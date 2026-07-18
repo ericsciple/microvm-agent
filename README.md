@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Put safe-outputs on PATH the Actions way (the harness installs its own
-      # gateway/mitmproxy internally — you don't add anything for that).
+      # gateway/mitmproxy internally — you don't add anything for which).
       - uses: ericsciple/safe-outputs/setup@v1
       # setup-* steps run here, on the host; their tool caches are mounted into the guest
       - uses: ericsciple/microvm-agent@v0
