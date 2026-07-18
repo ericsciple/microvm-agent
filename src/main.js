@@ -184,24 +184,27 @@ async function main() {
  */
 function bootVm(seconds, consoleLog) {
   return new Promise((resolve) => {
-    const outFd = fs.openSync(consoleLog, "w");
+    const fileStream = fs.createWriteStream(consoleLog);
     const child = spawn(
       "sudo",
       ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", "/tmp/mv-fc.sock", "--config-file", path.join(WORK, "vm_config.json")],
-      { stdio: ["ignore", outFd, outFd] }
+      { stdio: ["ignore", "pipe", "pipe"] }
     );
-    child.on("close", () => {
-      fs.closeSync(outFd);
+    // Stream the guest's serial console live to BOTH this action's stdout (so the
+    // user sees it in the workflow step log in real time) and the console.log file
+    // (kept as an artifact / for grading).
+    const fanout = (chunk) => {
+      process.stdout.write(chunk);
+      fileStream.write(chunk);
+    };
+    child.stdout.on("data", fanout);
+    child.stderr.on("data", fanout);
+    const finish = () => {
+      fileStream.end();
       resolve();
-    });
-    child.on("error", () => {
-      try {
-        fs.closeSync(outFd);
-      } catch {
-        /* already closed */
-      }
-      resolve();
-    });
+    };
+    child.on("close", finish);
+    child.on("error", finish);
   });
 }
 

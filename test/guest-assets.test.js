@@ -82,6 +82,13 @@ test("init adds --add-dir for a mounted workspace", () => {
   assert.ok(init.includes("mount -t overlay overlay"));
 });
 
+test("init runs the agent from the workspace when mounted, else /root", () => {
+  const mounted = generateInitScript({ mounts: { workspace: { dev: "/dev/vdb", path: "/__w" } } });
+  assert.ok(mounted.includes("cd '/__w' 2>/dev/null || cd /root"));
+  const bare = generateInitScript();
+  assert.ok(bare.includes("cd '/root'"));
+});
+
 test("Dockerfile includes util-linux for mount support", () => {
   assert.ok(generateDockerfile([]).includes("util-linux"));
 });

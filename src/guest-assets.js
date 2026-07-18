@@ -110,6 +110,9 @@ export function generateInitScript({
   const addDirs = ["/root"];
   if (mounts.workspace) addDirs.push(mounts.workspace.path);
   const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
+  // Run the agent from the workspace when it's mounted (like Actions container jobs,
+  // whose working directory is the workspace); otherwise fall back to /root.
+  const workDir = mounts.workspace ? mounts.workspace.path : "/root";
 
   return `#!/bin/bash
 set -x
@@ -131,7 +134,7 @@ export GITHUB_COPILOT_INTEGRATION_ID=agentic-workflows
 export NODE_EXTRA_CA_CERTS=/etc/mitmproxy-ca.pem
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 [ -f /etc/agent.env ] && . /etc/agent.env
-cd /root
+cd ${shq(workDir)} 2>/dev/null || cd /root
 
 echo "=== GUEST: starting copilot ==="
 copilot --no-ask-user --allow-all-tools \\
