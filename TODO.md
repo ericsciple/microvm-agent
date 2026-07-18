@@ -1,9 +1,13 @@
 # TODO — microvm-agent
 
 Build checklist for the microVM harness action. Pick this up in a Codespace (Node 20+, plus the
-host tooling the phase scripts use). The isolation mechanisms are proven in
-`github/ericsciple-planning/.github/workflows/agent-sandbox-phase{0..6}-*.yml`; the work here is
-porting them into a reusable action with the logic in Node.
+host tooling the phase scripts use). **The isolation is already prototyped and proven — do not
+re-derive it.** The verbatim, green proofs are in `docs/proven-prototype/` (copy the exact recipes
+from there), and `docs/prototype-lessons.md` indexes them and calls out every non-obvious gotcha
+(KVM setfacl, Copilot auth env + the `-p` flag, the mitmproxy token-swap gateway, the host firewall
+rules, the egress allowlist, the MCP-policy 403 + CLI-shim workaround, virtio-block ro + overlay).
+**Read `docs/prototype-lessons.md` first.** The work here is porting those proven pieces into the
+action, not figuring them out again.
 
 ## ⚠️ No Actions workflows in this repo
 
@@ -17,14 +21,19 @@ so default setup features like CodeQL default setup don't consume budget either.
 
 ## Ground truth to port from (proven, all green on `ubuntu-latest`)
 
-- phase0-kvm — `/dev/kvm` check + Firecracker boot
-- phase1-agent — Copilot CLI in the guest; auth via `GITHUB_TOKEN` + `copilot-requests: write`
-  (`COPILOT_GITHUB_TOKEN` fake in guest, `S2STOKENS=true`, `-p` prompt, `--allow-all-tools`)
-- phase2-gateway — mitmproxy credential gateway; fake→real token swap; inference host-side
-- phase3-firewall — host nftables/iptables deny-by-default + allowlist; in-guest root can't bypass
-- phase4-safeoutputs — CLI-shim delivery of host-side MCP writers (works around Copilot MCP policy)
-- phase5-redteam — adversarial checks (reference for a regression test)
-- phase6-mounts — virtio-block ro mounts; hypervisor-enforced read-only
+In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
+`docs/prototype-lessons.md`:
+
+- `phase0-kvm` — `/dev/kvm` check (`setfacl`) + Firecracker boot
+- `phase1-agent` — Copilot CLI in the guest; auth via `GITHUB_TOKEN` + `copilot-requests: write`
+  (`COPILOT_GITHUB_TOKEN`, `S2STOKENS=true`, `GITHUB_COPILOT_INTEGRATION_ID`, `-p` prompt,
+  `--allow-all-tools`)
+- `phase2-gateway` — mitmproxy credential gateway; fake→real token swap; inference host-side
+- `phase3-firewall` — host iptables deny-by-default + allowlist; in-guest root can't bypass
+- `phase4-safeoutputs` — CLI-shim delivery of host-side writers (works around Copilot MCP policy);
+  reuse the transport + gateway wiring only (the safe-output app now lives in `ericsciple/safe-outputs`)
+- `phase5-redteam` — adversarial checks (reference for a regression test)
+- `phase6-mounts` — virtio-block ro mounts (hypervisor-enforced) + overlay for writes
 
 ## Build phases (from the plan)
 

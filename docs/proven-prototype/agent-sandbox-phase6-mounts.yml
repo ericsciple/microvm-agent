@@ -1,0 +1,191 @@
+name: "Agent sandbox — Phase 6: workspace mounts (ro / rw / arbitrary mapping)"
+
+# Phase 6 of ACTIONS-AGENT-STEP-PROTOTYPE (prototypes github/c2c-actions#10310).
+# Validates the ADR `mount:` knob on Firecracker. Firecracker has no virtiofs/bind
+# mounts, so host paths are shared as virtio-BLOCK devices:
+#   - read-only  -> drive is_read_only:true (hypervisor-enforced; in-guest root cannot remount rw)
+#   - read-write -> drive is_read_only:false (guest writes land in the image; readable back on host)
+#   - arbitrary mapping (mount: {}) -> multiple drives mounted at arbitrary guest paths, per-path access
+# (A container/`sandbox: none` tier could instead use real bind mounts.)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/agent-sandbox-phase6-mounts.yml
+
+permissions:
+  contents: read
+
+jobs:
+  mounts-microvm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install host tools
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs
+
+      - name: Build guest rootfs + data images (ro / rw)
+        run: |
+          set -eux
+          mkdir -p guest
+
+          cat > guest/Dockerfile <<'DOCKER'
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends util-linux \
+              && rm -rf /var/lib/apt/lists/*
+          RUN mknod -m 622 /dev/console c 5 1 || true; \
+              mknod -m 666 /dev/null c 1 3 || true; \
+              mknod -m 666 /dev/zero c 1 5 || true; \
+              mknod -m 444 /dev/urandom c 1 9 || true; \
+              mknod -m 620 /dev/ttyS0 c 4 64 || true
+          COPY init.sh /init
+          RUN chmod +x /init
+          DOCKER
+
+          cat > guest/init.sh <<'INIT'
+          #!/bin/bash
+          set -x
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sys /sys 2>/dev/null || true
+          mount -t devtmpfs dev /dev 2>/dev/null || true
+          mkdir -p /repo /cache
+
+          echo "=== GUEST: block devices ==="; ls -l /dev/vd* 2>/dev/null
+
+          # --- Read-only mount: vdb is a hypervisor read-only drive ---
+          mount -o ro /dev/vdb /repo 2>&1 || echo "RO_MOUNT_FAILED"
+          echo "RO_READ=$(cat /repo/repo-marker.txt 2>/dev/null || echo FAIL)"
+          if echo hack > /repo/hack.txt 2>/dev/null; then echo "RO_WRITE_BLOCKED=no"; else echo "RO_WRITE_BLOCKED=yes"; fi
+          # in-guest root tries to force it read-write:
+          mount -o remount,rw /repo 2>/dev/null || true
+          if echo hack2 > /repo/hack2.txt 2>/dev/null; then echo "RO_REMOUNT_WRITE_BLOCKED=no"; else echo "RO_REMOUNT_WRITE_BLOCKED=yes"; fi
+
+          # --- Read-write mount: vdc is a writable drive ---
+          mount /dev/vdc /cache 2>&1 || echo "RW_MOUNT_FAILED"
+          if echo "guest-wrote-marker-98765" > /cache/from-guest.txt 2>/dev/null; then echo "RW_WRITE_OK=yes"; else echo "RW_WRITE_OK=no"; fi
+          sync
+
+          # --- Arbitrary mapping: distinct host volumes at arbitrary guest paths, per-path access ---
+          echo "=== GUEST: mount table (arbitrary mapping) ==="
+          mount | grep -E ' /repo | /cache '
+          repo_count=$(mount | grep -cE ' /repo ')
+          cache_count=$(mount | grep -cE ' /cache ')
+          if [ "$repo_count" -ge 1 ] && [ "$cache_count" -ge 1 ]; then echo "ARBITRARY_MAPPING=yes"; else echo "ARBITRARY_MAPPING=no"; fi
+
+          sync
+          echo 1 > /proc/sys/kernel/sysrq
+          echo b > /proc/sysrq-trigger
+          sleep infinity
+          INIT
+
+          docker build -t mounts-rootfs guest
+          cid=$(docker create mounts-rootfs)
+          docker export "$cid" -o rootfs.tar
+          docker rm "$cid"
+          truncate -s 1G rootfs.ext4
+          mkfs.ext4 -q -F rootfs.ext4
+          mkdir -p mnt
+          sudo mount -o loop rootfs.ext4 mnt
+          sudo tar -C mnt -xf rootfs.tar
+          sudo umount mnt
+
+          # Read-only data image (attached read-only to the VM) with a marker file.
+          truncate -s 32M ro.ext4
+          mkfs.ext4 -q -F ro.ext4
+          mkdir -p romnt
+          sudo mount -o loop ro.ext4 romnt
+          echo "READONLY-DATA-MOUNT-OK" | sudo tee romnt/repo-marker.txt >/dev/null
+          sudo umount romnt
+
+          # Read-write data image (empty; the guest will write into it).
+          truncate -s 32M rw.ext4
+          mkfs.ext4 -q -F rw.ext4
+
+      - name: Download Firecracker + guest kernel
+        run: |
+          set -eux
+          ARCH="$(uname -m)"
+          S3="https://s3.amazonaws.com/spec.ccfc.min"
+          CI_PREFIX=$(curl -fsSL "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" \
+            | grep -oP "(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)" | sort | tail -1)
+          KERNEL_KEY=$(curl -fsSL "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/vmlinux-" \
+            | grep -oP "(?<=<Key>)(${CI_PREFIX}${ARCH}/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" \
+            | sort -V | tail -1)
+          wget -q "$S3/${KERNEL_KEY}" -O vmlinux
+          REL="https://github.com/firecracker-microvm/firecracker/releases"
+          LATEST=$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' ${REL}/latest)")
+          curl -sSL "${REL}/download/${LATEST}/firecracker-${LATEST}-${ARCH}.tgz" | tar -xz
+          mv "release-${LATEST}-${ARCH}/firecracker-${LATEST}-${ARCH}" firecracker
+          chmod +x firecracker
+
+      - name: Boot with ro + rw data drives, run mount tests
+        run: |
+          set -x
+          sudo setfacl -m u:"${USER}":rw /dev/kvm 2>/dev/null || sudo chmod 666 /dev/kvm || true
+
+          cat > vm_config.json <<'EOF'
+          {
+            "boot-source": { "kernel_image_path": "vmlinux", "boot_args": "console=ttyS0 reboot=k panic=1 init=/init" },
+            "drives": [
+              { "drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": true, "is_read_only": false },
+              { "drive_id": "repo", "path_on_host": "ro.ext4", "is_root_device": false, "is_read_only": true },
+              { "drive_id": "cache", "path_on_host": "rw.ext4", "is_root_device": false, "is_read_only": false }
+            ],
+            "machine-config": { "vcpu_count": 2, "mem_size_mib": 1024 }
+          }
+          EOF
+
+          rm -f /tmp/fc.sock
+          echo "== booting microVM with ro+rw data drives =="
+          sudo timeout -k 5 120 ./firecracker --api-sock /tmp/fc.sock --config-file vm_config.json \
+            > console.log 2>&1 || true
+
+          echo "== console.log (tail) =="; tail -n 80 console.log || true
+
+          # Host-side verification of the images after the guest ran.
+          mkdir -p verifyrw verifyro
+          sudo mount -o loop rw.ext4 verifyrw
+          if sudo grep -q 'guest-wrote-marker-98765' verifyrw/from-guest.txt 2>/dev/null; then RW_PERSISTED=yes; else RW_PERSISTED=no; fi
+          sudo umount verifyrw
+          sudo mount -o loop,ro ro.ext4 verifyro
+          if sudo test -e verifyro/hack.txt || sudo test -e verifyro/hack2.txt; then RO_INTACT=no; else RO_INTACT=yes; fi
+          sudo umount verifyro
+
+          RO_READ=no; RO_WRITE_BLOCKED=no; RO_REMOUNT_BLOCKED=no; RW_WRITE_OK=no; MAPPING=no
+          grep -q "RO_READ=READONLY-DATA-MOUNT-OK" console.log && RO_READ=yes
+          grep -q "RO_WRITE_BLOCKED=yes" console.log && RO_WRITE_BLOCKED=yes
+          grep -q "RO_REMOUNT_WRITE_BLOCKED=yes" console.log && RO_REMOUNT_BLOCKED=yes
+          grep -q "RW_WRITE_OK=yes" console.log && RW_WRITE_OK=yes
+          grep -q "ARBITRARY_MAPPING=yes" console.log && MAPPING=yes
+
+          {
+            echo "## Phase 6: workspace mounts (virtio-block)"
+            echo "- Read-only mount readable in guest: **${RO_READ}**"
+            echo "- Read-only write blocked (guest, as root): **${RO_WRITE_BLOCKED}**"
+            echo "- Read-only remount-rw blocked (hypervisor-enforced): **${RO_REMOUNT_BLOCKED}**"
+            echo "- Read-only image unchanged on host after run: **${RO_INTACT}**"
+            echo "- Read-write mount writable in guest: **${RW_WRITE_OK}**"
+            echo "- Guest writes persisted back to host image: **${RW_PERSISTED}**"
+            echo "- Arbitrary mapping (distinct drives at distinct paths, per-path access): **${MAPPING}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$RO_READ" = yes ] && [ "$RO_WRITE_BLOCKED" = yes ] && [ "$RO_REMOUNT_BLOCKED" = yes ] \
+             && [ "$RO_INTACT" = yes ] && [ "$RW_WRITE_OK" = yes ] && [ "$RW_PERSISTED" = yes ] && [ "$MAPPING" = yes ]; then
+            echo "✅ mounts work: ro (hypervisor-enforced), rw (persists to host), arbitrary per-path mapping"
+          else
+            echo "❌ Phase 6 failed (RO_READ=$RO_READ RO_WRITE_BLOCKED=$RO_WRITE_BLOCKED RO_REMOUNT_BLOCKED=$RO_REMOUNT_BLOCKED RO_INTACT=$RO_INTACT RW_WRITE_OK=$RW_WRITE_OK RW_PERSISTED=$RW_PERSISTED MAPPING=$MAPPING)"
+            exit 1
+          fi
+
+      - name: Upload mount artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mounts-console
+          path: |
+            console.log
+            vm_config.json
+          if-no-files-found: ignore

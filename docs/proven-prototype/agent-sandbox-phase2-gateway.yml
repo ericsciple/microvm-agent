@@ -1,0 +1,289 @@
+name: "Agent sandbox — Phase 2: credential on a host-side gateway"
+
+# Phase 2 of ACTIONS-AGENT-STEP-PROTOTYPE (prototypes github/c2c-actions#10310).
+# The real credential lives only on a host-side mitmproxy gateway; the guest holds a
+# fake token and trusts the gateway CA. Guest :443 is transparently swapped fake->real.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/agent-sandbox-phase2-gateway.yml
+
+permissions:
+  contents: read
+
+jobs:
+  # Phase 2: the real credential lives ONLY on a host-side gateway, never in the guest.
+  # The guest holds a fake ghs_ sentinel token and trusts the gateway CA. All guest HTTPS
+  # (:443) is transparently redirected on the host to mitmproxy, whose addon swaps the fake
+  # token for the real GITHUB_TOKEN on the way out. A rooted guest can never read the real cred.
+  agent-gateway-microvm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    env:
+      FAKE_TOKEN: ghs_FAKE00000000000000000000000000000000
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install host tools + mitmproxy
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs iproute2 iptables jq
+          pipx install mitmproxy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Generate gateway CA
+        run: |
+          set -eux
+          export PATH="$HOME/.local/bin:$PATH"
+          # First run of any mitmproxy tool generates the CA under ~/.mitmproxy.
+          timeout 8 mitmdump -q >/dev/null 2>&1 || true
+          ls -l "$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+          cp "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" mitmproxy-ca.pem
+
+      - name: Write gateway addon
+        run: |
+          cat > gw_addon.py <<'GWADDON'
+          import os
+          from mitmproxy import http
+
+          FAKE = os.environ.get("FAKE_TOKEN", "")
+          REAL = os.environ.get("REAL_TOKEN", "")
+
+
+          def _append(path, line):
+              with open(path, "a") as f:
+                  f.write(line + "\n")
+
+
+          def request(flow: http.HTTPFlow) -> None:
+              host = flow.request.pretty_host
+              _append("/tmp/gw-hosts.log", host)
+              swapped = False
+              if FAKE:
+                  for k in list(flow.request.headers.keys()):
+                      val = flow.request.headers[k]
+                      if FAKE in val:
+                          flow.request.headers[k] = val.replace(FAKE, REAL)
+                          swapped = True
+                  body = flow.request.get_content(strict=False)
+                  if body and FAKE.encode() in body:
+                      flow.request.set_content(body.replace(FAKE.encode(), REAL.encode()))
+                      swapped = True
+              if swapped:
+                  _append("/tmp/gw-swaps.log", host + " " + flow.request.method + " " + flow.request.path)
+          GWADDON
+          echo "wrote gw_addon.py"
+
+      - name: Build guest rootfs (fake token + gateway CA) -> ext4
+        run: |
+          set -eux
+          mkdir -p guest
+
+          cat > guest/Dockerfile <<'DOCKER'
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates curl iproute2 iptables procps \
+              && rm -rf /var/lib/apt/lists/*
+          RUN curl -fsSL --retry 3 -o /tmp/copilot.tgz \
+                https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz \
+              && tar -xz -C /usr/local/bin -f /tmp/copilot.tgz \
+              && chmod +x /usr/local/bin/copilot \
+              && rm /tmp/copilot.tgz
+          RUN mknod -m 622 /dev/console c 5 1 || true; \
+              mknod -m 666 /dev/null c 1 3 || true; \
+              mknod -m 666 /dev/zero c 1 5 || true; \
+              mknod -m 444 /dev/random c 1 8 || true; \
+              mknod -m 444 /dev/urandom c 1 9 || true; \
+              mknod -m 620 /dev/ttyS0 c 4 64 || true
+          COPY init.sh /init
+          RUN chmod +x /init
+          DOCKER
+
+          cat > guest/init.sh <<'INIT'
+          #!/bin/bash
+          set -x
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sys /sys 2>/dev/null || true
+          mount -t devtmpfs dev /dev 2>/dev/null || true
+          ip link set lo up
+          ip addr add 172.16.0.2/30 dev eth0
+          ip link set eth0 up
+          ip route add default via 172.16.0.1
+          echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+
+          # Trust the host gateway CA so the intercepted TLS is accepted.
+          update-ca-certificates 2>/dev/null || true
+
+          export HOME=/root
+          export XDG_CONFIG_HOME=/root
+          export COPILOT_AGENT_RUNNER_TYPE=STANDALONE
+          export S2STOKENS=true
+          export NODE_EXTRA_CA_CERTS=/etc/mitmproxy-ca.pem
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          [ -f /etc/agent.env ] && . /etc/agent.env
+          cd /root
+
+          echo "=== GUEST: token held in guest starts with: $(printf '%s' "$COPILOT_GITHUB_TOKEN" | cut -c1-8) (this is the FAKE sentinel) ==="
+          getent hosts api.githubcopilot.com || echo "GUEST: DNS lookup failed"
+
+          echo "=== GUEST: starting copilot (real cred lives on the host gateway) ==="
+          copilot --no-ask-user --disable-builtin-mcps --allow-all-tools \
+            --add-dir /root --log-level all --log-dir /tmp/cplogs \
+            -p "$(cat /etc/prompt.txt)" 2>&1 | tee /dev/console
+          echo "=== GUEST: AGENT_EXIT=${PIPESTATUS[0]} ==="
+
+          sync
+          echo 1 > /proc/sys/kernel/sysrq
+          echo b > /proc/sysrq-trigger
+          sleep infinity
+          INIT
+
+          cat > guest/prompt.txt <<'PROMPT'
+          You are running inside a Firecracker microVM as a connectivity test.
+          Reply with exactly one line and nothing else:
+          AGENT_OK <the result of 6 times 7>
+          PROMPT
+
+          docker build -t agent-rootfs-gw guest
+          cid=$(docker create agent-rootfs-gw)
+          docker export "$cid" -o rootfs.tar
+          docker rm "$cid"
+
+          truncate -s 3G rootfs.ext4
+          mkfs.ext4 -q -F rootfs.ext4
+          mkdir -p mnt
+          sudo mount -o loop rootfs.ext4 mnt
+          sudo tar -C mnt -xf rootfs.tar
+          sudo cp guest/prompt.txt mnt/etc/prompt.txt
+          # Guest gets ONLY the fake sentinel token (never the real one).
+          printf 'export COPILOT_GITHUB_TOKEN=%s\n' "${FAKE_TOKEN}" | sudo tee mnt/etc/agent.env >/dev/null
+          # Install the gateway CA into the guest trust store.
+          sudo mkdir -p mnt/usr/local/share/ca-certificates
+          sudo cp mitmproxy-ca.pem mnt/usr/local/share/ca-certificates/mitmproxy.crt
+          sudo cp mitmproxy-ca.pem mnt/etc/mitmproxy-ca.pem
+          sudo umount mnt
+
+      - name: Download Firecracker + guest kernel
+        run: |
+          set -eux
+          ARCH="$(uname -m)"
+          S3="https://s3.amazonaws.com/spec.ccfc.min"
+          CI_PREFIX=$(curl -fsSL "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" \
+            | grep -oP "(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)" | sort | tail -1)
+          KERNEL_KEY=$(curl -fsSL "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/vmlinux-" \
+            | grep -oP "(?<=<Key>)(${CI_PREFIX}${ARCH}/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" \
+            | sort -V | tail -1)
+          wget -q "$S3/${KERNEL_KEY}" -O vmlinux
+          REL="https://github.com/firecracker-microvm/firecracker/releases"
+          LATEST=$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' ${REL}/latest)")
+          curl -sSL "${REL}/download/${LATEST}/firecracker-${LATEST}-${ARCH}.tgz" | tar -xz
+          mv "release-${LATEST}-${ARCH}/firecracker-${LATEST}-${ARCH}" firecracker
+          chmod +x firecracker
+
+      - name: Boot via gateway and run the agent
+        run: |
+          set -x
+          export PATH="$HOME/.local/bin:$PATH"
+          sudo setfacl -m u:"${USER}":rw /dev/kvm 2>/dev/null || sudo chmod 666 /dev/kvm || true
+
+          # Host tap network.
+          sudo ip link del tap0 2>/dev/null || true
+          sudo ip tuntap add dev tap0 mode tap
+          sudo ip addr add 172.16.0.1/30 dev tap0
+          sudo ip link set tap0 up
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv4.conf.all.send_redirects=0
+          HOST_IFACE=$(ip -j route list default | jq -r '.[0].dev')
+
+          # NAT so the guest can do DNS + non-intercepted egress.
+          sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
+          sudo iptables -A FORWARD -i tap0 -o "$HOST_IFACE" -j ACCEPT
+          sudo iptables -A FORWARD -i "$HOST_IFACE" -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          # Transparently redirect the guest's HTTPS to the host gateway.
+          sudo iptables -t nat -A PREROUTING -i tap0 -p tcp --dport 443 -j REDIRECT --to-ports 8080
+
+          # Start the gateway. The REAL token exists ONLY in this host process's env.
+          set +x
+          REAL_TOKEN="$GH_TOKEN" FAKE_TOKEN="$FAKE_TOKEN" mitmdump --mode transparent \
+            --listen-host 0.0.0.0 --listen-port 8080 \
+            -s gw_addon.py -q --set block_global=false \
+            > gateway.log 2>&1 &
+          GW_PID=$!
+          set -x
+          for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ':8080' && break; sleep 0.5; done
+          ss -ltn | grep ':8080' || { echo "gateway did not start"; cat gateway.log; }
+
+          cat > vm_config.json <<'EOF'
+          {
+            "boot-source": {
+              "kernel_image_path": "vmlinux",
+              "boot_args": "console=ttyS0 reboot=k panic=1 init=/init"
+            },
+            "drives": [
+              {
+                "drive_id": "rootfs",
+                "path_on_host": "rootfs.ext4",
+                "is_root_device": true,
+                "is_read_only": false
+              }
+            ],
+            "network-interfaces": [
+              {
+                "iface_id": "eth0",
+                "host_dev_name": "tap0",
+                "guest_mac": "06:00:AC:10:00:02"
+              }
+            ],
+            "machine-config": {
+              "vcpu_count": 2,
+              "mem_size_mib": 2048
+            }
+          }
+          EOF
+
+          rm -f /tmp/fc.sock
+          echo "== booting agent microVM via host gateway (up to 300s) =="
+          sudo timeout -k 5 300 ./firecracker --api-sock /tmp/fc.sock --config-file vm_config.json \
+            > console.log 2>&1 || true
+
+          kill "$GW_PID" 2>/dev/null || true
+
+          echo "== console.log (tail) =="; tail -n 120 console.log || true
+          echo "== gateway token swaps =="; cat /tmp/gw-swaps.log 2>/dev/null || echo "(none)"
+          echo "== unique hosts contacted (seeds Phase 3 allowlist) =="; sort -u /tmp/gw-hosts.log 2>/dev/null || true
+
+          AGENT_OK=no; SWAP_OK=no
+          grep -Eq "AGENT_OK[^A-Za-z]*42" console.log && AGENT_OK=yes
+          [ -s /tmp/gw-swaps.log ] && SWAP_OK=yes
+
+          {
+            echo "## Phase 2: credential on host gateway (out of the guest)"
+            echo "- Inference round-trip (AGENT_OK 42): **${AGENT_OK}**"
+            echo "- Gateway swapped fake->real token, real cred never in guest: **${SWAP_OK}**"
+            echo "- Unique hosts the agent contacted (Phase 3 allowlist seed):"
+            echo '```'
+            sort -u /tmp/gw-hosts.log 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$AGENT_OK" = yes ] && [ "$SWAP_OK" = yes ]; then
+            echo "✅ agent inferred with only a FAKE token in the guest; the host gateway supplied the real credential"
+          else
+            echo "❌ Phase 2 failed (AGENT_OK=$AGENT_OK SWAP_OK=$SWAP_OK) — inspect artifacts"
+            exit 1
+          fi
+
+      - name: Upload gateway artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-gateway
+          path: |
+            console.log
+            gateway.log
+            vm_config.json
+          if-no-files-found: ignore

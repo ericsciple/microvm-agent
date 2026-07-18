@@ -1,0 +1,219 @@
+name: "Agent sandbox — Phase 1: Copilot CLI inside the microVM"
+
+# Phase 1 of ACTIONS-AGENT-STEP-PROTOTYPE (prototypes github/c2c-actions#10310).
+# Runs the Copilot CLI inside a Firecracker microVM, authenticated by the Actions
+# GITHUB_TOKEN (permissions: copilot-requests: write). Baseline: real token in guest.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/agent-sandbox-phase1-agent.yml
+
+permissions:
+  contents: read
+
+jobs:
+  # Phase 1: run the Copilot CLI *inside* a Firecracker microVM.
+  # Auth uses the Actions GITHUB_TOKEN (permissions: copilot-requests: write) via
+  # COPILOT_GITHUB_TOKEN + S2STOKENS=true, mirroring gh-aw's copilot engine. This
+  # baseline puts the real token in the guest; a later phase moves it to a host gateway.
+  agent-in-microvm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    steps:
+      - name: Install host tools
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs iproute2 iptables jq
+
+      - name: Build guest rootfs (Copilot CLI + init) -> ext4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          mkdir -p guest
+
+          cat > guest/Dockerfile <<'DOCKER'
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates curl iproute2 iptables procps \
+              && rm -rf /var/lib/apt/lists/*
+          # Standalone Copilot CLI binary (no Node) from github/copilot-cli releases.
+          RUN curl -fsSL --retry 3 -o /tmp/copilot.tgz \
+                https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz \
+              && tar -xz -C /usr/local/bin -f /tmp/copilot.tgz \
+              && chmod +x /usr/local/bin/copilot \
+              && rm /tmp/copilot.tgz \
+              && /usr/local/bin/copilot --version
+          # Static device nodes in case the guest kernel does not auto-mount devtmpfs.
+          RUN mknod -m 622 /dev/console c 5 1 || true; \
+              mknod -m 666 /dev/null c 1 3 || true; \
+              mknod -m 666 /dev/zero c 1 5 || true; \
+              mknod -m 444 /dev/random c 1 8 || true; \
+              mknod -m 444 /dev/urandom c 1 9 || true; \
+              mknod -m 620 /dev/ttyS0 c 4 64 || true
+          COPY init.sh /init
+          RUN chmod +x /init
+          DOCKER
+
+          cat > guest/init.sh <<'INIT'
+          #!/bin/bash
+          set -x
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sys /sys 2>/dev/null || true
+          mount -t devtmpfs dev /dev 2>/dev/null || true
+          ip link set lo up
+          ip addr add 172.16.0.2/30 dev eth0
+          ip link set eth0 up
+          ip route add default via 172.16.0.1
+          echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+
+          export HOME=/root
+          export XDG_CONFIG_HOME=/root
+          export COPILOT_AGENT_RUNNER_TYPE=STANDALONE
+          export S2STOKENS=true
+          [ -f /etc/agent.env ] && . /etc/agent.env
+          cd /root
+
+          echo "=== GUEST: connectivity check ==="
+          getent hosts api.githubcopilot.com || echo "GUEST: DNS lookup failed"
+
+          echo "=== GUEST: starting copilot ==="
+          copilot --no-ask-user --disable-builtin-mcps --allow-all-tools \
+            --add-dir /root --log-level all --log-dir /tmp/cplogs \
+            -p "$(cat /etc/prompt.txt)" 2>&1 | tee /dev/console
+          echo "=== GUEST: AGENT_EXIT=${PIPESTATUS[0]} ==="
+
+          sync
+          echo 1 > /proc/sys/kernel/sysrq
+          echo b > /proc/sysrq-trigger
+          # If the reboot trigger did not fire, keep init alive so the kernel
+          # does not panic (the host timeout will reap the VM).
+          sleep infinity
+          INIT
+
+          cat > guest/prompt.txt <<'PROMPT'
+          You are running inside a Firecracker microVM as a connectivity test.
+          Reply with exactly one line and nothing else:
+          AGENT_OK <the result of 6 times 7>
+          PROMPT
+
+          docker build -t agent-rootfs guest
+          cid=$(docker create agent-rootfs)
+          docker export "$cid" -o rootfs.tar
+          docker rm "$cid"
+
+          truncate -s 3G rootfs.ext4
+          mkfs.ext4 -q -F rootfs.ext4
+          mkdir -p mnt
+          sudo mount -o loop rootfs.ext4 mnt
+          sudo tar -C mnt -xf rootfs.tar
+          sudo cp guest/prompt.txt mnt/etc/prompt.txt
+          # Inject the real token (Phase 1 baseline). Disable xtrace so it is not echoed;
+          # the runner also masks GITHUB_TOKEN in logs as defense in depth.
+          set +x
+          printf 'export COPILOT_GITHUB_TOKEN=%q\n' "${GH_TOKEN}" | sudo tee mnt/etc/agent.env >/dev/null
+          set -x
+          sudo umount mnt
+
+      - name: Download Firecracker + guest kernel
+        run: |
+          set -eux
+          ARCH="$(uname -m)"
+          S3="https://s3.amazonaws.com/spec.ccfc.min"
+          CI_PREFIX=$(curl -fsSL "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" \
+            | grep -oP "(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)" | sort | tail -1)
+          KERNEL_KEY=$(curl -fsSL "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/vmlinux-" \
+            | grep -oP "(?<=<Key>)(${CI_PREFIX}${ARCH}/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" \
+            | sort -V | tail -1)
+          wget -q "$S3/${KERNEL_KEY}" -O vmlinux
+          REL="https://github.com/firecracker-microvm/firecracker/releases"
+          LATEST=$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' ${REL}/latest)")
+          curl -sSL "${REL}/download/${LATEST}/firecracker-${LATEST}-${ARCH}.tgz" | tar -xz
+          mv "release-${LATEST}-${ARCH}/firecracker-${LATEST}-${ARCH}" firecracker
+          chmod +x firecracker
+          ./firecracker --version
+
+      - name: Boot microVM and run the agent
+        run: |
+          set -x
+          sudo setfacl -m u:"${USER}":rw /dev/kvm 2>/dev/null || sudo chmod 666 /dev/kvm || true
+
+          # Host tap + NAT so the guest can reach the Copilot API.
+          sudo ip link del tap0 2>/dev/null || true
+          sudo ip tuntap add dev tap0 mode tap
+          sudo ip addr add 172.16.0.1/30 dev tap0
+          sudo ip link set tap0 up
+          sudo sysctl -w net.ipv4.ip_forward=1
+          HOST_IFACE=$(ip -j route list default | jq -r '.[0].dev')
+          echo "host iface: ${HOST_IFACE}"
+          sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
+          sudo iptables -A FORWARD -i tap0 -o "$HOST_IFACE" -j ACCEPT
+          sudo iptables -A FORWARD -i "$HOST_IFACE" -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+          cat > vm_config.json <<'EOF'
+          {
+            "boot-source": {
+              "kernel_image_path": "vmlinux",
+              "boot_args": "console=ttyS0 reboot=k panic=1 init=/init"
+            },
+            "drives": [
+              {
+                "drive_id": "rootfs",
+                "path_on_host": "rootfs.ext4",
+                "is_root_device": true,
+                "is_read_only": false
+              }
+            ],
+            "network-interfaces": [
+              {
+                "iface_id": "eth0",
+                "host_dev_name": "tap0",
+                "guest_mac": "06:00:AC:10:00:02"
+              }
+            ],
+            "machine-config": {
+              "vcpu_count": 2,
+              "mem_size_mib": 2048
+            }
+          }
+          EOF
+
+          rm -f /tmp/fc.sock
+          echo "== booting agent microVM (up to 300s; init powers off when done) =="
+          sudo timeout -k 5 300 ./firecracker --api-sock /tmp/fc.sock --config-file vm_config.json \
+            > console.log 2>&1 || true
+
+          echo "== console.log (tail) =="
+          tail -n 120 console.log || true
+
+          AGENT_RAN=no; AGENT_OK=no
+          grep -q "GUEST: starting copilot" console.log && AGENT_RAN=yes
+          grep -Eq "AGENT_OK[^A-Za-z]*42" console.log && AGENT_OK=yes
+
+          {
+            echo "## Phase 1: agent in microVM"
+            echo "- Copilot CLI started in guest: **${AGENT_RAN}**"
+            echo "- Inference round-trip (AGENT_OK 42): **${AGENT_OK}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$AGENT_OK" = "yes" ]; then
+            echo "✅ Copilot CLI ran inside the microVM and completed a real inference"
+          else
+            echo "❌ agent did not complete inference — inspect the agent-console artifact"
+            exit 1
+          fi
+
+      - name: Upload agent console
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-console
+          path: |
+            console.log
+            vm_config.json
+          if-no-files-found: ignore

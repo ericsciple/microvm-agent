@@ -1,0 +1,403 @@
+name: "Agent sandbox — Phase 4: safe-outputs as CLI shims + framework staging"
+
+# Phase 4 of ACTIONS-AGENT-STEP-PROTOTYPE (prototypes github/c2c-actions#10310).
+# The Copilot CLI blocks non-default MCP servers when it cannot fetch GitHub's MCP
+# registry policy (403 with an Actions token). gh-aw's workaround is to expose safe
+# outputs as *CLI commands* (shell), not MCP servers. We do the same: the guest gets
+# thin `add_labels`/`add_comment` shims on PATH that POST the structured call to a
+# host-side framework (outside the guest — no tokens in the guest). Staging is
+# implemented ONCE in the framework's generic dispatch(); appliers are pure effects.
+# We stage add_labels and apply add_comment to prove staging needs no per-applier code.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/agent-sandbox-phase4-safeoutputs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  agent-safeoutputs-microvm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    env:
+      FAKE_TOKEN: ghs_FAKE00000000000000000000000000000000
+      GH_TOKEN: ${{ github.token }}
+      SO_REPO: ${{ github.repository }}
+      SO_SHA: ${{ github.sha }}
+      SO_ISSUE: "1"
+      SO_STAGE_TOOLS: add_labels
+    steps:
+      - name: Install host tools + mitmproxy
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs iproute2 iptables jq
+          pipx install mitmproxy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Generate gateway CA
+        run: |
+          set -eux
+          export PATH="$HOME/.local/bin:$PATH"
+          timeout 8 mitmdump -q >/dev/null 2>&1 || true
+          cp "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" mitmproxy-ca.pem
+
+      - name: Write gateway addon (token swap + domain allowlist)
+        run: |
+          cat > gw_addon.py <<'GWADDON'
+          import os
+          from mitmproxy import http
+
+          FAKE = os.environ.get("FAKE_TOKEN", "")
+          REAL = os.environ.get("REAL_TOKEN", "")
+          ALLOW = {"api.github.com", "api.githubcopilot.com", "api.mcp.github.com"}
+
+
+          def _append(path, line):
+              with open(path, "a") as f:
+                  f.write(line + "\n")
+
+
+          def request(flow: http.HTTPFlow) -> None:
+              host = flow.request.pretty_host
+              _append("/tmp/gw-hosts.log", host)
+              if host not in ALLOW:
+                  _append("/tmp/gw-blocked.log", host + " " + flow.request.path)
+                  flow.response = http.Response.make(403, b"blocked\n", {"Content-Type": "text/plain"})
+                  return
+              swapped = False
+              if FAKE:
+                  for k in list(flow.request.headers.keys()):
+                      val = flow.request.headers[k]
+                      if FAKE in val:
+                          flow.request.headers[k] = val.replace(FAKE, REAL)
+                          swapped = True
+                  body = flow.request.get_content(strict=False)
+                  if body and FAKE.encode() in body:
+                      flow.request.set_content(body.replace(FAKE.encode(), REAL.encode()))
+                      swapped = True
+              if swapped:
+                  _append("/tmp/gw-swaps.log", host + " " + flow.request.path)
+          GWADDON
+          echo "wrote gw_addon.py"
+
+      - name: Write safe-outputs framework (host dispatch server + pure-effect appliers)
+        run: |
+          cat > safe_outputs_server.py <<'SOSVR'
+          import datetime
+          import json
+          import os
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          STAGE_DIR = "so-staged"
+          APPLIED_LOG = "so-applied.jsonl"
+          CALLS_LOG = "so-calls.jsonl"
+          os.makedirs(STAGE_DIR, exist_ok=True)
+
+          # Triggering context is bound by the framework; the agent cannot widen it.
+          CONTEXT = {
+              "repo": os.environ.get("SO_REPO", ""),
+              "issue": int(os.environ.get("SO_ISSUE", "0")),
+              "sha": os.environ.get("SO_SHA", ""),
+          }
+          # `stage-artifact:` configuration — which tools stage instead of apply.
+          STAGE_TOOLS = set(t for t in os.environ.get("SO_STAGE_TOOLS", "").split(",") if t)
+
+
+          def _log(path, record):
+              with open(path, "a") as f:
+                  f.write(json.dumps(record) + "\n")
+
+
+          # --- Appliers: PURE EFFECTS. No applier contains any staging logic. ---
+          def effect_add_labels(args, context):
+              _log(APPLIED_LOG, {"effect": "add_labels", "labels": args["labels"], "context": context})
+
+
+          def effect_add_comment(args, context):
+              _log(APPLIED_LOG, {"effect": "add_comment", "body": args["body"], "context": context})
+
+
+          REGISTRY = {"add_labels": effect_add_labels, "add_comment": effect_add_comment}
+
+
+          # --- Framework: staging implemented ONCE, generically, for ANY tool. ---
+          def dispatch(tool, args):
+              _log(CALLS_LOG, {"tool": tool, "args": args})
+              if tool in STAGE_TOOLS:
+                  payload = {
+                      "tool": tool,
+                      "args": args,
+                      "context": CONTEXT,
+                      "staged_at": datetime.datetime.utcnow().isoformat() + "Z",
+                  }
+                  with open(os.path.join(STAGE_DIR, tool + ".json"), "w") as f:
+                      json.dump(payload, f, indent=2)
+                  return {"status": "staged", "tool": tool}
+              REGISTRY[tool](args, CONTEXT)
+              return {"status": "applied", "tool": tool}
+
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get("Content-Length", "0"))
+                  raw = self.rfile.read(n)
+                  try:
+                      req = json.loads(raw)
+                      result = dispatch(req["tool"], req.get("args", {}))
+                      code = 200
+                  except Exception as exc:
+                      result = {"error": str(exc)}
+                      code = 400
+                  out = json.dumps(result).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(out)))
+                  self.end_headers()
+                  self.wfile.write(out)
+
+              def log_message(self, *args):
+                  pass
+
+
+          if __name__ == "__main__":
+              HTTPServer(("0.0.0.0", 9000), Handler).serve_forever()
+          SOSVR
+          python3 -c "import ast; ast.parse(open('safe_outputs_server.py').read()); print('server syntax OK')"
+
+      - name: Build guest rootfs (Copilot CLI + safe-output CLI shims) -> ext4
+        run: |
+          set -eux
+          mkdir -p guest
+
+          cat > guest/Dockerfile <<'DOCKER'
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates curl iproute2 iptables procps jq \
+              && rm -rf /var/lib/apt/lists/*
+          RUN curl -fsSL --retry 3 -o /tmp/copilot.tgz \
+                https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz \
+              && tar -xz -C /usr/local/bin -f /tmp/copilot.tgz \
+              && chmod +x /usr/local/bin/copilot \
+              && rm /tmp/copilot.tgz
+          RUN mknod -m 622 /dev/console c 5 1 || true; \
+              mknod -m 666 /dev/null c 1 3 || true; \
+              mknod -m 666 /dev/zero c 1 5 || true; \
+              mknod -m 444 /dev/random c 1 8 || true; \
+              mknod -m 444 /dev/urandom c 1 9 || true; \
+              mknod -m 620 /dev/ttyS0 c 4 64 || true
+          COPY init.sh /init
+          COPY add_labels /usr/local/bin/add_labels
+          COPY add_comment /usr/local/bin/add_comment
+          RUN chmod +x /init /usr/local/bin/add_labels /usr/local/bin/add_comment
+          DOCKER
+
+          # Safe-output CLI shims: thin forwarders to the host framework. No tokens here.
+          cat > guest/add_labels <<'ADDLABELS'
+          #!/bin/bash
+          jq -nc --args '{tool:"add_labels",args:{labels:$ARGS.positional}}' "$@" \
+            | curl -s -X POST http://172.16.0.1:9000/dispatch \
+                -H 'Content-Type: application/json' --data-binary @-
+          echo
+          ADDLABELS
+
+          cat > guest/add_comment <<'ADDCOMMENT'
+          #!/bin/bash
+          jq -nc --arg body "$*" '{tool:"add_comment",args:{body:$body}}' \
+            | curl -s -X POST http://172.16.0.1:9000/dispatch \
+                -H 'Content-Type: application/json' --data-binary @-
+          echo
+          ADDCOMMENT
+
+          cat > guest/init.sh <<'INIT'
+          #!/bin/bash
+          set -x
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sys /sys 2>/dev/null || true
+          mount -t devtmpfs dev /dev 2>/dev/null || true
+          ip link set lo up
+          ip addr add 172.16.0.2/30 dev eth0
+          ip link set eth0 up
+          ip route add default via 172.16.0.1
+          echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+          update-ca-certificates 2>/dev/null || true
+
+          export HOME=/root
+          export XDG_CONFIG_HOME=/root
+          export COPILOT_AGENT_RUNNER_TYPE=STANDALONE
+          export S2STOKENS=true
+          export GITHUB_COPILOT_INTEGRATION_ID=agentic-workflows
+          export NODE_EXTRA_CA_CERTS=/etc/mitmproxy-ca.pem
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          [ -f /etc/agent.env ] && . /etc/agent.env
+          cd /root
+
+          echo "=== GUEST: safe-output shims present ==="; ls -l /usr/local/bin/add_labels /usr/local/bin/add_comment
+
+          echo "=== GUEST: starting copilot (write lane via CLI shims to host) ==="
+          copilot --no-ask-user --allow-all-tools \
+            --add-dir /root --log-level all --log-dir /tmp/cplogs \
+            -p "$(cat /etc/prompt.txt)" 2>&1 | tee /dev/console
+          echo "=== GUEST: AGENT_EXIT=${PIPESTATUS[0]} ==="
+
+          sync
+          echo 1 > /proc/sys/kernel/sysrq
+          echo b > /proc/sysrq-trigger
+          sleep infinity
+          INIT
+
+          cat > guest/prompt.txt <<'PROMPT'
+          You are triaging an issue from inside a sandbox. Two commands are available on your PATH:
+            add_labels <label> [<label> ...]   — add labels to the triggering issue
+            add_comment <text...>              — post a comment on the triggering issue
+          Do BOTH of these by ACTUALLY RUNNING the commands with your shell/bash tool (do not just describe them):
+          1. Run: add_labels triage
+          2. Run: add_comment hello from the sandboxed agent
+          After both commands have run successfully, reply with exactly this line:
+          AGENT_OK 42
+          PROMPT
+
+          docker build -t agent-rootfs-so guest
+          cid=$(docker create agent-rootfs-so)
+          docker export "$cid" -o rootfs.tar
+          docker rm "$cid"
+
+          truncate -s 3G rootfs.ext4
+          mkfs.ext4 -q -F rootfs.ext4
+          mkdir -p mnt
+          sudo mount -o loop rootfs.ext4 mnt
+          sudo tar -C mnt -xf rootfs.tar
+          sudo cp guest/prompt.txt mnt/etc/prompt.txt
+          printf 'export COPILOT_GITHUB_TOKEN=%s\n' "${FAKE_TOKEN}" | sudo tee mnt/etc/agent.env >/dev/null
+          sudo mkdir -p mnt/usr/local/share/ca-certificates
+          sudo cp mitmproxy-ca.pem mnt/usr/local/share/ca-certificates/mitmproxy.crt
+          sudo cp mitmproxy-ca.pem mnt/etc/mitmproxy-ca.pem
+          sudo umount mnt
+
+      - name: Download Firecracker + guest kernel
+        run: |
+          set -eux
+          ARCH="$(uname -m)"
+          S3="https://s3.amazonaws.com/spec.ccfc.min"
+          CI_PREFIX=$(curl -fsSL "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" \
+            | grep -oP "(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)" | sort | tail -1)
+          KERNEL_KEY=$(curl -fsSL "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/vmlinux-" \
+            | grep -oP "(?<=<Key>)(${CI_PREFIX}${ARCH}/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" \
+            | sort -V | tail -1)
+          wget -q "$S3/${KERNEL_KEY}" -O vmlinux
+          REL="https://github.com/firecracker-microvm/firecracker/releases"
+          LATEST=$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' ${REL}/latest)")
+          curl -sSL "${REL}/download/${LATEST}/firecracker-${LATEST}-${ARCH}.tgz" | tar -xz
+          mv "release-${LATEST}-${ARCH}/firecracker-${LATEST}-${ARCH}" firecracker
+          chmod +x firecracker
+
+      - name: Boot with firewall + gateway + safe-outputs framework, run the agent
+        run: |
+          set -x
+          export PATH="$HOME/.local/bin:$PATH"
+          sudo setfacl -m u:"${USER}":rw /dev/kvm 2>/dev/null || sudo chmod 666 /dev/kvm || true
+
+          sudo ip link del tap0 2>/dev/null || true
+          sudo ip tuntap add dev tap0 mode tap
+          sudo ip addr add 172.16.0.1/30 dev tap0
+          sudo ip link set tap0 up
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv4.conf.all.send_redirects=0
+          HOST_IFACE=$(ip -j route list default | jq -r '.[0].dev')
+
+          # Host-enforced firewall: DNS + the host framework port (9000) + :443->gateway; drop the rest.
+          sudo iptables -I INPUT 1 -i tap0 -p tcp --dport 9000 -j ACCEPT
+          sudo iptables -I FORWARD 1 -i "$HOST_IFACE" -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          sudo iptables -I FORWARD 2 -i tap0 -p udp --dport 53 -j ACCEPT
+          sudo iptables -I FORWARD 3 -i tap0 -p tcp --dport 53 -j ACCEPT
+          sudo iptables -I FORWARD 4 -i tap0 -j DROP
+          sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
+          sudo iptables -t nat -A PREROUTING -i tap0 -p tcp --dport 443 -j REDIRECT --to-ports 8080
+
+          # Credential gateway (inference token stays on host).
+          set +x
+          REAL_TOKEN="$GH_TOKEN" FAKE_TOKEN="$FAKE_TOKEN" mitmdump --mode transparent \
+            --listen-host 0.0.0.0 --listen-port 8080 -s gw_addon.py -q --set block_global=false \
+            > gateway.log 2>&1 &
+          GW_PID=$!
+          set -x
+
+          # Safe-outputs framework (appliers + generic staging) on the HOST.
+          python3 safe_outputs_server.py > so-server.log 2>&1 &
+          SO_PID=$!
+
+          for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ':8080' && break; sleep 0.5; done
+          for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ':9000' && break; sleep 0.5; done
+          ss -ltn | grep -E ':8080|:9000' || { echo "a service did not start"; cat gateway.log so-server.log; }
+
+          cat > vm_config.json <<'EOF'
+          {
+            "boot-source": { "kernel_image_path": "vmlinux", "boot_args": "console=ttyS0 reboot=k panic=1 init=/init" },
+            "drives": [ { "drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": true, "is_read_only": false } ],
+            "network-interfaces": [ { "iface_id": "eth0", "host_dev_name": "tap0", "guest_mac": "06:00:AC:10:00:02" } ],
+            "machine-config": { "vcpu_count": 2, "mem_size_mib": 2048 }
+          }
+          EOF
+
+          rm -f /tmp/fc.sock
+          echo "== booting agent microVM (up to 360s) =="
+          sudo timeout -k 5 360 ./firecracker --api-sock /tmp/fc.sock --config-file vm_config.json \
+            > console.log 2>&1 || true
+
+          kill "$GW_PID" 2>/dev/null || true
+          kill "$SO_PID" 2>/dev/null || true
+
+          echo "== console.log (tail) =="; tail -n 120 console.log || true
+          echo "== safe-outputs calls =="; cat so-calls.jsonl 2>/dev/null || echo "(none)"
+          echo "== applied (appliers that actually ran) =="; cat so-applied.jsonl 2>/dev/null || echo "(none)"
+          echo "== staged artifact (framework-serialized structured call) =="; cat so-staged/add_labels.json 2>/dev/null || echo "(none)"
+
+          AGENT_OK=no; CALLED_LABELS=no; CALLED_COMMENT=no; STAGED=no; APPLIED_COMMENT=no; APPLIED_LABELS=no
+          grep -Eq "AGENT_OK[^A-Za-z]*42" console.log && AGENT_OK=yes
+          grep -q '"tool": "add_labels"' so-calls.jsonl 2>/dev/null && CALLED_LABELS=yes
+          grep -q '"tool": "add_comment"' so-calls.jsonl 2>/dev/null && CALLED_COMMENT=yes
+          { [ -f so-staged/add_labels.json ] && python3 -c "import json,sys; json.load(open('so-staged/add_labels.json'))"; } 2>/dev/null && STAGED=yes
+          grep -q '"effect": "add_comment"' so-applied.jsonl 2>/dev/null && APPLIED_COMMENT=yes
+          grep -q '"effect": "add_labels"' so-applied.jsonl 2>/dev/null && APPLIED_LABELS=yes
+
+          {
+            echo "## Phase 4: safe-outputs as CLI shims + framework staging"
+            echo "- Agent completed via CLI shims (AGENT_OK 42): **${AGENT_OK}**"
+            echo "- Agent ran add_labels + add_comment: **${CALLED_LABELS} / ${CALLED_COMMENT}**"
+            echo "- Framework STAGED add_labels to an artifact: **${STAGED}**"
+            echo "- add_labels applier did NOT run (staged, not applied): **$([ "$APPLIED_LABELS" = no ] && echo yes || echo no)**"
+            echo "- add_comment applier DID run (applied): **${APPLIED_COMMENT}**"
+            echo "- Staged structured call:"
+            echo '```json'
+            cat so-staged/add_labels.json 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$AGENT_OK" = yes ] && [ "$CALLED_LABELS" = yes ] && [ "$CALLED_COMMENT" = yes ] \
+             && [ "$STAGED" = yes ] && [ "$APPLIED_COMMENT" = yes ] && [ "$APPLIED_LABELS" = no ]; then
+            echo "✅ framework staged one output to an artifact generically; the other applied — neither shim/applier implements staging"
+          else
+            echo "❌ Phase 4 failed (AGENT_OK=$AGENT_OK CALLED_LABELS=$CALLED_LABELS CALLED_COMMENT=$CALLED_COMMENT STAGED=$STAGED APPLIED_COMMENT=$APPLIED_COMMENT APPLIED_LABELS=$APPLIED_LABELS)"
+            echo "-- so-server.log --"; cat so-server.log 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Upload safe-outputs artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-safeoutputs
+          path: |
+            console.log
+            gateway.log
+            so-server.log
+            vm_config.json
+            so-staged/**
+            so-calls.jsonl
+            so-applied.jsonl
+          if-no-files-found: ignore

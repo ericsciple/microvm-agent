@@ -60,6 +60,7 @@ server. The harness keeps that secret host-side and never puts it in the guest's
 ## Related
 
 - `ericsciple/safe-outputs` — the context-aware safe-output MCP servers this harness wires in.
+- **`docs/prototype-lessons.md`** — hard-won findings from the proven prototype (read this before
+  building); **`docs/proven-prototype/`** — the verbatim, green phase workflows to lift recipes from.
 - Plan + proven phase workflows: `github/ericsciple-planning`
-  (`work/ACTIONS-AGENT-STEP-PROTOTYPE/harness-action-plan.md`,
-  `.github/workflows/agent-sandbox-phase{0..6}-*.yml`).
+  (`work/ACTIONS-AGENT-STEP-PROTOTYPE/harness-action-plan.md`).

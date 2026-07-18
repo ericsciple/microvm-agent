@@ -1,0 +1,168 @@
+name: "Agent sandbox — Phase 0: KVM + Firecracker probe"
+
+# Phase 0 of ACTIONS-AGENT-STEP-PROTOTYPE (prototypes github/c2c-actions#10310).
+# Confirms a standard ubuntu-latest runner exposes a usable /dev/kvm and boots a
+# Firecracker microVM. See work/ACTIONS-AGENT-STEP-PROTOTYPE/plan.md.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/agent-sandbox-phase0-kvm.yml
+
+permissions:
+  contents: read
+
+jobs:
+  kvm-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe CPU virtualization + /dev/kvm
+        run: |
+          set -x
+          {
+            echo "## KVM probe (ubuntu-latest)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "== uname =="; uname -a
+
+          echo "== CPU virtualization flags (vmx=Intel, svm=AMD) =="
+          VMX_SVM_COUNT=$(grep -Ec '(vmx|svm)' /proc/cpuinfo || true)
+          grep -Eo '(vmx|svm)' /proc/cpuinfo | sort -u || echo "no vmx/svm flags present"
+          echo "vmx/svm flag count: ${VMX_SVM_COUNT}"
+
+          echo "== lsmod | grep kvm =="
+          lsmod | grep kvm || echo "kvm module not loaded"
+
+          echo "== /dev/kvm =="
+          if [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            KVM_PRESENT=yes
+          else
+            echo "/dev/kvm does NOT exist"
+            KVM_PRESENT=no
+          fi
+
+          echo "== read/write access as $(whoami) =="
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "rw access OK"
+          else
+            echo "no rw access as $(whoami) (may still work via sudo/setfacl)"
+          fi
+
+          echo "== kvm-ok =="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpu-checker
+          sudo kvm-ok || true
+
+          echo "KVM_PRESENT=${KVM_PRESENT}" >> "$GITHUB_ENV"
+          {
+            echo "KVM_PRESENT=${KVM_PRESENT}"
+            echo "vmx/svm flag count: ${VMX_SVM_COUNT}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Boot a Firecracker microVM
+        if: env.KVM_PRESENT == 'yes'
+        run: |
+          set -x
+          ARCH="$(uname -m)"
+          sudo apt-get install -y -qq squashfs-tools jq
+
+          # Ensure this user can read/write /dev/kvm.
+          sudo setfacl -m u:"${USER}":rw /dev/kvm 2>/dev/null || sudo chmod 666 /dev/kvm || true
+
+          S3="https://s3.amazonaws.com/spec.ccfc.min"
+
+          # Latest Firecracker CI artifact set (YYYYMMDD-*).
+          CI_PREFIX=$(curl -fsSL "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" \
+            | grep -oP "(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)" | sort | tail -1)
+          echo "CI artifact prefix: ${CI_PREFIX}"
+
+          # Guest kernel (uncompressed vmlinux).
+          KERNEL_KEY=$(curl -fsSL "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/vmlinux-" \
+            | grep -oP "(?<=<Key>)(${CI_PREFIX}${ARCH}/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" \
+            | sort -V | tail -1)
+          echo "kernel: ${KERNEL_KEY}"
+          wget -q "$S3/${KERNEL_KEY}" -O vmlinux
+
+          # Ubuntu rootfs (squashfs) -> ext4 image.
+          UBUNTU_KEY=$(curl -fsSL "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/ubuntu-" \
+            | grep -oP "(?<=<Key>)(${CI_PREFIX}${ARCH}/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)" \
+            | sort -V | tail -1)
+          echo "rootfs: ${UBUNTU_KEY}"
+          wget -q "$S3/${UBUNTU_KEY}" -O rootfs.squashfs
+          unsquashfs -q -d squashfs-root rootfs.squashfs
+          sudo chown -R root:root squashfs-root
+          truncate -s 1G rootfs.ext4
+          sudo mkfs.ext4 -q -d squashfs-root -F rootfs.ext4
+
+          # Firecracker binary (latest release).
+          REL="https://github.com/firecracker-microvm/firecracker/releases"
+          LATEST=$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' ${REL}/latest)")
+          curl -sSL "${REL}/download/${LATEST}/firecracker-${LATEST}-${ARCH}.tgz" | tar -xz
+          mv "release-${LATEST}-${ARCH}/firecracker-${LATEST}-${ARCH}" firecracker
+          chmod +x firecracker
+          ./firecracker --version
+
+          cat > vm_config.json <<'EOF'
+          {
+            "boot-source": {
+              "kernel_image_path": "vmlinux",
+              "boot_args": "console=ttyS0 reboot=k panic=1"
+            },
+            "drives": [
+              {
+                "drive_id": "rootfs",
+                "path_on_host": "rootfs.ext4",
+                "is_root_device": true,
+                "is_read_only": false
+              }
+            ],
+            "machine-config": {
+              "vcpu_count": 2,
+              "mem_size_mib": 1024
+            }
+          }
+          EOF
+
+          rm -f /tmp/fc.sock
+          echo "== booting microVM (serial console -> console.log, 45s budget) =="
+          # timeout tears the VM down cleanly (SIGTERM, then SIGKILL after 5s) so we
+          # never need to hunt for the PID.
+          sudo timeout -k 5 45 ./firecracker --api-sock /tmp/fc.sock --config-file vm_config.json \
+            > console.log 2>&1 || true
+
+          echo "== console.log (tail) =="
+          tail -n 80 console.log || true
+
+          # Grade the boot from serial-console markers.
+          KERNEL_UP=no; ROOTFS_UP=no; USERSPACE_UP=no
+          grep -q "Linux version"                       console.log && KERNEL_UP=yes
+          grep -Eq "EXT4-fs .*mounted filesystem|EXT4-fs \(vda\)" console.log && ROOTFS_UP=yes
+          grep -Eq "login:|Welcome to Ubuntu|systemd\[1\]|Run /sbin/init" console.log && USERSPACE_UP=yes
+
+          {
+            echo "## Firecracker boot"
+            echo "- Firecracker version: \`$(./firecracker --version | head -1)\`"
+            echo "- Kernel started (KVM works): **${KERNEL_UP}**"
+            echo "- Rootfs mounted (virtio-blk works): **${ROOTFS_UP}**"
+            echo "- Userspace/init reached: **${USERSPACE_UP}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$KERNEL_UP" = "yes" ]; then
+            echo "✅ microVM kernel booted under KVM on ubuntu-latest"
+          else
+            echo "❌ kernel did not boot — inspect the console.log artifact"
+          fi
+
+      - name: Upload boot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firecracker-boot
+          path: |
+            console.log
+            vm_config.json
+          if-no-files-found: ignore
