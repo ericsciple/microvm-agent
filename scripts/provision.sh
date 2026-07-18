@@ -33,5 +33,18 @@ if [ ! -x firecracker ]; then
   chmod +x firecracker
 fi
 
+# The credential gateway uses mitmproxy (mitmdump). It is a HARNESS dependency, not
+# something the workflow author should have to install — so install it here if it's
+# missing. pipx (isolated) is preferred; fall back to pip. Installs to ~/.local/bin,
+# which main.js adds to PATH when it launches the gateway.
+if ! command -v mitmdump >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/mitmdump" ]; then
+  echo "installing mitmproxy (gateway dependency)"
+  if command -v pipx >/dev/null 2>&1; then
+    pipx install mitmproxy >/dev/null
+  else
+    pip3 install --user mitmproxy >/dev/null 2>&1 || pip3 install --break-system-packages mitmproxy >/dev/null
+  fi
+fi
+
 ./firecracker --version | head -1
 echo "provisioned into ${WORKDIR}"

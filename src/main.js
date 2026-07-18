@@ -41,6 +41,11 @@ const FAKE_TOKEN = "ghs_FAKE_GUEST_TOKEN_DO_NOT_USE";
 const DISPATCH_PORT = 9000;
 const GATEWAY_PORT = 8080;
 
+// provision.sh installs mitmproxy (the gateway) to ~/.local/bin; make sure that's
+// on PATH when we invoke mitmdump, even if the runner hasn't added it yet.
+const LOCAL_BIN = path.join(process.env.HOME || "/root", ".local", "bin");
+const GATEWAY_ENV = { ...process.env, PATH: `${LOCAL_BIN}:${process.env.PATH || ""}` };
+
 // Well-known guest mount points, mirroring the Actions container-job convention
 // (actions/runner ContainerInfo.cs maps the work dir -> /__w and the tool cache ->
 // /__t). We map the host paths to these fixed locations and set GITHUB_WORKSPACE /
@@ -150,7 +155,7 @@ async function main() {
     ["--mode", "transparent", "--listen-host", "0.0.0.0", "--listen-port", String(GATEWAY_PORT), "-s", path.join(SCRIPTS, "gw_addon.py"), "-q", "--set", "block_global=false"],
     {
       stdio: ["ignore", gwLog, gwLog],
-      env: { ...process.env, REAL_TOKEN: inputs.githubToken, FAKE_TOKEN, EXTRA_ALLOW: inputs.firewallAllow.join(",") },
+      env: { ...GATEWAY_ENV, REAL_TOKEN: inputs.githubToken, FAKE_TOKEN, EXTRA_ALLOW: inputs.firewallAllow.join(",") },
     }
   );
   const dispatch = createDispatchServer(registry, { log });
@@ -231,7 +236,7 @@ function freshDir(p) {
 function generateGatewayCa(inject) {
   // A short mitmdump run generates ~/.mitmproxy/mitmproxy-ca-cert.pem.
   try {
-    execFileSync("bash", ["-c", "timeout 8 mitmdump -q >/dev/null 2>&1 || true"], { stdio: "ignore" });
+    execFileSync("bash", ["-c", "timeout 8 mitmdump -q >/dev/null 2>&1 || true"], { stdio: "ignore", env: GATEWAY_ENV });
   } catch {
     /* the timeout exit is expected */
   }

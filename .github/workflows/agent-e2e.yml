@@ -34,12 +34,9 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install safe-outputs (on PATH) + mitmproxy
-        run: |
-          npm install -g github:ericsciple/safe-outputs
-          safe-outputs --help >/dev/null 2>&1 || true
-          pipx install mitmproxy
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # Put the safe-outputs CLI on PATH the Actions way. mitmproxy (the harness's
+      # credential gateway) is installed by microvm-agent itself — not here.
+      - uses: ericsciple/safe-outputs/setup@main
 
       - name: Seed candidate labels + build the triage prompt
         id: prep

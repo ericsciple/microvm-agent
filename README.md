@@ -6,9 +6,8 @@ Action. This is the **microVM harness** from the "Securely running agents in Act
 trusted — the job token, the egress firewall, the MCP gateway, the MCP servers, and the inference
 proxy — stays on the runner host, outside the VM. Safe by default.
 
-> **Status: scaffold / prototype.** The action is not runnable yet. The isolation mechanisms are
-> already proven (see the plan and phase workflows referenced in `TODO.md`); this repo is where they
-> get packaged into a reusable action. See `TODO.md` for the build checklist.
+> **Status: prototype.** The core is built and proven end to end (issue → microVM agent →
+> add-labels safe output lands a label). See `TODO.md` for what's done and what remains.
 
 ## Intended usage
 
@@ -21,6 +20,9 @@ jobs:
       issues: write             # for the add-labels / add-comment safe outputs
     steps:
       - uses: actions/checkout@v4
+      # Put safe-outputs on PATH the Actions way (the harness installs its own
+      # gateway/mitmproxy internally — you don't add anything for that).
+      - uses: ericsciple/safe-outputs/setup@v1
       # setup-* steps run here, on the host; their tool caches are mounted into the guest
       - uses: ericsciple/microvm-agent@v0
         with:
@@ -39,6 +41,14 @@ jobs:
 
 A safe output is just an MCP server, so you give it a token through its own `env`, like any MCP
 server. The harness keeps that secret host-side and never puts it in the guest's config.
+
+## Requirements
+
+Runs on a KVM-capable Linux runner (standard `ubuntu-latest` works — `/dev/kvm` is available).
+The harness installs its own dependencies (Firecracker, kernel, and **mitmproxy** for the
+credential gateway) during provisioning; `docker`, `sudo`, and `iptables` are expected on the
+runner (present on hosted runners). The one thing you add is the safe-outputs CLI, via
+`ericsciple/safe-outputs/setup@v1`.
 
 ## Design (what the action does)
 

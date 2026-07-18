@@ -1,6 +1,5 @@
 # Example for a CONSUMER's repo (place in their .github/workflows/). Do NOT add this to
-# .github/workflows/ of the microvm-agent repo itself. Aspirational — the action is a
-# scaffold; see TODO.md.
+# .github/workflows/ of the microvm-agent repo itself.
 name: Issue triage
 on:
   issues:
@@ -14,6 +13,9 @@ jobs:
       issues: write             # used by the add-labels safe output's token
     steps:
       - uses: actions/checkout@v4
+      # Put the safe-outputs CLI on PATH (the Actions way). The harness installs its
+      # own gateway (mitmproxy) internally — you don't add anything for that.
+      - uses: ericsciple/safe-outputs/setup@v1
       - uses: ericsciple/microvm-agent@v0
         with:
           prompt: "Read this issue and apply the most relevant labels."
@@ -29,3 +31,4 @@ jobs:
                 }
               }
             }
+
