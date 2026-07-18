@@ -111,16 +111,12 @@ async function main() {
   try {
     writeVmConfig(rootfs);
     const seconds = Math.max(60, inputs.timeoutMinutes * 60);
-    const outFd = fs.openSync(consoleLog, "w");
-    try {
-      execFileSync(
-        "sudo",
-        ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", "/tmp/mv-fc.sock", "--config-file", path.join(WORK, "vm_config.json")],
-        { stdio: ["ignore", outFd, outFd] }
-      );
-    } finally {
-      fs.closeSync(outFd);
-    }
+    // IMPORTANT: boot with async spawn, NOT execFileSync. The dispatch HTTP
+    // server lives in this same process; a synchronous boot would block the event
+    // loop for the whole VM lifetime, so the guest's shim calls to :9000 would
+    // hang with no response. Awaiting the child keeps the event loop free to serve
+    // dispatch (and the gateway) while the guest runs.
+    await bootVm(seconds, consoleLog);
     status = gradeConsole(consoleLog);
   } catch {
     // firecracker is reaped by the host timeout; grade from the console regardless.
@@ -136,6 +132,34 @@ async function main() {
   }
   setStatus(status);
   if (status !== "completed") process.exitCode = 1;
+}
+
+/**
+ * Boot the guest and resolve when it exits. The host `timeout` reaps the VM at
+ * the deadline, and a guest reboot makes firecracker exit cleanly, so a non-zero
+ * exit is expected and not treated as an error (the console is graded instead).
+ */
+function bootVm(seconds, consoleLog) {
+  return new Promise((resolve) => {
+    const outFd = fs.openSync(consoleLog, "w");
+    const child = spawn(
+      "sudo",
+      ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", "/tmp/mv-fc.sock", "--config-file", path.join(WORK, "vm_config.json")],
+      { stdio: ["ignore", outFd, outFd] }
+    );
+    child.on("close", () => {
+      fs.closeSync(outFd);
+      resolve();
+    });
+    child.on("error", () => {
+      try {
+        fs.closeSync(outFd);
+      } catch {
+        /* already closed */
+      }
+      resolve();
+    });
+  });
 }
 
 function gradeConsole(consoleLog) {
