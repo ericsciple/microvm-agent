@@ -1,4 +1,6 @@
-# Example (aspirational — the action is a scaffold; see TODO.md).
+# Example for a CONSUMER's repo (place in their .github/workflows/). Do NOT add this to
+# .github/workflows/ of the microvm-agent repo itself. Aspirational — the action is a
+# scaffold; see TODO.md.
 name: Issue triage
 on:
   issues:

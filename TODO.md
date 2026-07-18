@@ -5,6 +5,16 @@ host tooling the phase scripts use). The isolation mechanisms are proven in
 `github/ericsciple-planning/.github/workflows/agent-sandbox-phase{0..6}-*.yml`; the work here is
 porting them into a reusable action with the logic in Node.
 
+## ⚠️ No Actions workflows in this repo
+
+Do **not** add `.github/workflows/` to this repo. It is a personal public repo and workflow runs
+would eat into the personal Actions budget. This repo is **action code only**, referenced by
+`uses: ericsciple/microvm-agent@<ref>` from elsewhere. The end-to-end proof workflow
+(`issues: opened` → `microvm-agent` → add-labels safe output) lives in an **org-owned** repo
+(e.g. `github/ericsciple-planning`), not here. The `examples/` file is documentation for a
+*consumer's* repo, not a workflow to run here. (Consider disabling Actions in Settings → Actions
+so default setup features like CodeQL default setup don't consume budget either.)
+
 ## Ground truth to port from (proven, all green on `ubuntu-latest`)
 
 - phase0-kvm — `/dev/kvm` check + Firecracker boot
@@ -39,7 +49,11 @@ porting them into a reusable action with the logic in Node.
 - [ ] **Egress:** apply `firewall-allow` on top of deny-all.
 - [ ] **Teardown + outputs:** stop VM/gateway/firewall/servers; set `status` output; honor
       `timeout-minutes`.
-- [ ] **Package:** tag `v0`, add an example workflow (see `examples/`), document required permissions.
+- [ ] **Package:** tag `v0`, keep the `examples/` file as docs (do NOT put it in `.github/workflows/`),
+      document required permissions.
+- [ ] **Prove end-to-end** from an **org-owned** repo (e.g. `github/ericsciple-planning`): an
+      `issues: opened` workflow that `uses: ericsciple/microvm-agent@<ref>` with an add-labels safe
+      output, landing a label on a real issue. Not from this repo (budget).
 
 ## Key correctness notes
 
