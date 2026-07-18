@@ -34,6 +34,23 @@ inputs:
     description: "Extra egress hosts (newline-separated) allowed on top of the deny-all baseline."
     required: false
     default: ""
+  mounts:
+    description: >-
+      Which host paths to expose inside the guest (cumulative enum):
+      'none' mounts nothing (hermetic agent); 'workspace' (default) mounts
+      GITHUB_WORKSPACE read-only with a throwaway write overlay; 'workspace+toolcache'
+      also mounts RUNNER_TOOL_CACHE read-only. Mounted at identical guest paths so
+      GITHUB_WORKSPACE/RUNNER_TOOL_CACHE/PATH need no translation. Writes are discarded;
+      the only durable output path is a safe output.
+    required: false
+    default: "workspace"
+  copy-event:
+    description: >-
+      Copy the triggering event payload (GITHUB_EVENT_PATH's event.json) into the guest
+      as agent context, and repoint GITHUB_EVENT_PATH at the copy. Only event.json is
+      copied — never RUNNER_TEMP. Set to 'false' to withhold it.
+    required: false
+    default: "true"
   timeout-minutes:
     description: "Hard cap on the agent run."
     required: false

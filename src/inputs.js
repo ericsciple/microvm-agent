@@ -1,7 +1,9 @@
-// Read and normalize action inputs (SCAFFOLD).
+// Read and normalize action inputs.
 //
 // GitHub Actions passes inputs as INPUT_<NAME> env vars (uppercased, spaces->_).
-// TODO: consider @actions/core for parsing/typing; kept dependency-free here.
+// Kept dependency-free (no @actions/core).
+
+const MOUNT_MODES = ["none", "workspace", "workspace+toolcache"];
 
 function input(name, fallback = "") {
   const key = "INPUT_" + name.replace(/ /g, "_").toUpperCase();
@@ -10,6 +12,13 @@ function input(name, fallback = "") {
 }
 
 export function readInputs() {
+  const mounts = input("mounts", "workspace");
+  if (!MOUNT_MODES.includes(mounts)) {
+    throw new Error(
+      `Invalid 'mounts' value '${mounts}'. Expected one of: ${MOUNT_MODES.join(", ")}.`
+    );
+  }
+
   return {
     prompt: input("prompt"),
     model: input("model", "auto"),
@@ -20,7 +29,19 @@ export function readInputs() {
       .map((s) => s.trim())
       .filter(Boolean),
     timeoutMinutes: parseInt(input("timeout-minutes", "15"), 10),
+    // Which host paths to expose in the guest (cumulative enum). Default mounts
+    // GITHUB_WORKSPACE read-only with a throwaway write overlay; 'workspace+toolcache'
+    // also mounts RUNNER_TOOL_CACHE read-only (opt-in due to a glibc/ABI caveat).
+    mounts,
+    // Copy the event payload into the guest by default (agent context only). Only
+    // event.json is ever copied — never RUNNER_TEMP (checkout persists a token there).
+    copyEvent: input("copy-event", "true") !== "false",
+    // Ambient host paths (provided by the Actions runner), used for mounts + event.
+    workspace: process.env.GITHUB_WORKSPACE || "",
+    toolCache: process.env.RUNNER_TOOL_CACHE || "",
+    eventPath: process.env.GITHUB_EVENT_PATH || "",
     // Host-side only. Never written into the guest MCP config.
     githubToken: input("github-token") || process.env.GITHUB_TOKEN || "",
   };
 }
+

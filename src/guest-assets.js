@@ -57,13 +57,60 @@ export function generateShim(tool, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}
 }
 
 /**
- * The guest init script: bring up networking, trust the gateway CA, export the
- * Copilot CLI auth env, and run the agent with the prompt. Ported from the proven
- * phase1/phase4 init.
- * @param {{guestIp?: string, hostIp?: string, dns?: string}} [opts]
+ * Generate the bash that mounts the requested host images inside the guest.
+ * - workspace: mount the RO image as an overlay lowerdir, with a tmpfs upper, at
+ *   the identical host path — so writes are captured in memory and discarded, and
+ *   GITHUB_WORKSPACE/PATH need no translation. The RO lower is hypervisor-enforced.
+ * - toolcache: mount the RO image directly at its identical host path.
+ * @param {{workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
  * @returns {string}
  */
-export function generateInitScript({ guestIp = "172.16.0.2", hostIp = "172.16.0.1", dns = "8.8.8.8" } = {}) {
+export function generateMountSetup({ workspace = null, toolcache = null } = {}) {
+  let out = "";
+  if (workspace) {
+    out +=
+      `\n# --- workspace: hypervisor read-only lower + throwaway tmpfs overlay ---\n` +
+      `mkdir -p /mnt/mv-ws-lower /mnt/mv-ws-rw ${shq(workspace.path)}\n` +
+      `mount -o ro ${shq(workspace.dev)} /mnt/mv-ws-lower\n` +
+      `mount -t tmpfs tmpfs /mnt/mv-ws-rw\n` +
+      `mkdir -p /mnt/mv-ws-rw/upper /mnt/mv-ws-rw/work\n` +
+      `mount -t overlay overlay -o lowerdir=/mnt/mv-ws-lower,upperdir=/mnt/mv-ws-rw/upper,workdir=/mnt/mv-ws-rw/work ${shq(workspace.path)}\n`;
+  }
+  if (toolcache) {
+    out +=
+      `\n# --- toolcache: hypervisor read-only mount at its identical path ---\n` +
+      `mkdir -p ${shq(toolcache.path)}\n` +
+      `mount -o ro ${shq(toolcache.dev)} ${shq(toolcache.path)}\n`;
+  }
+  return out;
+}
+
+function shq(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The guest init script: bring up networking, trust the gateway CA, set up any
+ * requested mounts, export the Copilot CLI auth env, and run the agent with the
+ * prompt. Ported from the proven phase1/phase4/phase6 init.
+ * @param {Object} [opts]
+ * @param {string} [opts.guestIp]
+ * @param {string} [opts.hostIp]
+ * @param {string} [opts.dns]
+ * @param {{workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @returns {string}
+ */
+export function generateInitScript({
+  guestIp = "172.16.0.2",
+  hostIp = "172.16.0.1",
+  dns = "8.8.8.8",
+  mounts = {},
+} = {}) {
+  const mountSetup = generateMountSetup(mounts);
+  const addDirs = ["/root"];
+  if (mounts.workspace) addDirs.push(mounts.workspace.path);
+  const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
+
   return `#!/bin/bash
 set -x
 mount -t proc proc /proc 2>/dev/null || true
@@ -75,7 +122,7 @@ ip link set eth0 up
 ip route add default via ${hostIp}
 echo 'nameserver ${dns}' > /etc/resolv.conf
 update-ca-certificates 2>/dev/null || true
-
+${mountSetup}
 export HOME=/root
 export XDG_CONFIG_HOME=/root
 export COPILOT_AGENT_RUNNER_TYPE=STANDALONE
@@ -88,7 +135,7 @@ cd /root
 
 echo "=== GUEST: starting copilot ==="
 copilot --no-ask-user --allow-all-tools \\
-  --add-dir /root --log-level all --log-dir /tmp/cplogs \\
+  ${addDirFlags} --log-level all --log-dir /tmp/cplogs \\
   -p "$(cat /etc/prompt.txt)" 2>&1 | tee /dev/console
 echo "=== GUEST: AGENT_EXIT=\${PIPESTATUS[0]} ==="
 
@@ -101,7 +148,8 @@ sleep infinity
 
 /**
  * Dockerfile for the guest rootfs: Debian slim + the standalone Copilot CLI +
- * device nodes + the generated shims. Ported from phase4.
+ * device nodes + the generated shims. Ported from phase4. `util-linux` provides
+ * `mount` for the virtio-block workspace/toolcache mounts (phase6).
  * @param {string[]} shimNames
  * @returns {string}
  */
@@ -110,7 +158,7 @@ export function generateDockerfile(shimNames) {
   const chmodShims = shimNames.map((n) => `/usr/local/bin/${n}`).join(" ");
   return `FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-      ca-certificates curl iproute2 iptables procps jq \\
+      ca-certificates curl iproute2 iptables procps jq util-linux \\
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL --retry 3 -o /tmp/copilot.tgz \\
       https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz \\

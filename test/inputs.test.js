@@ -62,3 +62,34 @@ test("timeout-minutes is parsed as an integer", () => {
   const inputs = withEnv({ "INPUT_TIMEOUT-MINUTES": "30" }, readInputs);
   assert.equal(inputs.timeoutMinutes, 30);
 });
+
+test("mounts defaults to 'workspace'", () => {
+  const inputs = withEnv({ INPUT_PROMPT: "x" }, readInputs);
+  assert.equal(inputs.mounts, "workspace");
+});
+
+test("mounts accepts the cumulative enum values", () => {
+  for (const v of ["none", "workspace", "workspace+toolcache"]) {
+    const inputs = withEnv({ INPUT_MOUNTS: v }, readInputs);
+    assert.equal(inputs.mounts, v);
+  }
+});
+
+test("an invalid mounts value is rejected", () => {
+  assert.throws(() => withEnv({ INPUT_MOUNTS: "everything" }, readInputs), /Invalid 'mounts'/);
+});
+
+test("copy-event defaults on and can be disabled", () => {
+  assert.equal(withEnv({ INPUT_PROMPT: "x" }, readInputs).copyEvent, true);
+  assert.equal(withEnv({ "INPUT_COPY-EVENT": "false" }, readInputs).copyEvent, false);
+});
+
+test("ambient host paths are surfaced for mounts + event", () => {
+  const inputs = withEnv(
+    { GITHUB_WORKSPACE: "/home/runner/work/r/r", RUNNER_TOOL_CACHE: "/opt/hostedtoolcache", GITHUB_EVENT_PATH: "/e.json" },
+    readInputs
+  );
+  assert.equal(inputs.workspace, "/home/runner/work/r/r");
+  assert.equal(inputs.toolCache, "/opt/hostedtoolcache");
+  assert.equal(inputs.eventPath, "/e.json");
+});

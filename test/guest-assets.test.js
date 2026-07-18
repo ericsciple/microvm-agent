@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateShim, generateDockerfile, generateInitScript, DEFAULT_DISPATCH_ENDPOINT } from "../src/guest-assets.js";
+import { generateShim, generateDockerfile, generateInitScript, generateMountSetup, DEFAULT_DISPATCH_ENDPOINT } from "../src/guest-assets.js";
 
 const addLabels = {
   name: "add_labels",
@@ -53,4 +53,35 @@ test("init script wires networking, auth env, and the prompt", () => {
   assert.ok(init.includes("S2STOKENS=true"));
   assert.ok(init.includes("GITHUB_COPILOT_INTEGRATION_ID=agentic-workflows"));
   assert.ok(init.includes('-p "$(cat /etc/prompt.txt)"'));
+});
+
+test("generateMountSetup is empty when nothing is mounted", () => {
+  assert.equal(generateMountSetup(), "");
+  assert.equal(generateMountSetup({}), "");
+});
+
+test("workspace mount is an RO lower + tmpfs overlay at the identical path", () => {
+  const s = generateMountSetup({ workspace: { dev: "/dev/vdb", path: "/home/runner/work/r/r" } });
+  assert.ok(s.includes("mount -o ro '/dev/vdb' /mnt/mv-ws-lower"));
+  assert.ok(s.includes("mount -t tmpfs tmpfs /mnt/mv-ws-rw"));
+  assert.ok(
+    s.includes("mount -t overlay overlay -o lowerdir=/mnt/mv-ws-lower,upperdir=/mnt/mv-ws-rw/upper,workdir=/mnt/mv-ws-rw/work '/home/runner/work/r/r'")
+  );
+});
+
+test("toolcache mount is a plain RO mount at the identical path", () => {
+  const s = generateMountSetup({ toolcache: { dev: "/dev/vdc", path: "/opt/hostedtoolcache" } });
+  assert.ok(s.includes("mount -o ro '/dev/vdc' '/opt/hostedtoolcache'"));
+  assert.ok(!s.includes("overlay")); // toolcache is read-only, no overlay
+});
+
+test("init adds --add-dir for a mounted workspace", () => {
+  const init = generateInitScript({ mounts: { workspace: { dev: "/dev/vdb", path: "/ws" } } });
+  assert.ok(init.includes("--add-dir '/root'"));
+  assert.ok(init.includes("--add-dir '/ws'"));
+  assert.ok(init.includes("mount -t overlay overlay"));
+});
+
+test("Dockerfile includes util-linux for mount support", () => {
+  assert.ok(generateDockerfile([]).includes("util-linux"));
 });

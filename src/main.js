@@ -60,7 +60,11 @@ async function main() {
   fs.mkdirSync(path.join(inject, "root", ".copilot"), { recursive: true });
   fs.mkdirSync(path.join(inject, "usr", "local", "share", "ca-certificates"), { recursive: true });
 
-  fs.writeFileSync(path.join(ctx, "init.sh"), generateInitScript());
+  // Plan the mounts: build a virtio-block image per host path and assign guest
+  // device names in drive order (rootfs is vda, so the first extra drive is vdb).
+  const { drives, initMounts } = planMounts(inputs);
+
+  fs.writeFileSync(path.join(ctx, "init.sh"), generateInitScript({ mounts: initMounts }));
   const shimNames = discovered.map((d) => d.name);
   for (const d of discovered) {
     fs.writeFileSync(path.join(ctx, d.name), generateShim({ name: d.name, inputSchema: d.inputSchema }));
@@ -68,7 +72,17 @@ async function main() {
   fs.writeFileSync(path.join(ctx, "Dockerfile"), generateDockerfile(shimNames));
 
   fs.writeFileSync(path.join(inject, "etc", "prompt.txt"), inputs.prompt + "\n");
-  fs.writeFileSync(path.join(inject, "etc", "agent.env"), `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`);
+
+  // Runtime agent env. The event payload is copied in (agent context only) and
+  // GITHUB_EVENT_PATH repointed at the guest copy — ONLY event.json is copied,
+  // never RUNNER_TEMP (checkout persists a push token there).
+  let agentEnv = `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`;
+  if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
+    fs.copyFileSync(inputs.eventPath, path.join(inject, "etc", "event.json"));
+    agentEnv += `export GITHUB_EVENT_PATH=/etc/event.json\n`;
+    log("copied event.json into the guest (GITHUB_EVENT_PATH repointed).");
+  }
+  fs.writeFileSync(path.join(inject, "etc", "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above).
   fs.writeFileSync(
     path.join(inject, "root", ".copilot", "mcp-config.json"),
@@ -79,12 +93,16 @@ async function main() {
   runScript("provision.sh", [WORK]);
   if (!process.env.MV_DRY_RUN) generateGatewayCa(inject);
 
-  // 5. Build the guest rootfs (docker export -> mkfs.ext4 -d, no loop mount).
+  // 5. Build the guest rootfs (docker export -> mkfs.ext4 -d, no loop mount) and
+  //    any requested mount images (workspace/toolcache -> virtio-block ext4).
   const rootfs = path.join(WORK, "rootfs.ext4");
   runScript("build-rootfs.sh", [ctx, inject, rootfs, "3G"]);
+  for (const drive of drives) {
+    runScript("build-mount-image.sh", [drive.src, drive.image]);
+  }
 
   if (process.env.MV_DRY_RUN) {
-    log("MV_DRY_RUN set: guest rootfs built; skipping network + gateway + boot.");
+    log(`MV_DRY_RUN set: guest rootfs + ${drives.length} mount image(s) built; skipping boot.`);
     return setStatus("dry-run");
   }
 
@@ -109,7 +127,7 @@ async function main() {
   let status = "failed";
   const consoleLog = path.join(WORK, "console.log");
   try {
-    writeVmConfig(rootfs);
+    writeVmConfig(rootfs, drives);
     const seconds = Math.max(60, inputs.timeoutMinutes * 60);
     // IMPORTANT: boot with async spawn, NOT execFileSync. The dispatch HTTP
     // server lives in this same process; a synchronous boot would block the event
@@ -186,17 +204,66 @@ function generateGatewayCa(inject) {
   fs.copyFileSync(ca, path.join(inject, "usr", "local", "share", "ca-certificates", "mitmproxy.crt"));
 }
 
-function writeVmConfig(rootfs) {
+function writeVmConfig(rootfs, extraDrives = []) {
   const config = {
     "boot-source": {
       kernel_image_path: path.join(WORK, "vmlinux"),
       boot_args: "console=ttyS0 reboot=k panic=1 init=/init",
     },
-    drives: [{ drive_id: "rootfs", path_on_host: rootfs, is_root_device: true, is_read_only: false }],
+    drives: [
+      { drive_id: "rootfs", path_on_host: rootfs, is_root_device: true, is_read_only: false },
+      // Extra drives follow the rootfs in order, so they appear as vdb, vdc, ...
+      ...extraDrives.map((d) => ({
+        drive_id: d.id,
+        path_on_host: d.image,
+        is_root_device: false,
+        is_read_only: true,
+      })),
+    ],
     "network-interfaces": [{ iface_id: "eth0", host_dev_name: "tap0", guest_mac: "06:00:AC:10:00:02" }],
     "machine-config": { vcpu_count: 2, mem_size_mib: 2048 },
   };
   fs.writeFileSync(path.join(WORK, "vm_config.json"), JSON.stringify(config, null, 2));
+}
+
+/**
+ * Decide which host paths to expose as virtio-block drives, assigning guest device
+ * names in drive order (rootfs=vda, so the first extra drive is vdb). Returns the
+ * drives to build/attach and the mount plan handed to the guest init.
+ * @param {ReturnType<import("./inputs.js").readInputs>} inputs
+ */
+function planMounts(inputs) {
+  const drives = [];
+  const initMounts = {};
+  if (inputs.mounts === "none") return { drives, initMounts };
+
+  const letters = "bcdefg";
+  let i = 0;
+  const nextDev = () => `/dev/vd${letters[i++]}`;
+
+  // workspace (RO lower + throwaway overlay), mounted at its identical host path.
+  if (inputs.workspace && fs.existsSync(inputs.workspace)) {
+    const dev = nextDev();
+    drives.push({ id: "workspace", src: inputs.workspace, image: path.join(WORK, "workspace.ext4") });
+    initMounts.workspace = { dev, path: inputs.workspace };
+    log(`mount: workspace ${inputs.workspace} (ro+overlay) -> ${dev}`);
+  } else if (inputs.mounts !== "none") {
+    log(`mount: workspace requested but GITHUB_WORKSPACE is unset/missing; skipping.`);
+  }
+
+  // toolcache (RO), opt-in via workspace+toolcache, at its identical host path.
+  if (inputs.mounts === "workspace+toolcache") {
+    if (inputs.toolCache && fs.existsSync(inputs.toolCache)) {
+      const dev = nextDev();
+      drives.push({ id: "toolcache", src: inputs.toolCache, image: path.join(WORK, "toolcache.ext4") });
+      initMounts.toolcache = { dev, path: inputs.toolCache };
+      log(`mount: toolcache ${inputs.toolCache} (ro) -> ${dev}`);
+    } else {
+      log(`mount: toolcache requested but RUNNER_TOOL_CACHE is unset/missing; skipping.`);
+    }
+  }
+
+  return { drives, initMounts };
 }
 
 function setStatus(status) {
