@@ -39,10 +39,10 @@ test("callTool rejects when the command cannot be spawned", async () => {
 
 // --- dispatch registry ---
 
-test("buildToolRegistry maps each tool to its server and skips github", async () => {
+test("buildToolRegistry maps each tool to its server and skips servers with no command", async () => {
   const registry = await buildToolRegistry([
     server({ FIXTURE_TOOL: "add_labels" }),
-    { name: "github", kind: "github", env: { GITHUB_TOKEN: "x" } },
+    { name: "no-command", kind: "custom", env: { GITHUB_TOKEN: "x" } },
   ]);
   assert.deepEqual(Object.keys(registry), ["add_labels"]);
   assert.equal(registry.add_labels.name, "fixture");

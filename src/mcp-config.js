@@ -5,23 +5,26 @@
 // absolute: **nothing in `guestConfig` may contain a real secret**, because the
 // guest (the sandboxed agent, running as root inside the microVM) can read it.
 //
-// The proven model (docs/proven-prototype/phase4) splits servers two ways:
+// EVERY MCP server runs host-side and is exposed to the guest as a CLI shim — a
+// thin forwarder on the guest PATH that POSTs `{tool, args}` to the host dispatch
+// endpoint (172.16.0.1:9000). The real server runs host-side with its declared
+// `env` (which may hold secrets); the guest sees only the shim, and NO server is
+// written into the guest MCP config. This is uniform: the standalone Copilot CLI
+// blocks *custom* MCP servers under its registry policy, so nothing is delivered
+// as a native guest MCP entry.
 //
-//   1. The default read-only `github` server is the ONE server the standalone
-//      Copilot CLI allows under its MCP registry policy, so it stays a real MCP
-//      server in the guest config. It reaches api.github.com through the host
-//      gateway, which swaps the guest's *fake* token for the real one — so no real
-//      token is ever written into the guest config.
-//
-//   2. Every other server (safe outputs and third-party tools alike) is a *custom*
-//      MCP server, which the CLI blocks under policy. These are delivered as CLI
-//      shims on the guest PATH: thin forwarders that POST `{tool, args}` to a host
-//      dispatch endpoint (172.16.0.1:9000 in the prototype). The real server runs
-//      host-side with its declared `env` (which may hold secrets, e.g. a safe
-//      output's `GITHUB_TOKEN: ${{ github.token }}`); the guest sees only the shim.
-//      Safe outputs are NOT special-cased — every custom server is handled this way.
+//   - User servers (safe outputs + third-party tools) carry their own secrets in
+//     their `env` block (e.g. a safe output's `GITHUB_TOKEN: ${{ github.token }}`).
+//   - The default read-only `github` server runs the official github-mcp-server
+//     image host-side over stdio (docker), with the real token host-side and
+//     GITHUB_READ_ONLY=1 — the same "local mode" gh-aw uses. It is NOT special-
+//     cased: it flows through the identical host-launch + tools/list shim path.
 
 const DEFAULT_GITHUB_SERVER_NAME = "github";
+
+// Pinned github-mcp-server image (matches gh-aw's DefaultGitHubMCPServerVersion).
+// Bump deliberately; keep in sync with a supply-chain-safe pin when productizing.
+const GITHUB_MCP_IMAGE = "ghcr.io/github/github-mcp-server:v1.6.0";
 
 /**
  * @param {ReturnType<import("./inputs.js").readInputs>} inputs
@@ -29,8 +32,8 @@ const DEFAULT_GITHUB_SERVER_NAME = "github";
  *
  * @typedef {Object} HostServer
  * @property {string} name
- * @property {"github"|"custom"} kind - how it's exposed to the guest
- * @property {string} [command] - executable to launch host-side (custom servers)
+ * @property {"github"|"custom"} kind - informational label; all servers are shim-dispatched
+ * @property {string} [command] - executable to launch host-side
  * @property {string[]} [args]
  * @property {Record<string,string>} env - the server's environment; may hold secrets
  * @property {object} [def] - the remaining original server definition (custom servers)
@@ -47,16 +50,31 @@ export function buildGuestMcpConfig(inputs) {
     DEFAULT_GITHUB_SERVER_NAME
   );
 
-  // (1) Default read-only github server — a guest-visible MCP entry with a fake
-  // token sentinel (swapped to the real one at the gateway), never the real token.
+  // (1) Default read-only github server — the official github-mcp-server run
+  // host-side over stdio (docker), holding the REAL token host-side with
+  // GITHUB_READ_ONLY=1. Not written into the guest config; discovered like any
+  // other server and delivered to the guest as `github_*` CLI shims.
   if (inputs.githubMcp && !userDefinedGithub) {
-    guestServers[DEFAULT_GITHUB_SERVER_NAME] = githubReadOnlyGuestEntry();
     hostServers.push({
       name: DEFAULT_GITHUB_SERVER_NAME,
       kind: "github",
-      // The harness token is used host-side (gateway swap for the read-only github
-      // server); it is deliberately NOT part of any guest-visible config.
-      env: { GITHUB_TOKEN: inputs.githubToken },
+      command: "docker",
+      // `-e NAME` (no value) forwards NAME from the spawned process env (set below)
+      // into the container, so the real token never appears on the command line.
+      args: [
+        "run", "-i", "--rm",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "-e", "GITHUB_READ_ONLY",
+        "-e", "GITHUB_TOOLSETS",
+        "-e", "GITHUB_HOST",
+        GITHUB_MCP_IMAGE,
+      ],
+      env: {
+        GITHUB_PERSONAL_ACCESS_TOKEN: inputs.githubToken,
+        GITHUB_READ_ONLY: "1",
+        GITHUB_TOOLSETS: "default",
+        GITHUB_HOST: inputs.githubServerUrl || "https://github.com",
+      },
     });
   }
 
@@ -68,23 +86,6 @@ export function buildGuestMcpConfig(inputs) {
   }
 
   return { guestConfig: { mcpServers: guestServers }, hostServers };
-}
-
-/**
- * Guest-facing entry for the default read-only github MCP server. Carries a FAKE
- * token sentinel that the host gateway rewrites to the real token; the real token
- * never appears here.
- *
- * NOTE: the exact transport/URL of the CLI's github server through the gateway is
- * an OPEN QUESTION (see TODO.md "Default `github` server transport — HOW TO WIRE IT").
- * This shape is a non-functional placeholder — the github READ lane is not wired yet;
- * only the no-secret invariant is guaranteed here. The write lane (safe outputs) works.
- */
-function githubReadOnlyGuestEntry() {
-  return {
-    readOnly: true,
-    tokenEnv: "COPILOT_GITHUB_TOKEN", // fake sentinel in the guest; swapped at the gateway
-  };
 }
 
 /**

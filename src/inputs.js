@@ -40,6 +40,8 @@ export function readInputs() {
     workspace: process.env.GITHUB_WORKSPACE || "",
     toolCache: process.env.RUNNER_TOOL_CACHE || "",
     eventPath: process.env.GITHUB_EVENT_PATH || "",
+    // Base URL for the default github MCP server (GHES-aware); host-side only.
+    githubServerUrl: process.env.GITHUB_SERVER_URL || "https://github.com",
     // Host-side only. Never written into the guest MCP config.
     githubToken: input("github-token") || process.env.GITHUB_TOKEN || "",
   };

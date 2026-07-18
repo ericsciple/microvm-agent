@@ -19,9 +19,9 @@ import http from "node:http";
 import { callTool, listTools } from "./mcp-client.js";
 
 /**
- * Discover the tools advertised by each custom host server (via tools/list).
- * Servers of kind "github" (guest-visible MCP servers) and those without a
- * command are skipped.
+ * Discover the tools advertised by each host server (via tools/list). Servers
+ * without a command are skipped. All servers are shim-dispatched now, including
+ * the default `github` server (run host-side over docker/stdio).
  * @param {import("./mcp-config.js").HostServer[]} hostServers
  * @param {{log?: (msg:string)=>void}} [opts]
  * @returns {Promise<Array<{server: import("./mcp-config.js").HostServer, name: string, inputSchema?: object}>>}
@@ -29,7 +29,6 @@ import { callTool, listTools } from "./mcp-client.js";
 export async function discoverTools(hostServers, { log = () => {} } = {}) {
   const found = [];
   for (const server of hostServers) {
-    if (server.kind === "github") continue;
     if (!server.command) {
       log(`skipping server '${server.name}': no command to launch`);
       continue;
@@ -44,8 +43,6 @@ export async function discoverTools(hostServers, { log = () => {} } = {}) {
 
 /**
  * Discover which tool each host server advertises and build a tool -> server map.
- * Servers of kind "github" are skipped (they are guest-visible MCP servers, not
- * shim-dispatched).
  * @param {import("./mcp-config.js").HostServer[]} hostServers
  * @param {{log?: (msg:string)=>void}} [opts]
  * @returns {Promise<Record<string, import("./mcp-config.js").HostServer>>}

@@ -70,10 +70,12 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
         RO read at identical path, overlay write succeeds, toolcache write + remount-rw both blocked
         (hypervisor-enforced), and the host images stay pristine (writes discarded).
 - [x] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
-      `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) NOTE: the wiring is now **decided** —
-      run `ghcr.io/github/github-mcp-server` host-side over stdio via the shim/dispatch bridge (real
-      token host-side, `GITHUB_READ_ONLY=1`), same path as safe outputs. See the resolved open question
-      below; the current `githubReadOnlyGuestEntry()` placeholder should be replaced accordingly.
+      `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) **DONE + validated locally:** runs the
+      official `ghcr.io/github/github-mcp-server:v1.6.0` host-side over docker/stdio with the real
+      token host-side and `GITHUB_READ_ONLY=1`, discovered via the same `tools/list` shim path as safe
+      outputs (no guest MCP entry). Verified against the real image: 26 read-only tools discovered
+      (`get_file_contents`, `issue_read`, `list_commits`, …). The MCP client was hardened to do the
+      full MCP handshake (initialize + `notifications/initialized`) that real servers require.
 - [x] **MCP config merge + secret split:** `buildGuestMcpConfig` splits requested servers into a
       guest-visible config (no secrets) and a host-side server plan (real env). A fail-closed guard,
       `assertNoSecretsInGuestConfig`, asserts no host-server secret appears in the guest config; it
@@ -112,7 +114,7 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 
 ## Open questions (need @ericsciple input)
 
-- **Default `github` server — RESOLVED (align with gh-aw's *local* mode).** Run the official GitHub
+- **Default `github` server — RESOLVED + IMPLEMENTED (align with gh-aw's *local* mode).** Run the official GitHub
   MCP server **host-side as a normal stdio server**, exposed to the guest through the existing
   shim/dispatch bridge — *exactly like a safe output*. Do **not** special-case it, do **not** write a
   `github` entry into the guest MCP config, and do **not** use the mitmproxy fake→real token swap for
