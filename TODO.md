@@ -120,9 +120,21 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
   the host-side server that advertises that tool. Tool names are discovered by launching each server
   and calling `tools/list` at startup (`src/dispatch.js` / `src/mcp-client.js`). Validated locally
   end-to-end (including through a real microVM).
-- **Node build from a Codespace.** Per your workflow, I did not run the `ncc` bundle or commit
-  `dist/` here. Command to run in a Codespace: `npm i -D @vercel/ncc && npx ncc build src/main.js -o dist`
-  then commit `dist/`. Confirm `ncc` is the bundler you want (vs. esbuild).
+- **Node build from a Codespace (RESOLVED).** No bundler needed — the action is zero-dependency
+  ESM (`"type":"module"`) and `runs.main` points directly at `src/main.js`, so there's no `dist/`
+  to build or commit.
+
+## Options on the table (future)
+
+- **Node-native TLS-intercepting gateway (drop the mitmproxy/Python dependency).** Today the
+  credential gateway is `mitmproxy` (`mitmdump` + `gw_addon.py`), which the harness installs at
+  provision time (pip/pipx). Replacing it with a small Node-native TLS-terminating forward proxy
+  (generate a CA once, MITM `:443`, do the fake→real token swap + egress allowlist in JS) would make
+  the harness **fully self-contained** (Node-only, no Python/pip install) and shave provisioning time.
+  **Wanted**, provided it doesn't drastically bloat the guest/host footprint. Risks to weigh: correct
+  TLS termination + SNI/ALPN handling, CA trust in the guest (same as today), HTTP/2, and streaming.
+  A dependency-light approach (built-in `node:tls`/`node:http2` + a tiny cert-gen) is preferred over a
+  heavy proxy library.
 
 ## Key correctness notes
 
@@ -132,7 +144,11 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
   tools) carry their own secrets in their `env` block in `mcp-config`. For every server, the harness
   runs it host-side and **never writes the real secret into the guest MCP config**.
 - **Copilot MCP policy is ignored** for the prototype — use the CLI-shim path (phase4), not native
-  custom MCP servers.
+  custom MCP servers. This is why safe outputs appear to the agent as **shell commands** (e.g. the
+  prompt says "run `add_labels <label>`") rather than advertised MCP tools: the standalone Copilot CLI
+  blocks non-default MCP servers when it can't fetch the MCP registry policy (403 with an Actions
+  token), so custom servers are delivered as PATH shims invoked via the agent's bash tool. Native
+  custom MCP would need the automation policy path resolved.
 - **Node action, bash provisioning.** Logic (input parsing, MCP merge, safe-output wiring) in Node;
   low-level host setup shelled out to `scripts/*.sh`.
-- **Build from a Codespace** (not locally): `npm run build` (once wired) + commit `dist/`.
+- **Zero-dependency ESM action.** `runs.main` -> `src/main.js` directly; no `dist/` bundle to build.
