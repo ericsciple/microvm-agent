@@ -6,8 +6,11 @@
 //    or overridden by a user entry named `github`.
 //  - Identify safe-output servers (the `safe-outputs` app) and user servers.
 //  - Produce a guest-facing config that reaches every server through the gateway /
-//    CLI-shim, WITHOUT any real secret. Real tokens (job token, safe-output token,
-//    user server secrets) are injected host-side where each server actually runs.
+//    CLI-shim, WITHOUT any real secret. Secrets a server needs (e.g. the safe-output
+//    server's GITHUB_TOKEN, or a user server's API key) are declared in that server's
+//    own `env` block; the harness keeps them host-side where the server runs and strips
+//    them from the guest's copy. Safe outputs are NOT special-cased here — every server's
+//    secrets are handled the same way.
 //
 // This is the security-critical seam: nothing returned here may contain a real
 // credential, because the guest can read it.

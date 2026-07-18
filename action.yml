@@ -38,10 +38,12 @@ inputs:
     default: "15"
   github-token:
     description: >-
-      Token used host-side by the gateway and by safe-output MCP servers to act on
-      GitHub. Held on the host; the guest never sees it. Requires
-      'copilot-requests: write' for inference, plus whatever the enabled safe outputs
-      need (e.g. 'issues: write').
+      Token the HARNESS itself uses host-side — for the inference gateway
+      (copilot-requests) and the default read-only 'github' MCP server it provides.
+      Held on the host; the guest never sees it. NOTE: this is NOT how safe-output or
+      other user MCP servers get a token — those receive it via their own `env` block
+      in mcp-config (e.g. GITHUB_TOKEN: ${{ github.token }}), like any MCP server.
+      Requires 'copilot-requests: write' for inference.
     required: false
     default: ${{ github.token }}
 

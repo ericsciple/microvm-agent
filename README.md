@@ -28,19 +28,28 @@ jobs:
           mcp-config: |
             {
               "mcpServers": {
-                "labeler": { "command": "safe-outputs", "args": ["add-labels"] }
+                "labeler": {
+                  "command": "safe-outputs",
+                  "args": ["add-labels"],
+                  "env": { "GITHUB_TOKEN": "${{ github.token }}" }
+                }
               }
             }
 ```
+
+A safe output is just an MCP server, so you give it a token through its own `env`, like any MCP
+server. The harness keeps that secret host-side and never puts it in the guest's config.
 
 ## Design (what the action does)
 
 - **Runs on the host (trusted side).** Node.js entrypoint owns the logic (inputs, MCP config merge,
   safe-output wiring) and shells out to bash for host provisioning.
 - **microVM sandbox by default.** Firecracker; `/dev/kvm` on standard hosted runners (proven).
-- **Credentials stay host-side.** The `github-token` input (default `${{ github.token }}`) is held by
-  the gateway and the safe-output servers; the guest gets only fake sentinels. The real token is
-  **never** placed in the guest's MCP config.
+- **Credentials stay host-side.** The `github-token` input (default `${{ github.token }}`) is what the
+  **harness itself** uses host-side — for the inference gateway and the default read-only `github` server.
+  Servers the user adds (safe outputs, third-party tools) get their own secrets via their `env` block in
+  `mcp-config`. Either way the guest gets only fake sentinels; real tokens are **never** placed in the
+  guest's MCP config.
 - **Egress denied by default.** Host-enforced firewall + allowlist; extend with `firewall-allow`.
 - **Read-only mounts + throwaway overlay.** `GITHUB_WORKSPACE` and the Actions tool cache are mounted
   read-only; the agent writes into a discarded overlay. Persisting changes happens only via safe

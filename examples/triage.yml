@@ -8,16 +8,22 @@ jobs:
   triage:
     runs-on: ubuntu-latest
     permissions:
-      copilot-requests: write   # inference through the gateway
-      issues: write             # for the add-labels safe output
+      copilot-requests: write   # inference through the gateway (harness github-token)
+      issues: write             # used by the add-labels safe output's token
     steps:
       - uses: actions/checkout@v4
       - uses: ericsciple/microvm-agent@v0
         with:
           prompt: "Read this issue and apply the most relevant labels."
+          # Safe outputs are just MCP servers: give them a token via their own env,
+          # exactly like any MCP server. The harness keeps it host-side.
           mcp-config: |
             {
               "mcpServers": {
-                "labeler": { "command": "safe-outputs", "args": ["add-labels"] }
+                "labeler": {
+                  "command": "safe-outputs",
+                  "args": ["add-labels"],
+                  "env": { "GITHUB_TOKEN": "${{ github.token }}" }
+                }
               }
             }

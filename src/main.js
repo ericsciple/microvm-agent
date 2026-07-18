@@ -33,9 +33,11 @@ async function main() {
   //    - default read-only github MCP server (unless github-mcp=false or overridden
   //      by a user 'github' entry)
   //    - user servers from mcp-config
-  //    - safe-output servers (github/ericsciple safe-outputs): launch host-side with
-  //      GITHUB_TOKEN + GITHUB_EVENT_PATH in *their* env; expose to the guest via the
-  //      CLI-shim path (phase4). NEVER put the token in the guest config.
+  //    - safe-output servers (github/ericsciple safe-outputs): user-added MCP servers, not
+  //      special-cased. The harness runs them host-side (where GITHUB_EVENT_PATH is available)
+  //      with the env from their own config — which carries GITHUB_TOKEN via ${{ github.token }},
+  //      like any MCP server secret — and scrubs that secret from the guest's config (phase4
+  //      CLI-shim). The token is NOT auto-injected by the harness.
   const guestMcpConfig = buildGuestMcpConfig(inputs); // TODO: real merge + shims
 
   // 3. RUN (guest) — TODO: launch Copilot CLI in the microVM

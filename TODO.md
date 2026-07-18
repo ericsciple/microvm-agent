@@ -31,9 +31,11 @@ porting them into a reusable action with the logic in Node.
 - [ ] **MCP config merge + shims:** finish `buildGuestMcpConfig` — strip real secrets from the guest
       config, place servers host-side, deliver via CLI-shim (phase4). **Do not** put the token in the
       guest config.
-- [ ] **Safe outputs wiring:** launch `safe-outputs <op>` servers host-side with `GITHUB_TOKEN` +
-      `GITHUB_EVENT_PATH` in their env; expose to the guest as shims. Prove `add-labels` end-to-end
-      against a throwaway issue.
+- [ ] **Safe outputs wiring:** the user adds `safe-outputs <op>` servers via `mcp-config` with their
+      token in their own `env` block (`GITHUB_TOKEN: ${{ github.token }}`). The harness runs them
+      host-side (inheriting `GITHUB_EVENT_PATH`), applies that env, and scrubs the secret from the guest
+      config; expose to the guest as shims. Not special-cased vs other user servers. Prove `add-labels`
+      end-to-end against a throwaway issue.
 - [ ] **Egress:** apply `firewall-allow` on top of deny-all.
 - [ ] **Teardown + outputs:** stop VM/gateway/firewall/servers; set `status` output; honor
       `timeout-minutes`.
@@ -41,9 +43,11 @@ porting them into a reusable action with the logic in Node.
 
 ## Key correctness notes
 
-- **Token stays host-side.** `github-token` (default `${{ github.token }}`) is used by the gateway
-  and safe-output servers on the host. The guest gets a fake `COPILOT_GITHUB_TOKEN`; the real one is
-  swapped at the gateway. Never write the real token into the guest MCP config.
+- **Tokens stay host-side.** The harness `github-token` input (default `${{ github.token }}`) is for
+  the harness's own use — the inference gateway (guest gets a fake `COPILOT_GITHUB_TOKEN`, swapped at
+  the gateway) and the default read-only `github` server. User-added servers (safe outputs, third-party
+  tools) carry their own secrets in their `env` block in `mcp-config`. For every server, the harness
+  runs it host-side and **never writes the real secret into the guest MCP config**.
 - **Copilot MCP policy is ignored** for the prototype — use the CLI-shim path (phase4), not native
   custom MCP servers.
 - **Node action, bash provisioning.** Logic (input parsing, MCP merge, safe-output wiring) in Node;
