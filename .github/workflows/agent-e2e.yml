@@ -75,6 +75,7 @@ jobs:
         uses: ./
         with:
           prompt: ${{ steps.prep.outputs.prompt }}
+          github-token: ${{ github.token }}
           timeout-minutes: "10"
           mcp-config: |
             {
