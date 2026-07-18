@@ -70,8 +70,10 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
         RO read at identical path, overlay write succeeds, toolcache write + remount-rw both blocked
         (hypervisor-enforced), and the host images stay pristine (writes discarded).
 - [x] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
-      `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) NOTE: the guest `github` entry is a
-      no-secret placeholder shape — its exact transport through the gateway is an open question below.
+      `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) NOTE: the wiring is now **decided** —
+      run `ghcr.io/github/github-mcp-server` host-side over stdio via the shim/dispatch bridge (real
+      token host-side, `GITHUB_READ_ONLY=1`), same path as safe outputs. See the resolved open question
+      below; the current `githubReadOnlyGuestEntry()` placeholder should be replaced accordingly.
 - [x] **MCP config merge + secret split:** `buildGuestMcpConfig` splits requested servers into a
       guest-visible config (no secrets) and a host-side server plan (real env). A fail-closed guard,
       `assertNoSecretsInGuestConfig`, asserts no host-server secret appears in the guest config; it
@@ -110,38 +112,33 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 
 ## Open questions (need @ericsciple input)
 
-- **Default `github` server transport — HOW TO WIRE IT (need answers from the prior prototyping
-  session).** Today `buildGuestMcpConfig` emits a **placeholder** guest entry for `github`
-  (`{ readOnly: true, tokenEnv: "COPILOT_GITHUB_TOKEN" }`, `src/mcp-config.js:82`) that is NOT a
-  functioning MCP server — the github *read* lane doesn't work yet. The write lane (safe outputs via
-  CLI shims) is proven; this is only about giving the in-guest agent read access to repos/issues/PRs.
-  Specific questions to resolve:
-  1. **Native MCP vs. shim.** The Copilot CLI blocks *custom* MCP servers under registry policy (403),
-     but `github` is the CLI's *default/built-in* server — is it exempt from that block, so it can run
-     as a real MCP entry in the guest config? Or does the same 403 hit it, forcing the shim path like
-     the safe outputs?
-  2. **Built-in toolset vs. explicit server entry.** Does the standalone CLI enable its github tools
-     purely from env (e.g. `COPILOT_GITHUB_TOKEN` / `GITHUB_TOKEN` / an integration id) with NO
-     `mcpServers.github` entry at all — or must we write an explicit `mcpServers.github` entry? If
-     explicit, what transport: a remote **HTTP** endpoint (`https://api.githubcopilot.com/mcp/` or
-     similar), or a local **stdio** `github-mcp-server` binary baked into the guest rootfs?
-  3. **If HTTP:** which host is it, and does it go through our existing mitmproxy gateway (so the fake
-     `COPILOT_GITHUB_TOKEN` gets swapped to the real token there)? Does that host need adding to the
-     egress allowlist in `gw_addon.py` (currently `api.github.com`, `api.githubcopilot.com`,
-     `api.mcp.github.com`)?
-  4. **If stdio (local `github-mcp-server`):** we'd bake the binary into the rootfs and it would need
-     the real token to reach api.github.com — but we must NOT put the real token in the guest. Does it
-     honor a fake token that the gateway swaps on egress (same trick as inference), i.e. run it with
-     `GITHUB_TOKEN=<fake>` and rely on the :443 → gateway redirect? Any read-only enforcement flag
-     (e.g. `--read-only`, `GITHUB_READ_ONLY=1`) it supports?
-  5. **Read-only scoping.** How is read-only actually enforced — a server flag, a toolset allowlist, or
-     just relying on the token's scopes? We want the default `github` server to be read-only by
-     construction, with writes only via safe outputs.
-  6. **Token identity.** The harness's `github-token` (default `${{ github.token }}`) is what the
-     github reader would use. Confirm the job token has sufficient read scope for the intended tools,
-     and that using it for reads (in addition to inference `copilot-requests`) is fine.
-  Once answered, replace `githubReadOnlyGuestEntry()` with the real shape and add the host wiring
-  (allowlist entry and/or the stdio server in the rootfs + host launch).
+- **Default `github` server — RESOLVED (align with gh-aw's *local* mode).** Run the official GitHub
+  MCP server **host-side as a normal stdio server**, exposed to the guest through the existing
+  shim/dispatch bridge — *exactly like a safe output*. Do **not** special-case it, do **not** write a
+  `github` entry into the guest MCP config, and do **not** use the mitmproxy fake→real token swap for
+  the read lane (that trick is only for the in-guest *inference* lane).
+  - **Transport:** local Docker `ghcr.io/github/github-mcp-server:<pinned>` over stdio — gh-aw's default
+    "local" mode. **Not** remote HTTP (`https://api.githubcopilot.com/mcp/`): per gh-aw, remote mode does
+    **not** work with the Actions `GITHUB_TOKEN` and requires a PAT/GitHub App token. Refs in
+    `.repos/gh-aw`: `pkg/workflow/docker.go:28` (the image), `pkg/workflow/mcp_renderer_github.go:179-195`
+    (env block), `pkg/workflow/mcp_github_config.go:119-120` (github MCP is **always** read-only).
+  - **Env (host-side only — holds the real token, never reaches the guest):**
+    `GITHUB_PERSONAL_ACCESS_TOKEN=<harness github-token>`, `GITHUB_READ_ONLY=1`,
+    `GITHUB_TOOLSETS=default` (or the user's toolsets), `GITHUB_HOST=$GITHUB_SERVER_URL`.
+  - **Why this dissolves all six old sub-questions:** the server runs on the trusted host, so (a) the
+    real token stays host-side by construction — no fake-token/gateway swap for reads; (b) the CLI's
+    custom-MCP 403 never applies, because `github` isn't in the guest config at all — the guest only sees
+    auto-discovered `github_*` CLI shims (via `tools/list`, same path as safe outputs); (c) read-only is
+    server-enforced via `GITHUB_READ_ONLY=1` (+ toolset scoping); (d) the host reaches api.github.com
+    directly, outside the guest egress firewall (host-side services are trusted); (e) token identity is
+    the harness `github-token` (default `${{ github.token }}`), which has read scope — the same token
+    gh-aw uses in local mode.
+  - **Implementation:** in `src/mcp-config.js`, delete `githubReadOnlyGuestEntry()` and the guest
+    `github` entry; make the default `github` host server a stdio server (`command: "docker"`, args
+    `run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN -e GITHUB_READ_ONLY -e GITHUB_TOOLSETS -e GITHUB_HOST
+    ghcr.io/github/github-mcp-server:<pinned>`) carrying the env above, so it flows through the same
+    host-launch + `tools/list` shim-discovery path as every other server. Keep name-override +
+    `github-mcp: false`. `assertNoSecretsInGuestConfig` then covers it for free.
 - **Shim ↔ host dispatch contract (RESOLVED).** A guest shim POSTs `{"tool","args"}` to the host
   dispatch at `http://172.16.0.1:9000/dispatch`; the dispatch forwards it as an MCP `tools/call` to
   the host-side server that advertises that tool. Tool names are discovered by launching each server
