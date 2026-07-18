@@ -76,8 +76,9 @@ export function buildGuestMcpConfig(inputs) {
  * never appears here.
  *
  * NOTE: the exact transport/URL of the CLI's github server through the gateway is
- * an open question (see TODO.md); this shape is intentionally minimal and holds no
- * secret. Only the no-secret invariant is guaranteed here.
+ * an OPEN QUESTION (see TODO.md "Default `github` server transport — HOW TO WIRE IT").
+ * This shape is a non-functional placeholder — the github READ lane is not wired yet;
+ * only the no-secret invariant is guaranteed here. The write lane (safe outputs) works.
  */
 function githubReadOnlyGuestEntry() {
   return {
