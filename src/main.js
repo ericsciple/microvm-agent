@@ -20,6 +20,7 @@ import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
 import { discoverTools, createDispatchServer } from "./dispatch.js";
 import { generateShim, generateInitScript, generateDockerfile } from "./guest-assets.js";
+import { translateToolCachePathEntries } from "./paths.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS = path.join(HERE, "..", "scripts");
@@ -31,15 +32,12 @@ const FAKE_TOKEN = "ghs_FAKE_GUEST_TOKEN_DO_NOT_USE";
 const DISPATCH_PORT = 9000;
 const GATEWAY_PORT = 8080;
 
-// Well-known guest mount points (like Actions container actions, which mount the
-// workspace at /github/workspace rather than the host's run-specific path). We map
-// the host paths to these fixed locations and set GITHUB_WORKSPACE / RUNNER_TOOL_CACHE
-// accordingly inside the guest so the agent + tooling resolve correctly.
-// Ref: actions/runner src/Runner.Worker/Handlers/ContainerActionHandler.cs (/github/workspace).
-const GUEST_WORKSPACE_PATH = "/github/workspace";
-// The tool cache keeps its standard well-known path so binaries' baked-in PATH
-// entries (e.g. /opt/hostedtoolcache/node/.../bin) stay valid inside the guest.
-const GUEST_TOOLCACHE_PATH = "/opt/hostedtoolcache";
+// Well-known guest mount points, mirroring the Actions container-job convention
+// (actions/runner ContainerInfo.cs maps the work dir -> /__w and the tool cache ->
+// /__t). We map the host paths to these fixed locations and set GITHUB_WORKSPACE /
+// RUNNER_TOOL_CACHE accordingly inside the guest.
+const GUEST_WORKSPACE_PATH = "/__w";
+const GUEST_TOOLCACHE_PATH = "/__t";
 
 const log = (m) => process.stderr.write(`[microvm-agent] ${m}\n`);
 const runScript = (name, args = []) =>
@@ -90,7 +88,20 @@ async function main() {
   // Point the guest's GITHUB_WORKSPACE / RUNNER_TOOL_CACHE at the well-known mount
   // points, so the agent and tooling resolve them correctly inside the guest.
   if (initMounts.workspace) agentEnv += `export GITHUB_WORKSPACE=${initMounts.workspace.path}\n`;
-  if (initMounts.toolcache) agentEnv += `export RUNNER_TOOL_CACHE=${initMounts.toolcache.path}\n`;
+  if (initMounts.toolcache) {
+    agentEnv += `export RUNNER_TOOL_CACHE=${initMounts.toolcache.path}\n`;
+    // Bring only the tool-cache PATH entries across, rewritten to the guest mount
+    // point — not the whole host PATH (host-specific dirs don't exist in the guest).
+    const guestPathAdds = translateToolCachePathEntries(
+      process.env.PATH || "",
+      inputs.toolCache,
+      initMounts.toolcache.path
+    );
+    if (guestPathAdds.length) {
+      agentEnv += `export PATH=${guestPathAdds.join(":")}:$PATH\n`;
+      log(`guest PATH += ${guestPathAdds.join(":")}`);
+    }
+  }
   if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
     fs.copyFileSync(inputs.eventPath, path.join(inject, "etc", "event.json"));
     agentEnv += `export GITHUB_EVENT_PATH=/etc/event.json\n`;

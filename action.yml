@@ -40,8 +40,9 @@ inputs:
       'none' mounts nothing (hermetic agent); 'workspace' (default) mounts
       GITHUB_WORKSPACE read-only with a throwaway write overlay; 'workspace+toolcache'
       also mounts RUNNER_TOOL_CACHE read-only. Mapped to well-known guest paths
-      (workspace -> /github/workspace, toolcache -> /opt/hostedtoolcache) like Actions
-      container jobs, with GITHUB_WORKSPACE/RUNNER_TOOL_CACHE set to match. Writes are
+      (workspace -> /__w, toolcache -> /__t) like Actions container jobs, with
+      GITHUB_WORKSPACE/RUNNER_TOOL_CACHE set to match. Only the tool-cache entries
+      from the host PATH are carried into the guest (rewritten to /__t). Writes are
       discarded; the only durable output path is a safe output.
     required: false
     default: "workspace"

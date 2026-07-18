@@ -53,10 +53,13 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
         throwaway tmpfs **overlay** at the identical guest path; `workspace+toolcache` also mounts
         `RUNNER_TOOL_CACHE` read-only at its identical path (opt-in — the glibc/ABI caveat still applies;
         verify a `setup-node`/`setup-go` build in-guest before relying on it). No full-FS mount.
-      - **Well-known guest paths** (like Actions container jobs/actions): workspace ->
-        `/github/workspace`, toolcache -> `/opt/hostedtoolcache`, with `GITHUB_WORKSPACE` and
-        `RUNNER_TOOL_CACHE` set in the guest to match; the workspace is also added via `--add-dir`.
-        (Ref: actions/runner `ContainerActionHandler.cs` mounts the workspace at `/github/workspace`.)
+      - **Well-known guest paths** (Actions container-job convention): workspace -> `/__w`,
+        toolcache -> `/__t`, with `GITHUB_WORKSPACE`/`RUNNER_TOOL_CACHE` set in the guest to match;
+        the workspace is also added via `--add-dir`. Only the host PATH entries under the tool cache
+        are carried across (rewritten to `/__t`, `src/paths.js`) — the whole host PATH is not copied.
+        Externals (`/__e`) is NOT mounted: we run no JavaScript actions in the guest (the Copilot CLI
+        is a standalone binary, shims are bash, safe-outputs run host-side).
+        (Ref: actions/runner `ContainerInfo.cs` maps Work->/__w, Tools->/__t, Externals->/__e.)
       - **Event payload (`copy-event`, default on):** copies **only** `event.json` into the guest and
         repoints `GITHUB_EVENT_PATH`; never copies `RUNNER_TEMP`.
       - **Writes discarded:** overlay writes land in tmpfs and vanish on teardown; the durable output
