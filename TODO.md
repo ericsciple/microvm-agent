@@ -53,12 +53,26 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 - [x] **MCP config merge + secret split:** `buildGuestMcpConfig` splits requested servers into a
       guest-visible config (no secrets) and a host-side server plan (real env). A fail-closed guard,
       `assertNoSecretsInGuestConfig`, asserts no host-server secret appears in the guest config; it
-      runs in `main.js` before the guest config would be written. Unit-tested (16 tests).
-      *Still TODO (needs the running host):* actually launch `hostServers`, generate the per-server
-      CLI shims on the guest PATH, and run the host dispatch endpoint (phase4 transport).
-- [ ] **Safe outputs wiring:** config half is done — safe-output servers are treated like any other
-      user server (env kept host-side, scrubbed from the guest). Remaining: run them host-side with
-      `GITHUB_EVENT_PATH`, wire the shims, and prove `add-labels` end-to-end against a throwaway issue.
+      runs in `main.js` before the guest config would be written. Unit-tested.
+- [x] **Shim ↔ host dispatch bridge (RESOLVED + validated locally).** `src/mcp-client.js` (stdio MCP
+      client) + `src/dispatch.js` (host HTTP endpoint on `:9000`). Tool→server registry is discovered
+      generically via `tools/list` at startup, so safe outputs are not special-cased. Proven locally
+      three ways: (a) unit tests with a fixture MCP server; (b) the real `safe-outputs add-labels`
+      server driven through the dispatch against a mock GitHub API — label bound to the triggering
+      issue, token host-side; (c) end-to-end through a **real Firecracker microVM**: guest shim →
+      `172.16.0.1:9000` → dispatch → safe-outputs → GitHub, guest saw `{"status":"ok"}`.
+- [ ] **Safe outputs wiring:** dispatch bridge done and proven. Remaining: generate the per-tool CLI
+      shims into the guest rootfs from the discovered registry, and prove the full path with the real
+      Copilot CLI (not a simulated shim call) — see the copilot-inference item below.
+- [ ] **Provision + rootfs (port into `scripts/` + `main.js`).** All recipes validated locally in
+      this Codespace: Firecracker v1.16.1 + CI kernel boot under KVM; guest rootfs built via
+      `docker export` + **`mkfs.ext4 -d <dir>`** (NOT a loop mount — Codespaces has no loop devices;
+      `-d` also works on hosted runners); tap0/NAT; `chmod 666 /dev/kvm` (no `setfacl` here).
+- [ ] **Copilot inference in-guest (needs a real `copilot-requests` token).** Only piece not yet
+      validated locally — the Codespace token likely lacks the scope. Validate via a workflow run
+      (`ubuntu-latest`, `permissions: copilot-requests: write`) using the phase1/phase4 auth env
+      (`COPILOT_GITHUB_TOKEN` fake in guest, `S2STOKENS=true`, `GITHUB_COPILOT_INTEGRATION_ID`,
+      gateway token-swap) once the harness is wired.
 - [ ] **Egress:** apply `firewall-allow` on top of deny-all.
 - [ ] **Teardown + outputs:** stop VM/gateway/firewall/servers; set `status` output; honor
       `timeout-minutes`.
@@ -76,11 +90,11 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
   real shape the standalone Copilot CLI expects for a read-only github server reached through the
   gateway — is it the CLI's built-in github toolset (configured via env only), or an explicit
   `mcpServers.github` HTTP/stdio entry? This determines the final placeholder.
-- **Shim ↔ host dispatch contract.** Phase4 used a bash shim that POSTs `{tool, args}` to
-  `http://172.16.0.1:9000/dispatch`, where a host service applied the effect. With real MCP servers,
-  the host dispatch needs to forward the shim call as an MCP `tools/call` to the right host-side
-  stdio server and return the result. Confirm: one dispatch endpoint multiplexing by server/tool
-  name, and how tool names are discovered (launch each server + `tools/list`, or declared in config).
+- **Shim ↔ host dispatch contract (RESOLVED).** A guest shim POSTs `{"tool","args"}` to the host
+  dispatch at `http://172.16.0.1:9000/dispatch`; the dispatch forwards it as an MCP `tools/call` to
+  the host-side server that advertises that tool. Tool names are discovered by launching each server
+  and calling `tools/list` at startup (`src/dispatch.js` / `src/mcp-client.js`). Validated locally
+  end-to-end (including through a real microVM).
 - **Node build from a Codespace.** Per your workflow, I did not run the `ncc` bundle or commit
   `dist/` here. Command to run in a Codespace: `npm i -D @vercel/ncc && npx ncc build src/main.js -o dist`
   then commit `dist/`. Confirm `ncc` is the bundler you want (vs. esbuild).
