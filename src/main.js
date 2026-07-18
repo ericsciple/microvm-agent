@@ -31,6 +31,16 @@ const FAKE_TOKEN = "ghs_FAKE_GUEST_TOKEN_DO_NOT_USE";
 const DISPATCH_PORT = 9000;
 const GATEWAY_PORT = 8080;
 
+// Well-known guest mount points (like Actions container actions, which mount the
+// workspace at /github/workspace rather than the host's run-specific path). We map
+// the host paths to these fixed locations and set GITHUB_WORKSPACE / RUNNER_TOOL_CACHE
+// accordingly inside the guest so the agent + tooling resolve correctly.
+// Ref: actions/runner src/Runner.Worker/Handlers/ContainerActionHandler.cs (/github/workspace).
+const GUEST_WORKSPACE_PATH = "/github/workspace";
+// The tool cache keeps its standard well-known path so binaries' baked-in PATH
+// entries (e.g. /opt/hostedtoolcache/node/.../bin) stay valid inside the guest.
+const GUEST_TOOLCACHE_PATH = "/opt/hostedtoolcache";
+
 const log = (m) => process.stderr.write(`[microvm-agent] ${m}\n`);
 const runScript = (name, args = []) =>
   execFileSync("bash", [path.join(SCRIPTS, name), ...args], { stdio: "inherit" });
@@ -77,6 +87,10 @@ async function main() {
   // GITHUB_EVENT_PATH repointed at the guest copy — ONLY event.json is copied,
   // never RUNNER_TEMP (checkout persists a push token there).
   let agentEnv = `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`;
+  // Point the guest's GITHUB_WORKSPACE / RUNNER_TOOL_CACHE at the well-known mount
+  // points, so the agent and tooling resolve them correctly inside the guest.
+  if (initMounts.workspace) agentEnv += `export GITHUB_WORKSPACE=${initMounts.workspace.path}\n`;
+  if (initMounts.toolcache) agentEnv += `export RUNNER_TOOL_CACHE=${initMounts.toolcache.path}\n`;
   if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
     fs.copyFileSync(inputs.eventPath, path.join(inject, "etc", "event.json"));
     agentEnv += `export GITHUB_EVENT_PATH=/etc/event.json\n`;
@@ -241,23 +255,23 @@ function planMounts(inputs) {
   let i = 0;
   const nextDev = () => `/dev/vd${letters[i++]}`;
 
-  // workspace (RO lower + throwaway overlay), mounted at its identical host path.
+  // workspace (RO lower + throwaway overlay), mounted at the well-known guest path.
   if (inputs.workspace && fs.existsSync(inputs.workspace)) {
     const dev = nextDev();
     drives.push({ id: "workspace", src: inputs.workspace, image: path.join(WORK, "workspace.ext4") });
-    initMounts.workspace = { dev, path: inputs.workspace };
-    log(`mount: workspace ${inputs.workspace} (ro+overlay) -> ${dev}`);
+    initMounts.workspace = { dev, path: GUEST_WORKSPACE_PATH };
+    log(`mount: workspace ${inputs.workspace} (ro+overlay) -> ${dev} at ${GUEST_WORKSPACE_PATH}`);
   } else if (inputs.mounts !== "none") {
     log(`mount: workspace requested but GITHUB_WORKSPACE is unset/missing; skipping.`);
   }
 
-  // toolcache (RO), opt-in via workspace+toolcache, at its identical host path.
+  // toolcache (RO), opt-in via workspace+toolcache, at its standard well-known path.
   if (inputs.mounts === "workspace+toolcache") {
     if (inputs.toolCache && fs.existsSync(inputs.toolCache)) {
       const dev = nextDev();
       drives.push({ id: "toolcache", src: inputs.toolCache, image: path.join(WORK, "toolcache.ext4") });
-      initMounts.toolcache = { dev, path: inputs.toolCache };
-      log(`mount: toolcache ${inputs.toolCache} (ro) -> ${dev}`);
+      initMounts.toolcache = { dev, path: GUEST_TOOLCACHE_PATH };
+      log(`mount: toolcache ${inputs.toolCache} (ro) -> ${dev} at ${GUEST_TOOLCACHE_PATH}`);
     } else {
       log(`mount: toolcache requested but RUNNER_TOOL_CACHE is unset/missing; skipping.`);
     }

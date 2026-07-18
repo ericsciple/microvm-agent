@@ -60,25 +60,25 @@ test("generateMountSetup is empty when nothing is mounted", () => {
   assert.equal(generateMountSetup({}), "");
 });
 
-test("workspace mount is an RO lower + tmpfs overlay at the identical path", () => {
-  const s = generateMountSetup({ workspace: { dev: "/dev/vdb", path: "/home/runner/work/r/r" } });
+test("workspace mount is an RO lower + tmpfs overlay at the well-known guest path", () => {
+  const s = generateMountSetup({ workspace: { dev: "/dev/vdb", path: "/github/workspace" } });
   assert.ok(s.includes("mount -o ro '/dev/vdb' /mnt/mv-ws-lower"));
   assert.ok(s.includes("mount -t tmpfs tmpfs /mnt/mv-ws-rw"));
   assert.ok(
-    s.includes("mount -t overlay overlay -o lowerdir=/mnt/mv-ws-lower,upperdir=/mnt/mv-ws-rw/upper,workdir=/mnt/mv-ws-rw/work '/home/runner/work/r/r'")
+    s.includes("mount -t overlay overlay -o lowerdir=/mnt/mv-ws-lower,upperdir=/mnt/mv-ws-rw/upper,workdir=/mnt/mv-ws-rw/work '/github/workspace'")
   );
 });
 
-test("toolcache mount is a plain RO mount at the identical path", () => {
+test("toolcache mount is a plain RO mount at its well-known path", () => {
   const s = generateMountSetup({ toolcache: { dev: "/dev/vdc", path: "/opt/hostedtoolcache" } });
   assert.ok(s.includes("mount -o ro '/dev/vdc' '/opt/hostedtoolcache'"));
   assert.ok(!s.includes("overlay")); // toolcache is read-only, no overlay
 });
 
 test("init adds --add-dir for a mounted workspace", () => {
-  const init = generateInitScript({ mounts: { workspace: { dev: "/dev/vdb", path: "/ws" } } });
+  const init = generateInitScript({ mounts: { workspace: { dev: "/dev/vdb", path: "/github/workspace" } } });
   assert.ok(init.includes("--add-dir '/root'"));
-  assert.ok(init.includes("--add-dir '/ws'"));
+  assert.ok(init.includes("--add-dir '/github/workspace'"));
   assert.ok(init.includes("mount -t overlay overlay"));
 });
 

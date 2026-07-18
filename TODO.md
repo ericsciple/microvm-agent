@@ -53,8 +53,10 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
         throwaway tmpfs **overlay** at the identical guest path; `workspace+toolcache` also mounts
         `RUNNER_TOOL_CACHE` read-only at its identical path (opt-in — the glibc/ABI caveat still applies;
         verify a `setup-node`/`setup-go` build in-guest before relying on it). No full-FS mount.
-      - **Identical guest paths** (`GITHUB_WORKSPACE`, `RUNNER_TOOL_CACHE`) so `PATH`/env need no
-        translation; the workspace is also added via `--add-dir`.
+      - **Well-known guest paths** (like Actions container jobs/actions): workspace ->
+        `/github/workspace`, toolcache -> `/opt/hostedtoolcache`, with `GITHUB_WORKSPACE` and
+        `RUNNER_TOOL_CACHE` set in the guest to match; the workspace is also added via `--add-dir`.
+        (Ref: actions/runner `ContainerActionHandler.cs` mounts the workspace at `/github/workspace`.)
       - **Event payload (`copy-event`, default on):** copies **only** `event.json` into the guest and
         repoints `GITHUB_EVENT_PATH`; never copies `RUNNER_TEMP`.
       - **Writes discarded:** overlay writes land in tmpfs and vanish on teardown; the durable output
