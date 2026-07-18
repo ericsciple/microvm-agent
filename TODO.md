@@ -9,15 +9,13 @@ rules, the egress allowlist, the MCP-policy 403 + CLI-shim workaround, virtio-bl
 **Read `docs/prototype-lessons.md` first.** The work here is porting those proven pieces into the
 action, not figuring them out again.
 
-## ⚠️ No Actions workflows in this repo
+## Actions workflows
 
-Do **not** add `.github/workflows/` to this repo. It is a personal public repo and workflow runs
-would eat into the personal Actions budget. This repo is **action code only**, referenced by
-`uses: ericsciple/microvm-agent@<ref>` from elsewhere. The end-to-end proof workflow
-(`issues: opened` → `microvm-agent` → add-labels safe output) lives in an **org-owned** repo
-(e.g. `github/ericsciple-planning`), not here. The `examples/` file is documentation for a
-*consumer's* repo, not a workflow to run here. (Consider disabling Actions in Settings → Actions
-so default setup features like CodeQL default setup don't consume budget either.)
+Workflows are now allowed in this repo (the earlier "no workflows / personal budget" restriction
+was lifted; `ubuntu-latest` has `/dev/kvm` for Firecracker). `.github/workflows/ci.yml` runs the
+unit tests. The full harness end-to-end (`issues: opened` → microvm-agent → add-labels safe output)
+can also live here once the host provisioning phases are built — it's no longer required to run only
+from an org-owned repo. The `examples/` file remains documentation for a *consumer's* repo.
 
 ## Ground truth to port from (proven, all green on `ubuntu-latest`)
 
@@ -37,32 +35,55 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 
 ## Build phases (from the plan)
 
-- [x] `ericsciple/safe-outputs` app (add-labels, add-comment) — done; run `npm test` there.
+- [x] `ericsciple/safe-outputs` app — done and expanded: `add-labels`, `add-comment`,
+      `update-issue`, `create-pull-request`, plus scope-widening flags + sanitization. Run
+      `npm test` there (61 tests green).
 - [ ] **Scaffold → runnable action.** Bundle `src/main.js` → `dist/index.js` (e.g. `ncc`) and commit
       `dist/`. Fill in `readInputs` usage. `action.yml` already declares inputs.
+      (`readInputs` is now wired + unit-tested; still needs the `ncc` bundle step, run from a Codespace.)
 - [ ] **Provision** (bash scripts under `scripts/`, called from `main.js`): KVM/`setfacl`, kernel +
-      base rootfs, tap+NAT, firewall, gateway. Port from phase0–3.
+      base rootfs, tap+NAT, firewall, gateway. Port from phase0–3. (Needs a real KVM-capable host;
+      cannot be validated in the offline dev sandbox.)
 - [ ] **Mounts:** `GITHUB_WORKSPACE` + `RUNNER_TOOL_CACHE` read-only + throwaway overlay; wire guest
       `PATH` for `setup-*` toolchains. Port from phase6. Verify a `setup-node`/`setup-go` build runs
       in the guest.
-- [ ] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
-      `github-mcp: false`. (`src/mcp-config.js` stub.)
-- [ ] **MCP config merge + shims:** finish `buildGuestMcpConfig` — strip real secrets from the guest
-      config, place servers host-side, deliver via CLI-shim (phase4). **Do not** put the token in the
-      guest config.
-- [ ] **Safe outputs wiring:** the user adds `safe-outputs <op>` servers via `mcp-config` with their
-      token in their own `env` block (`GITHUB_TOKEN: ${{ github.token }}`). The harness runs them
-      host-side (inheriting `GITHUB_EVENT_PATH`), applies that env, and scrubs the secret from the guest
-      config; expose to the guest as shims. Not special-cased vs other user servers. Prove `add-labels`
-      end-to-end against a throwaway issue.
+- [x] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
+      `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) NOTE: the guest `github` entry is a
+      no-secret placeholder shape — its exact transport through the gateway is an open question below.
+- [x] **MCP config merge + secret split:** `buildGuestMcpConfig` splits requested servers into a
+      guest-visible config (no secrets) and a host-side server plan (real env). A fail-closed guard,
+      `assertNoSecretsInGuestConfig`, asserts no host-server secret appears in the guest config; it
+      runs in `main.js` before the guest config would be written. Unit-tested (16 tests).
+      *Still TODO (needs the running host):* actually launch `hostServers`, generate the per-server
+      CLI shims on the guest PATH, and run the host dispatch endpoint (phase4 transport).
+- [ ] **Safe outputs wiring:** config half is done — safe-output servers are treated like any other
+      user server (env kept host-side, scrubbed from the guest). Remaining: run them host-side with
+      `GITHUB_EVENT_PATH`, wire the shims, and prove `add-labels` end-to-end against a throwaway issue.
 - [ ] **Egress:** apply `firewall-allow` on top of deny-all.
 - [ ] **Teardown + outputs:** stop VM/gateway/firewall/servers; set `status` output; honor
       `timeout-minutes`.
 - [ ] **Package:** tag `v0`, keep the `examples/` file as docs (do NOT put it in `.github/workflows/`),
       document required permissions.
-- [ ] **Prove end-to-end** from an **org-owned** repo (e.g. `github/ericsciple-planning`): an
-      `issues: opened` workflow that `uses: ericsciple/microvm-agent@<ref>` with an add-labels safe
-      output, landing a label on a real issue. Not from this repo (budget).
+- [ ] **Prove end-to-end** with an `issues: opened` workflow that runs the harness with an
+      add-labels safe output, landing a label on a real issue. Can now run in-repo on `ubuntu-latest`
+      (KVM available), or from an org-owned repo (e.g. `github/ericsciple-planning`) via
+      `uses: ericsciple/microvm-agent@<ref>`. Blocked on the host provisioning phases above.
+
+## Open questions (need @ericsciple input)
+
+- **Default `github` server transport.** `buildGuestMcpConfig` emits a minimal, tokenless placeholder
+  for the guest `github` entry (`{ readOnly: true, tokenEnv: "COPILOT_GITHUB_TOKEN" }`). What is the
+  real shape the standalone Copilot CLI expects for a read-only github server reached through the
+  gateway — is it the CLI's built-in github toolset (configured via env only), or an explicit
+  `mcpServers.github` HTTP/stdio entry? This determines the final placeholder.
+- **Shim ↔ host dispatch contract.** Phase4 used a bash shim that POSTs `{tool, args}` to
+  `http://172.16.0.1:9000/dispatch`, where a host service applied the effect. With real MCP servers,
+  the host dispatch needs to forward the shim call as an MCP `tools/call` to the right host-side
+  stdio server and return the result. Confirm: one dispatch endpoint multiplexing by server/tool
+  name, and how tool names are discovered (launch each server + `tools/list`, or declared in config).
+- **Node build from a Codespace.** Per your workflow, I did not run the `ncc` bundle or commit
+  `dist/` here. Command to run in a Codespace: `npm i -D @vercel/ncc && npx ncc build src/main.js -o dist`
+  then commit `dist/`. Confirm `ncc` is the bundler you want (vs. esbuild).
 
 ## Key correctness notes
 

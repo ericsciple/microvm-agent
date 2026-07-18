@@ -16,7 +16,7 @@
 // STATUS: scaffold only. See TODO.md for the build checklist.
 
 import { readInputs } from "./inputs.js";
-import { buildGuestMcpConfig } from "./mcp-config.js";
+import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
 
 async function main() {
   const inputs = readInputs();
@@ -29,25 +29,28 @@ async function main() {
   //    - mount GITHUB_WORKSPACE + RUNNER_TOOL_CACHE read-only; overlay for writes
   //      (phase6)
   //
-  // 2. MCP SERVERS (host, trusted) — TODO
-  //    - default read-only github MCP server (unless github-mcp=false or overridden
-  //      by a user 'github' entry)
-  //    - user servers from mcp-config
-  //    - safe-output servers (github/ericsciple safe-outputs): user-added MCP servers, not
-  //      special-cased. The harness runs them host-side (where GITHUB_EVENT_PATH is available)
-  //      with the env from their own config — which carries GITHUB_TOKEN via ${{ github.token }},
-  //      like any MCP server secret — and scrubs that secret from the guest's config (phase4
-  //      CLI-shim). The token is NOT auto-injected by the harness.
-  const guestMcpConfig = buildGuestMcpConfig(inputs); // TODO: real merge + shims
+  // 2. MCP SERVERS (host, trusted)
+  //    Split the requested servers into the guest-visible config (no secrets) and
+  //    the host-side server plan (real env, incl. secrets). The default read-only
+  //    `github` server is the only guest MCP entry; user servers (incl. safe
+  //    outputs) are launched host-side and exposed to the guest as CLI shims.
+  const { guestConfig, hostServers } = buildGuestMcpConfig(inputs);
+
+  // Fail closed: never let a real credential reach the guest config.
+  assertNoSecretsInGuestConfig({ guestConfig, hostServers });
 
   // 3. RUN (guest) — TODO: launch Copilot CLI in the microVM
+  //    - write `guestConfig` to $XDG_CONFIG_HOME/.copilot/mcp-config.json in the guest
+  //    - start `hostServers` host-side; install a CLI shim on the guest PATH for each
+  //      custom server, forwarding {tool,args} to the host dispatch endpoint (phase4)
   //    - COPILOT_GITHUB_TOKEN=<fake> in guest; real token swapped at the gateway
   //    - inference + github MCP go through the gateway (phase1/phase2)
   //    - --allow-all-tools; prompt via -p
-  void guestMcpConfig;
+  void guestConfig;
+  void hostServers;
 
   // 4. TEARDOWN — TODO: stop VM, gateway, firewall, servers; surface status
-  throw new Error("microvm-agent is a scaffold; see TODO.md");
+  throw new Error("microvm-agent is a scaffold; the host provisioning phases are not wired yet (see TODO.md).");
 }
 
 main().catch((err) => {
