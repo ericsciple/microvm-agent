@@ -1,21 +1,13 @@
 # CI for the microVM agent harness.
 #
-# Runs the unit tests for the Node logic — most importantly the security seam in
-# src/mcp-config.js (buildGuestMcpConfig + assertNoSecretsInGuestConfig), which
-# guarantees no real credential can reach the guest MCP config.
-#
-# NOTE: this is NOT the full harness end-to-end. Booting a Firecracker microVM and
-# running the Copilot CLI inside it requires the host provisioning phases to be
-# built first (see TODO.md); ubuntu-latest does have /dev/kvm available for that
-# once the harness is wired. The proven, green isolation proofs live in
-# docs/proven-prototype/.
+# Runs the unit tests for the Node logic (mcp-config secret seam, dispatch, guest
+# assets, mounts, paths). Manual-only (workflow_dispatch) — we run `npm test`
+# locally and don't want a run on every push. Trigger from the Actions tab when
+# you want it in CI.
 name: ci
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-  pull_request:
 
 jobs:
   test:
@@ -27,3 +19,4 @@ jobs:
           node-version: "20"
       - name: Unit tests
         run: npm test
+
