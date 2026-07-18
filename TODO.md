@@ -38,22 +38,26 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 - [x] `ericsciple/safe-outputs` app — done and expanded: `add-labels`, `add-comment`,
       `update-issue`, `create-pull-request`, plus scope-widening flags + sanitization. Run
       `npm test` there (61 tests green).
-- [ ] **Scaffold → runnable action.** Bundle `src/main.js` → `dist/index.js` (e.g. `ncc`) and commit
-      `dist/`. Fill in `readInputs` usage. `action.yml` already declares inputs.
-      (`readInputs` is now wired + unit-tested; still needs the `ncc` bundle step, run from a Codespace.)
-- [ ] **Provision** (bash scripts under `scripts/`, called from `main.js`): KVM/`setfacl`, kernel +
-      base rootfs, tap+NAT, firewall, gateway. Port from phase0–3. (Needs a real KVM-capable host;
-      cannot be validated in the offline dev sandbox.)
+- [x] **Scaffold → runnable action.** `action.yml` `runs.main` points directly at `src/main.js`
+      (zero-dependency ESM via `"type":"module"`), so **no `ncc`/`dist` bundle is needed**. `main.js`
+      orchestrates the whole flow: inputs → MCP secret split → tool discovery → guest-asset generation
+      → provision → rootfs → gateway + dispatch → boot → teardown → `status` output.
+- [x] **Provision** (bash under `scripts/`, called from `main.js`): `provision.sh` (KVM access +
+      firecracker + kernel), `build-rootfs.sh` (docker export → `mkfs.ext4 -d`, no loop mount),
+      `network-up.sh`/`network-down.sh` (tap/NAT/firewall/gateway redirect), `gw_addon.py` (gateway).
+      All validated locally in this KVM Codespace; `MV_DRY_RUN=1 node src/main.js` runs the full path
+      up to boot (provision + rootfs) green.
 - [ ] **Mounts:** `GITHUB_WORKSPACE` + `RUNNER_TOOL_CACHE` read-only + throwaway overlay; wire guest
       `PATH` for `setup-*` toolchains. Port from phase6. Verify a `setup-node`/`setup-go` build runs
-      in the guest.
+      in the guest. (Not started — the label scenario doesn't need it yet.)
 - [x] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
       `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) NOTE: the guest `github` entry is a
       no-secret placeholder shape — its exact transport through the gateway is an open question below.
 - [x] **MCP config merge + secret split:** `buildGuestMcpConfig` splits requested servers into a
       guest-visible config (no secrets) and a host-side server plan (real env). A fail-closed guard,
       `assertNoSecretsInGuestConfig`, asserts no host-server secret appears in the guest config; it
-      runs in `main.js` before the guest config would be written. Unit-tested.
+      runs in `main.js` before the guest config is written. Unit-tested + verified in the dry-run
+      (user secret appears nowhere in the guest inject tree).
 - [x] **Shim ↔ host dispatch bridge (RESOLVED + validated locally).** `src/mcp-client.js` (stdio MCP
       client) + `src/dispatch.js` (host HTTP endpoint on `:9000`). Tool→server registry is discovered
       generically via `tools/list` at startup, so safe outputs are not special-cased. Proven locally
@@ -61,27 +65,29 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
       server driven through the dispatch against a mock GitHub API — label bound to the triggering
       issue, token host-side; (c) end-to-end through a **real Firecracker microVM**: guest shim →
       `172.16.0.1:9000` → dispatch → safe-outputs → GitHub, guest saw `{"status":"ok"}`.
-- [ ] **Safe outputs wiring:** dispatch bridge done and proven. Remaining: generate the per-tool CLI
-      shims into the guest rootfs from the discovered registry, and prove the full path with the real
-      Copilot CLI (not a simulated shim call) — see the copilot-inference item below.
-- [ ] **Provision + rootfs (port into `scripts/` + `main.js`).** All recipes validated locally in
+- [x] **Safe outputs wiring:** `src/guest-assets.js` generates a schema-driven CLI shim per discovered
+      tool (array→positional, string→whole-line, else JSON arg); `main.js` writes them into the guest
+      rootfs and runs the servers host-side via the dispatch. The only piece left is the real Copilot
+      CLI driving the shim (vs. the simulated shim call) — see the copilot-inference item + agent-e2e
+      workflow below.
+- [x] **Provision + rootfs (ported into `scripts/` + `main.js`).** All recipes validated locally in
       this Codespace: Firecracker v1.16.1 + CI kernel boot under KVM; guest rootfs built via
       `docker export` + **`mkfs.ext4 -d <dir>`** (NOT a loop mount — Codespaces has no loop devices;
       `-d` also works on hosted runners); tap0/NAT; `chmod 666 /dev/kvm` (no `setfacl` here).
-- [ ] **Copilot inference in-guest (needs a real `copilot-requests` token).** Only piece not yet
-      validated locally — the Codespace token likely lacks the scope. Validate via a workflow run
-      (`ubuntu-latest`, `permissions: copilot-requests: write`) using the phase1/phase4 auth env
-      (`COPILOT_GITHUB_TOKEN` fake in guest, `S2STOKENS=true`, `GITHUB_COPILOT_INTEGRATION_ID`,
-      gateway token-swap) once the harness is wired.
-- [ ] **Egress:** apply `firewall-allow` on top of deny-all.
-- [ ] **Teardown + outputs:** stop VM/gateway/firewall/servers; set `status` output; honor
-      `timeout-minutes`.
-- [ ] **Package:** tag `v0`, keep the `examples/` file as docs (do NOT put it in `.github/workflows/`),
-      document required permissions.
-- [ ] **Prove end-to-end** with an `issues: opened` workflow that runs the harness with an
-      add-labels safe output, landing a label on a real issue. Can now run in-repo on `ubuntu-latest`
-      (KVM available), or from an org-owned repo (e.g. `github/ericsciple-planning`) via
-      `uses: ericsciple/microvm-agent@<ref>`. Blocked on the host provisioning phases above.
+- [ ] **Copilot inference in-guest (needs a real `copilot-requests` token).** The one piece not yet
+      validated locally — the Codespace token likely lacks the scope. Wired in `guest-assets.js`
+      init + `gw_addon.py` token-swap (`COPILOT_GITHUB_TOKEN` fake in guest, `S2STOKENS=true`,
+      `GITHUB_COPILOT_INTEGRATION_ID`, gateway swap). Validate via the `agent-e2e.yml` workflow run
+      on `ubuntu-latest` (`permissions: copilot-requests: write`).
+- [x] **Egress:** `firewall-allow` is threaded into the gateway allowlist (`EXTRA_ALLOW` in
+      `gw_addon.py`) on top of the deny-all baseline in `network-up.sh`.
+- [x] **Teardown + outputs:** `main.js` stops the gateway + dispatch and runs `network-down.sh` in a
+      `finally`, sets the `status` output, and honors `timeout-minutes` via the boot timeout.
+- [ ] **Package:** tag `v0`, keep the `examples/` file as docs, document required permissions.
+      (Action is runnable now; `agent-e2e.yml` demonstrates required permissions.)
+- [ ] **Prove end-to-end** — `.github/workflows/agent-e2e.yml` added (`issues: opened` → this action
+      with an add-labels safe output → label lands on the issue). Runs in-repo on `ubuntu-latest`.
+      **Pending its first real run** (needs the copilot-requests token at runtime).
 
 ## Open questions (need @ericsciple input)
 

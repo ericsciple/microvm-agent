@@ -1,0 +1,108 @@
+# End-to-end: an opened issue is triaged by an agent running inside a Firecracker
+# microVM, which applies the single most appropriate existing label via the
+# add-labels safe output (host-side; the guest never holds a write token).
+#
+# This is the real harness path: `uses: ./` runs the microvm-agent action, which
+# boots the VM, runs the Copilot CLI inside it wired only through the host gateway,
+# and exposes `add_labels` to the agent as a CLI shim that forwards to the
+# host-side safe-outputs server.
+#
+# Requires a KVM-capable ubuntu-latest runner (KVM is available there).
+name: agent-e2e
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to triage."
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  copilot-requests: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install safe-outputs (on PATH) + mitmproxy
+        run: |
+          npm install -g github:ericsciple/safe-outputs
+          safe-outputs --help >/dev/null 2>&1 || true
+          pipx install mitmproxy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Seed candidate labels + build the triage prompt
+        id: prep
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for l in bug documentation enhancement question wontfix; do
+            gh label create "$l" --force >/dev/null 2>&1 || true
+          done
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            n="${{ github.event.issue.number }}"
+          else
+            n="${{ inputs.issue_number }}"
+          fi
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+          title=$(gh issue view "$n" --json title --jq .title)
+          body=$(gh issue view "$n" --json body --jq .body)
+          {
+            echo "prompt<<PROMPTEOF"
+            echo "You are triaging a GitHub issue inside a sandbox."
+            echo "Choose the SINGLE most appropriate label from this list ONLY:"
+            echo "bug, documentation, enhancement, question, wontfix."
+            echo "Apply it by ACTUALLY RUNNING this command with your shell/bash tool"
+            echo "(do not just describe it): add_labels <label>"
+            echo "Issue title: ${title}"
+            echo "Issue body: ${body}"
+            echo "After add_labels has run successfully, reply with exactly: DONE"
+            echo "PROMPTEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run the microVM agent
+        id: agent
+        uses: ./
+        with:
+          prompt: ${{ steps.prep.outputs.prompt }}
+          timeout-minutes: "10"
+          mcp-config: |
+            {
+              "mcpServers": {
+                "labeler": {
+                  "command": "safe-outputs",
+                  "args": ["add-labels"],
+                  "env": { "GITHUB_TOKEN": "${{ github.token }}" }
+                }
+              }
+            }
+
+      - name: Verify a label was applied to the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n="${{ steps.prep.outputs.number }}"
+          echo "agent status: ${{ steps.agent.outputs.status }}"
+          echo "labels now on #$n:"
+          gh issue view "$n" --json labels --jq '.labels[].name'
+          test "$(gh issue view "$n" --json labels --jq '.labels | length')" -ge 1
+
+      - name: Upload VM console + logs on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: microvm-agent-logs
+          path: |
+            .mvwork/console.log
+            .mvwork/gateway.log
+          if-no-files-found: ignore

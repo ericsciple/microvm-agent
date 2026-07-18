@@ -19,6 +19,30 @@ import http from "node:http";
 import { callTool, listTools } from "./mcp-client.js";
 
 /**
+ * Discover the tools advertised by each custom host server (via tools/list).
+ * Servers of kind "github" (guest-visible MCP servers) and those without a
+ * command are skipped.
+ * @param {import("./mcp-config.js").HostServer[]} hostServers
+ * @param {{log?: (msg:string)=>void}} [opts]
+ * @returns {Promise<Array<{server: import("./mcp-config.js").HostServer, name: string, inputSchema?: object}>>}
+ */
+export async function discoverTools(hostServers, { log = () => {} } = {}) {
+  const found = [];
+  for (const server of hostServers) {
+    if (server.kind === "github") continue;
+    if (!server.command) {
+      log(`skipping server '${server.name}': no command to launch`);
+      continue;
+    }
+    const tools = await listTools(server);
+    for (const tool of tools) {
+      found.push({ server, name: tool.name, inputSchema: tool.inputSchema });
+    }
+  }
+  return found;
+}
+
+/**
  * Discover which tool each host server advertises and build a tool -> server map.
  * Servers of kind "github" are skipped (they are guest-visible MCP servers, not
  * shim-dispatched).
@@ -28,22 +52,14 @@ import { callTool, listTools } from "./mcp-client.js";
  */
 export async function buildToolRegistry(hostServers, { log = () => {} } = {}) {
   const registry = {};
-  for (const server of hostServers) {
-    if (server.kind === "github") continue;
-    if (!server.command) {
-      log(`skipping server '${server.name}': no command to launch`);
-      continue;
+  for (const { server, name } of await discoverTools(hostServers, { log })) {
+    if (registry[name]) {
+      throw new Error(
+        `Tool name collision: '${name}' is advertised by both '${registry[name].name}' and '${server.name}'.`
+      );
     }
-    const tools = await listTools(server);
-    for (const tool of tools) {
-      if (registry[tool.name]) {
-        throw new Error(
-          `Tool name collision: '${tool.name}' is advertised by both '${registry[tool.name].name}' and '${server.name}'.`
-        );
-      }
-      registry[tool.name] = server;
-      log(`registered tool '${tool.name}' -> server '${server.name}'`);
-    }
+    registry[name] = server;
+    log(`registered tool '${name}' -> server '${server.name}'`);
   }
   return registry;
 }

@@ -4,7 +4,7 @@
   "description": "Safely run an AI agent prompt inside a Firecracker microVM as a GitHub Action.",
   "type": "module",
   "scripts": {
-    "build": "echo 'TODO: bundle src/main.js -> dist/index.js (e.g. ncc) in a Codespace' && exit 1",
+    "build": "echo 'No build step: zero-dependency ESM action; runs.main points directly at src/main.js.'",
     "test": "node --test test/*.test.js"
   },
   "engines": {

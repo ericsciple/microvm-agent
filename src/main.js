@@ -1,56 +1,183 @@
-// microVM agent harness — entrypoint (SCAFFOLD).
+// microVM agent harness — host-side entrypoint.
 //
-// This action runs on the runner HOST (the trusted side). It provisions a
-// Firecracker microVM, stands up the host-side gateway + firewall + MCP servers,
-// runs the Copilot CLI inside the guest wired to talk only through the gateway,
-// and tears everything down. The guest holds only fake tokens; all real
-// credentials stay host-side.
+// Runs on the trusted runner HOST. Provisions a Firecracker microVM, stands up
+// the host-side credential gateway + egress firewall + MCP dispatch, boots the
+// Copilot CLI inside the guest wired to talk only through the gateway, and tears
+// everything down. The guest holds only fake tokens; every real credential stays
+// host-side. The low-level recipes are ported from docs/proven-prototype/ and the
+// Node logic (inputs, MCP secret split, tool discovery, shim generation, dispatch)
+// is validated by the unit tests + local microVM runs (see TODO.md).
 //
-// The low-level provisioning (KVM, tap/NAT, iptables, firecracker, mitmproxy,
-// rootfs build) is already proven in github/ericsciple-planning under
-// .github/workflows/agent-sandbox-phase{0..6}-*.yml. This file is where that gets
-// ported into a reusable action: the Node entrypoint owns the LOGIC (inputs, MCP
-// config merge, safe-output server wiring) and shells out to bash scripts for the
-// host provisioning.
-//
-// STATUS: scaffold only. See TODO.md for the build checklist.
+// MV_DRY_RUN=1 stops after the rootfs is built (before booting), so the whole
+// provisioning path can be exercised without a Copilot inference token.
+
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
+import { discoverTools, createDispatchServer } from "./dispatch.js";
+import { generateShim, generateInitScript, generateDockerfile } from "./guest-assets.js";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPTS = path.join(HERE, "..", "scripts");
+const WORK = process.env.MV_WORKDIR || path.join(process.cwd(), ".mvwork");
+
+// A sentinel the guest holds in place of the real inference token; the host
+// gateway swaps it for the real one on the way out. Not a secret.
+const FAKE_TOKEN = "ghs_FAKE_GUEST_TOKEN_DO_NOT_USE";
+const DISPATCH_PORT = 9000;
+const GATEWAY_PORT = 8080;
+
+const log = (m) => process.stderr.write(`[microvm-agent] ${m}\n`);
+const runScript = (name, args = []) =>
+  execFileSync("bash", [path.join(SCRIPTS, name), ...args], { stdio: "inherit" });
 
 async function main() {
   const inputs = readInputs();
+  if (!inputs.prompt) throw new Error("input 'prompt' is required.");
+  if (!inputs.githubToken) throw new Error("no github-token available for the harness (gateway/github).");
 
-  // 1. PROVISION (host, trusted) — TODO: port from phase0/phase1 scripts
-  //    - check /dev/kvm (setfacl), fetch kernel + build/prepare base rootfs
-  //    - set up tap + NAT; start host-enforced firewall (phase3)
-  //    - start the credential gateway (phase2): real inference/GitHub tokens live
-  //      here; guest gets fake sentinels
-  //    - mount GITHUB_WORKSPACE + RUNNER_TOOL_CACHE read-only; overlay for writes
-  //      (phase6)
-  //
-  // 2. MCP SERVERS (host, trusted)
-  //    Split the requested servers into the guest-visible config (no secrets) and
-  //    the host-side server plan (real env, incl. secrets). The default read-only
-  //    `github` server is the only guest MCP entry; user servers (incl. safe
-  //    outputs) are launched host-side and exposed to the guest as CLI shims.
+  // 1. Plan MCP servers: guest config (no secrets) + host server plan (real env).
   const { guestConfig, hostServers } = buildGuestMcpConfig(inputs);
-
-  // Fail closed: never let a real credential reach the guest config.
   assertNoSecretsInGuestConfig({ guestConfig, hostServers });
 
-  // 3. RUN (guest) — TODO: launch Copilot CLI in the microVM
-  //    - write `guestConfig` to $XDG_CONFIG_HOME/.copilot/mcp-config.json in the guest
-  //    - start `hostServers` host-side; install a CLI shim on the guest PATH for each
-  //      custom server, forwarding {tool,args} to the host dispatch endpoint (phase4)
-  //    - COPILOT_GITHUB_TOKEN=<fake> in guest; real token swapped at the gateway
-  //    - inference + github MCP go through the gateway (phase1/phase2)
-  //    - --allow-all-tools; prompt via -p
-  void guestConfig;
-  void hostServers;
+  // 2. Discover the tools each custom server advertises -> shims + dispatch registry.
+  const discovered = await discoverTools(hostServers, { log });
+  const registry = {};
+  for (const { server, name } of discovered) {
+    if (registry[name]) throw new Error(`Tool name collision on '${name}'.`);
+    registry[name] = server;
+  }
+  log(`tools exposed to the guest as shims: ${discovered.map((d) => d.name).join(", ") || "(none)"}`);
 
-  // 4. TEARDOWN — TODO: stop VM, gateway, firewall, servers; surface status
-  throw new Error("microvm-agent is a scaffold; the host provisioning phases are not wired yet (see TODO.md).");
+  // 3. Generate the guest build context + the runtime injection tree.
+  const ctx = freshDir(path.join(WORK, "guest"));
+  const inject = freshDir(path.join(WORK, "inject"));
+  fs.mkdirSync(path.join(inject, "etc"), { recursive: true });
+  fs.mkdirSync(path.join(inject, "root", ".copilot"), { recursive: true });
+  fs.mkdirSync(path.join(inject, "usr", "local", "share", "ca-certificates"), { recursive: true });
+
+  fs.writeFileSync(path.join(ctx, "init.sh"), generateInitScript());
+  const shimNames = discovered.map((d) => d.name);
+  for (const d of discovered) {
+    fs.writeFileSync(path.join(ctx, d.name), generateShim({ name: d.name, inputSchema: d.inputSchema }));
+  }
+  fs.writeFileSync(path.join(ctx, "Dockerfile"), generateDockerfile(shimNames));
+
+  fs.writeFileSync(path.join(inject, "etc", "prompt.txt"), inputs.prompt + "\n");
+  fs.writeFileSync(path.join(inject, "etc", "agent.env"), `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`);
+  // Guest MCP config carries NO secret (asserted above).
+  fs.writeFileSync(
+    path.join(inject, "root", ".copilot", "mcp-config.json"),
+    JSON.stringify(guestConfig, null, 2)
+  );
+
+  // 4. Provision KVM + firecracker + kernel, then the gateway CA (needed in the rootfs).
+  runScript("provision.sh", [WORK]);
+  if (!process.env.MV_DRY_RUN) generateGatewayCa(inject);
+
+  // 5. Build the guest rootfs (docker export -> mkfs.ext4 -d, no loop mount).
+  const rootfs = path.join(WORK, "rootfs.ext4");
+  runScript("build-rootfs.sh", [ctx, inject, rootfs, "3G"]);
+
+  if (process.env.MV_DRY_RUN) {
+    log("MV_DRY_RUN set: guest rootfs built; skipping network + gateway + boot.");
+    return setStatus("dry-run");
+  }
+
+  // 6. Host network: tap + NAT + firewall + gateway redirect.
+  runScript("network-up.sh");
+
+  // 7. Host services: credential gateway + MCP dispatch.
+  const gwLog = fs.openSync(path.join(WORK, "gateway.log"), "a");
+  const gateway = spawn(
+    "mitmdump",
+    ["--mode", "transparent", "--listen-host", "0.0.0.0", "--listen-port", String(GATEWAY_PORT), "-s", path.join(SCRIPTS, "gw_addon.py"), "-q", "--set", "block_global=false"],
+    {
+      stdio: ["ignore", gwLog, gwLog],
+      env: { ...process.env, REAL_TOKEN: inputs.githubToken, FAKE_TOKEN, EXTRA_ALLOW: inputs.firewallAllow.join(",") },
+    }
+  );
+  const dispatch = createDispatchServer(registry, { log });
+  await new Promise((r) => dispatch.listen(DISPATCH_PORT, "0.0.0.0", r));
+  log(`dispatch on 0.0.0.0:${DISPATCH_PORT}, gateway on :${GATEWAY_PORT}`);
+
+  // 8. Boot the guest and run the agent (host timeout reaps the VM).
+  let status = "failed";
+  const consoleLog = path.join(WORK, "console.log");
+  try {
+    writeVmConfig(rootfs);
+    const seconds = Math.max(60, inputs.timeoutMinutes * 60);
+    const outFd = fs.openSync(consoleLog, "w");
+    try {
+      execFileSync(
+        "sudo",
+        ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", "/tmp/mv-fc.sock", "--config-file", path.join(WORK, "vm_config.json")],
+        { stdio: ["ignore", outFd, outFd] }
+      );
+    } finally {
+      fs.closeSync(outFd);
+    }
+    status = gradeConsole(consoleLog);
+  } catch {
+    // firecracker is reaped by the host timeout; grade from the console regardless.
+    status = fs.existsSync(consoleLog) ? gradeConsole(consoleLog) : "failed";
+  } finally {
+    gateway.kill("SIGTERM");
+    await new Promise((r) => dispatch.close(r));
+    try {
+      runScript("network-down.sh");
+    } catch {
+      /* best effort */
+    }
+  }
+  setStatus(status);
+  if (status !== "completed") process.exitCode = 1;
+}
+
+function gradeConsole(consoleLog) {
+  const text = fs.readFileSync(consoleLog, "utf8");
+  return /GUEST: starting copilot/.test(text) ? "completed" : "failed";
+}
+
+function freshDir(p) {
+  fs.rmSync(p, { recursive: true, force: true });
+  fs.mkdirSync(p, { recursive: true });
+  return p;
+}
+
+function generateGatewayCa(inject) {
+  // A short mitmdump run generates ~/.mitmproxy/mitmproxy-ca-cert.pem.
+  try {
+    execFileSync("bash", ["-c", "timeout 8 mitmdump -q >/dev/null 2>&1 || true"], { stdio: "ignore" });
+  } catch {
+    /* the timeout exit is expected */
+  }
+  const ca = path.join(process.env.HOME || "/root", ".mitmproxy", "mitmproxy-ca-cert.pem");
+  if (!fs.existsSync(ca)) throw new Error("gateway CA was not generated (is mitmproxy installed?).");
+  fs.copyFileSync(ca, path.join(inject, "etc", "mitmproxy-ca.pem"));
+  fs.copyFileSync(ca, path.join(inject, "usr", "local", "share", "ca-certificates", "mitmproxy.crt"));
+}
+
+function writeVmConfig(rootfs) {
+  const config = {
+    "boot-source": {
+      kernel_image_path: path.join(WORK, "vmlinux"),
+      boot_args: "console=ttyS0 reboot=k panic=1 init=/init",
+    },
+    drives: [{ drive_id: "rootfs", path_on_host: rootfs, is_root_device: true, is_read_only: false }],
+    "network-interfaces": [{ iface_id: "eth0", host_dev_name: "tap0", guest_mac: "06:00:AC:10:00:02" }],
+    "machine-config": { vcpu_count: 2, mem_size_mib: 2048 },
+  };
+  fs.writeFileSync(path.join(WORK, "vm_config.json"), JSON.stringify(config, null, 2));
+}
+
+function setStatus(status) {
+  log(`status=${status}`);
+  if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `status=${status}\n`);
 }
 
 main().catch((err) => {

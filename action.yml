@@ -5,8 +5,10 @@ description: >-
   VM. Safe by default. (Prototype — see TODO.md.)
 author: "ericsciple"
 
-# NOTE: This is a scaffold. `runs.main` points at a bundle that must be built
-# (see TODO.md); the action is not runnable yet.
+# NOTE: Zero-dependency ESM action ("type": "module" in package.json), so
+# runs.main points directly at src/main.js — no dist bundle needed. The action
+# shells out to scripts/*.sh for host provisioning and requires a KVM-capable
+# ubuntu-latest runner, docker, sudo, and mitmproxy on PATH (see README/TODO).
 
 inputs:
   prompt:
@@ -53,7 +55,7 @@ outputs:
 
 runs:
   using: "node20"
-  main: "dist/index.js" # TODO: build from src/main.js (e.g. ncc) in a Codespace
+  main: "src/main.js"
 
 branding:
   icon: "shield"
