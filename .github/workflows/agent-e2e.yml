@@ -72,6 +72,8 @@ jobs:
 
       - name: Run the microVM agent
         id: agent
+        env:
+          MV_WORKDIR: ${{ runner.temp }}/microvm-agent-work
         uses: ./
         with:
           prompt: ${{ steps.prep.outputs.prompt }}
@@ -104,6 +106,6 @@ jobs:
         with:
           name: microvm-agent-logs
           path: |
-            .mvwork/console.log
-            .mvwork/gateway.log
+            ${{ runner.temp }}/microvm-agent-work/console.log
+            ${{ runner.temp }}/microvm-agent-work/gateway.log
           if-no-files-found: ignore

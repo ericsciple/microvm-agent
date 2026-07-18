@@ -19,9 +19,9 @@ if [ ! -d "$SRC" ]; then
   exit 1
 fi
 
-USED_MB=$(du -sm "$SRC" 2>/dev/null | cut -f1)
+USED_MB=$(du -sm --apparent-size "$SRC" 2>/dev/null | cut -f1)
 [ -n "$USED_MB" ] || USED_MB=0
-# ext4 needs room for metadata/journal; size = used + margin, minimum 64 MiB.
+# ext4 needs room for metadata/journal; size = apparent used + margin, min 64 MiB.
 SIZE_MB=$((USED_MB + MARGIN_MB))
 [ "$SIZE_MB" -ge 64 ] || SIZE_MB=64
 

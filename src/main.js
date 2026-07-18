@@ -13,6 +13,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,7 +25,15 @@ import { translateToolCachePathEntries } from "./paths.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS = path.join(HERE, "..", "scripts");
-const WORK = process.env.MV_WORKDIR || path.join(process.cwd(), ".mvwork");
+// Scratch dir for the kernel, rootfs, and mount images. MUST live OUTSIDE
+// GITHUB_WORKSPACE: our multi-GB artifacts (rootfs.ext4, the mount images
+// themselves) would otherwise be packaged into the workspace mount image and
+// overflow it. Prefer RUNNER_TEMP (runner scratch, never checked out, never
+// mounted into the guest); fall back to the OS temp dir.
+const WORK =
+  process.env.MV_WORKDIR ||
+  path.join(process.env.RUNNER_TEMP || os.tmpdir(), "microvm-agent-work");
+
 
 // A sentinel the guest holds in place of the real inference token; the host
 // gateway swaps it for the real one on the way out. Not a secret.
