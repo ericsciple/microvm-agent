@@ -44,9 +44,9 @@ inputs:
       (copilot-requests) and the default read-only 'github' MCP server it provides.
       Held on the host; the guest never sees it. NOTE: this is NOT how safe-output or
       other user MCP servers get a token — those receive it via their own `env` block
-      in mcp-config (e.g. GITHUB_TOKEN: ${{ github.token }}), like any MCP server.
+      in mcp-config (e.g. GITHUB_TOKEN set to the workflow's github.token), like any MCP server.
       Requires 'copilot-requests: write' for inference. The caller must pass this
-      (e.g. github-token: ${{ github.token }}); the action also falls back to the
+      (e.g. github-token set to the workflow's github.token); the action also falls back to the
       GITHUB_TOKEN environment variable.
     required: false
     default: ""
