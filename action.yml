@@ -1,0 +1,58 @@
+name: "microVM agent harness"
+description: >-
+  Safely run an AI agent prompt inside a hardware-virtualized microVM. Credentials,
+  egress firewall, MCP gateway, and MCP servers stay on the runner host, outside the
+  VM. Safe by default. (Prototype — see TODO.md.)
+author: "ericsciple"
+
+# NOTE: This is a scaffold. `runs.main` points at a bundle that must be built
+# (see TODO.md); the action is not runnable yet.
+
+inputs:
+  prompt:
+    description: "The task for the agent."
+    required: true
+  model:
+    description: "Model passed to the Copilot CLI."
+    required: false
+    default: "auto"
+  mcp-config:
+    description: >-
+      Additional MCP servers as a JSON string in Copilot MCP JSON format
+      ({"mcpServers": {...}}). This is also how safe outputs are added (they are
+      just MCP servers). Merged in behind the gateway. Real secrets referenced here
+      are kept host-side and never placed in the guest's config.
+    required: false
+    default: ""
+  github-mcp:
+    description: "Add the default read-only GitHub MCP server (named 'github')."
+    required: false
+    default: "true"
+  firewall-allow:
+    description: "Extra egress hosts (newline-separated) allowed on top of the deny-all baseline."
+    required: false
+    default: ""
+  timeout-minutes:
+    description: "Hard cap on the agent run."
+    required: false
+    default: "15"
+  github-token:
+    description: >-
+      Token used host-side by the gateway and by safe-output MCP servers to act on
+      GitHub. Held on the host; the guest never sees it. Requires
+      'copilot-requests: write' for inference, plus whatever the enabled safe outputs
+      need (e.g. 'issues: write').
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  status:
+    description: "Result status of the agent run."
+
+runs:
+  using: "node20"
+  main: "dist/index.js" # TODO: build from src/main.js (e.g. ncc) in a Codespace
+
+branding:
+  icon: "shield"
+  color: "purple"

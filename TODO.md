@@ -1,0 +1,51 @@
+# TODO — microvm-agent
+
+Build checklist for the microVM harness action. Pick this up in a Codespace (Node 20+, plus the
+host tooling the phase scripts use). The isolation mechanisms are proven in
+`github/ericsciple-planning/.github/workflows/agent-sandbox-phase{0..6}-*.yml`; the work here is
+porting them into a reusable action with the logic in Node.
+
+## Ground truth to port from (proven, all green on `ubuntu-latest`)
+
+- phase0-kvm — `/dev/kvm` check + Firecracker boot
+- phase1-agent — Copilot CLI in the guest; auth via `GITHUB_TOKEN` + `copilot-requests: write`
+  (`COPILOT_GITHUB_TOKEN` fake in guest, `S2STOKENS=true`, `-p` prompt, `--allow-all-tools`)
+- phase2-gateway — mitmproxy credential gateway; fake→real token swap; inference host-side
+- phase3-firewall — host nftables/iptables deny-by-default + allowlist; in-guest root can't bypass
+- phase4-safeoutputs — CLI-shim delivery of host-side MCP writers (works around Copilot MCP policy)
+- phase5-redteam — adversarial checks (reference for a regression test)
+- phase6-mounts — virtio-block ro mounts; hypervisor-enforced read-only
+
+## Build phases (from the plan)
+
+- [x] `ericsciple/safe-outputs` app (add-labels, add-comment) — done; run `npm test` there.
+- [ ] **Scaffold → runnable action.** Bundle `src/main.js` → `dist/index.js` (e.g. `ncc`) and commit
+      `dist/`. Fill in `readInputs` usage. `action.yml` already declares inputs.
+- [ ] **Provision** (bash scripts under `scripts/`, called from `main.js`): KVM/`setfacl`, kernel +
+      base rootfs, tap+NAT, firewall, gateway. Port from phase0–3.
+- [ ] **Mounts:** `GITHUB_WORKSPACE` + `RUNNER_TOOL_CACHE` read-only + throwaway overlay; wire guest
+      `PATH` for `setup-*` toolchains. Port from phase6. Verify a `setup-node`/`setup-go` build runs
+      in the guest.
+- [ ] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
+      `github-mcp: false`. (`src/mcp-config.js` stub.)
+- [ ] **MCP config merge + shims:** finish `buildGuestMcpConfig` — strip real secrets from the guest
+      config, place servers host-side, deliver via CLI-shim (phase4). **Do not** put the token in the
+      guest config.
+- [ ] **Safe outputs wiring:** launch `safe-outputs <op>` servers host-side with `GITHUB_TOKEN` +
+      `GITHUB_EVENT_PATH` in their env; expose to the guest as shims. Prove `add-labels` end-to-end
+      against a throwaway issue.
+- [ ] **Egress:** apply `firewall-allow` on top of deny-all.
+- [ ] **Teardown + outputs:** stop VM/gateway/firewall/servers; set `status` output; honor
+      `timeout-minutes`.
+- [ ] **Package:** tag `v0`, add an example workflow (see `examples/`), document required permissions.
+
+## Key correctness notes
+
+- **Token stays host-side.** `github-token` (default `${{ github.token }}`) is used by the gateway
+  and safe-output servers on the host. The guest gets a fake `COPILOT_GITHUB_TOKEN`; the real one is
+  swapped at the gateway. Never write the real token into the guest MCP config.
+- **Copilot MCP policy is ignored** for the prototype — use the CLI-shim path (phase4), not native
+  custom MCP servers.
+- **Node action, bash provisioning.** Logic (input parsing, MCP merge, safe-output wiring) in Node;
+  low-level host setup shelled out to `scripts/*.sh`.
+- **Build from a Codespace** (not locally): `npm run build` (once wired) + commit `dist/`.

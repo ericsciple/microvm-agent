@@ -1,0 +1,15 @@
+{
+  "name": "microvm-agent",
+  "version": "0.0.0",
+  "description": "Safely run an AI agent prompt inside a Firecracker microVM as a GitHub Action.",
+  "type": "module",
+  "scripts": {
+    "build": "echo 'TODO: bundle src/main.js -> dist/index.js (e.g. ncc) in a Codespace' && exit 1",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "private": false
+}

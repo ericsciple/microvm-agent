@@ -1,0 +1,23 @@
+# Example (aspirational — the action is a scaffold; see TODO.md).
+name: Issue triage
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    permissions:
+      copilot-requests: write   # inference through the gateway
+      issues: write             # for the add-labels safe output
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ericsciple/microvm-agent@v0
+        with:
+          prompt: "Read this issue and apply the most relevant labels."
+          mcp-config: |
+            {
+              "mcpServers": {
+                "labeler": { "command": "safe-outputs", "args": ["add-labels"] }
+              }
+            }
