@@ -2,10 +2,9 @@
 # microVM, which applies the single most appropriate existing label via the
 # add-labels safe output (host-side; the guest never holds a write token).
 #
-# This is the real harness path: `uses: ./` runs the microvm-agent action, which
-# boots the VM, runs the Copilot CLI inside it wired only through the host gateway,
-# and exposes `add_labels` to the agent as a CLI shim that forwards to the
-# host-side safe-outputs server.
+# The agent reads the triggering issue from the event payload we copy into the guest
+# (GITHUB_EVENT_PATH -> /etc/event.json), and applies a label via the add-labels safe
+# output, delivered to the guest as a CLI shim that forwards to the host-side server.
 #
 # Requires a KVM-capable ubuntu-latest runner (KVM is available there).
 name: agent-e2e
@@ -13,11 +12,6 @@ name: agent-e2e
 on:
   issues:
     types: [opened]
-  workflow_dispatch:
-    inputs:
-      issue_number:
-        description: "Issue number to triage."
-        required: true
 
 permissions:
   contents: read
@@ -30,42 +24,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      # Put the safe-outputs CLI on PATH the Actions way. mitmproxy (the harness's
-      # credential gateway) is installed by microvm-agent itself — not here.
+      # Put the safe-outputs CLI on PATH (job-scoped Node.js action). mitmproxy (the
+      # harness's credential gateway) is installed by microvm-agent itself — not here.
       - uses: ericsciple/safe-outputs/setup@main
 
-      - name: Seed candidate labels + build the triage prompt
-        id: prep
+      # Test setup ONLY: make sure the candidate labels exist so add_labels can apply
+      # one (the API rejects labels that don't already exist). A real repo already has
+      # its labels, so a consumer would not need this step.
+      - name: Ensure candidate labels exist (test setup)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           for l in bug documentation enhancement question wontfix; do
             gh label create "$l" --force >/dev/null 2>&1 || true
           done
-          if [ "${{ github.event_name }}" = "issues" ]; then
-            n="${{ github.event.issue.number }}"
-          else
-            n="${{ inputs.issue_number }}"
-          fi
-          echo "number=$n" >> "$GITHUB_OUTPUT"
-          title=$(gh issue view "$n" --json title --jq .title)
-          body=$(gh issue view "$n" --json body --jq .body)
-          {
-            echo "prompt<<PROMPTEOF"
-            echo "You are triaging a GitHub issue inside a sandbox."
-            echo "Choose the SINGLE most appropriate label from this list ONLY:"
-            echo "bug, documentation, enhancement, question, wontfix."
-            echo "Apply it by ACTUALLY RUNNING this command with your shell/bash tool"
-            echo "(do not just describe it): add_labels <label>"
-            echo "Issue title: ${title}"
-            echo "Issue body: ${body}"
-            echo "After add_labels has run successfully, reply with exactly: DONE"
-            echo "PROMPTEOF"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Run the microVM agent
         id: agent
@@ -73,7 +45,16 @@ jobs:
           MV_WORKDIR: ${{ runner.temp }}/microvm-agent-work
         uses: ./
         with:
-          prompt: ${{ steps.prep.outputs.prompt }}
+          prompt: |
+            You are triaging the GitHub issue this workflow is running on.
+            Read the issue from the JSON file at $GITHUB_EVENT_PATH using your bash tool, e.g.:
+              jq -r '.issue | "TITLE: \(.title)\n\nBODY: \(.body)"' "$GITHUB_EVENT_PATH"
+            Choose the SINGLE most appropriate label from EXACTLY this list:
+              bug, documentation, enhancement, question, wontfix
+            Apply it by ACTUALLY RUNNING this command with your bash tool (do not just describe it):
+              add_labels <label>
+            The label applies to the issue this workflow is running on — you do not need an
+            issue number. After it succeeds, reply with exactly: DONE
           github-token: ${{ github.token }}
           timeout-minutes: "10"
           mcp-config: |
@@ -91,7 +72,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          n="${{ steps.prep.outputs.number }}"
+          n="${{ github.event.issue.number }}"
           echo "agent status: ${{ steps.agent.outputs.status }}"
           echo "labels now on #$n:"
           gh issue view "$n" --json labels --jq '.labels[].name'
