@@ -47,9 +47,31 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
       `network-up.sh`/`network-down.sh` (tap/NAT/firewall/gateway redirect), `gw_addon.py` (gateway).
       All validated locally in this KVM Codespace; `MV_DRY_RUN=1 node src/main.js` runs the full path
       up to boot (provision + rootfs) green.
-- [ ] **Mounts:** `GITHUB_WORKSPACE` + `RUNNER_TOOL_CACHE` read-only + throwaway overlay; wire guest
-      `PATH` for `setup-*` toolchains. Port from phase6. Verify a `setup-node`/`setup-go` build runs
-      in the guest. (Not started — the label scenario doesn't need it yet.)
+- [ ] **Mounts (decided design — 2026-07-18).** Two independent axes:
+      - **`mounts` input — a single cumulative enum** (default `workspace`):
+        - `none` — mount nothing; hermetic reasoning + MCP-tools agent.
+        - `workspace` **(default)** — `GITHUB_WORKSPACE` read-only + throwaway write overlay (port the
+          virtio-block RO + overlay from `phase6-mounts`).
+        - `workspace+toolcache` — also mount `RUNNER_TOOL_CACHE` read-only. **Opt-in** because of the
+          glibc/ABI catch (host `setup-*` binaries need guest glibc ≥ host; only reliable when the guest
+          base image tracks the runner OS). Verify a `setup-node`/`setup-go` build runs in the guest.
+        - Do **not** implement a full-filesystem mount, and never "best-effort secret redaction". The
+          toolchain escape hatch is bring-your-own image (future `image:` input), not host-FS exposure.
+      - **Mount at identical guest paths** (`/home/runner/work/...`, `/opt/hostedtoolcache`) so `PATH`,
+        `GITHUB_WORKSPACE`, and `RUNNER_TOOL_CACHE` need **no** translation inside the guest — the values
+        are already correct. (Sidesteps the container-feature `/__w`/`/__t` remap; the only residual concern
+        on the toolcache path is glibc, not path math.)
+      - **Event payload — separate axis, default on (not gated by the enum).** Copy the single
+        `event.json` (`$GITHUB_EVENT_PATH`) into the guest and set `GITHUB_EVENT_PATH` to the guest copy.
+        **Copy only that file — never `RUNNER_TEMP`**, since `actions/checkout@v7` stores the persisted
+        push token in a creds config under `RUNNER_TEMP`. Same runtime-file injection already used for
+        `prompt.txt`/`agent.env`. Safe outputs don't need it in-guest (they run host-side and bind their
+        target from the host's payload); it's purely agent context. Consider an off switch later.
+      - **Writes exit only via safe outputs.** Workspace is RO + discardable, so a code agent's edits live
+        in the overlay and are thrown away. The write-back path is a safe output (e.g. `create-pull-request`)
+        that takes the changed files as tool arguments and applies them host-side via the GitHub API
+        (createCommitOnBranch / git-database API — no local git). Mounts = *reading + running* (tests/build/
+        lint); safe outputs = *the only escape*. (Not started — the label scenario needs none of this yet.)
 - [x] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
       `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) NOTE: the guest `github` entry is a
       no-secret placeholder shape — its exact transport through the gateway is an open question below.
