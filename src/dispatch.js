@@ -35,7 +35,7 @@ export async function discoverTools(hostServers, { log = () => {} } = {}) {
     }
     const tools = await listTools(server);
     for (const tool of tools) {
-      found.push({ server, name: tool.name, inputSchema: tool.inputSchema });
+      found.push({ server, name: tool.name, description: tool.description, inputSchema: tool.inputSchema });
     }
   }
   return found;

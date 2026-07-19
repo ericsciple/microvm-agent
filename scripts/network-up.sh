@@ -18,10 +18,18 @@ HOST_IFACE=$(ip -j route list default | jq -r '.[0].dev')
 echo "$HOST_IFACE" > /tmp/mv-host-iface
 echo "host iface: ${HOST_IFACE}"
 
+# Pin DNS to a single resolver. Allowing :53 to ANY destination is a DNS-tunnel exfil
+# channel (data encoded in queries to a guest-controlled resolver, no token needed).
+# Restrict egress :53 to exactly this resolver; DROP any other :53. (Stronger option:
+# a host-side resolver that only answers allowlisted names — future.)
+DNS_RESOLVER="${MV_DNS_RESOLVER:-8.8.8.8}"
+echo "$DNS_RESOLVER" > /tmp/mv-dns-resolver
+echo "dns resolver: ${DNS_RESOLVER}"
+
 sudo iptables -I INPUT 1 -i tap0 -p tcp --dport 9000 -j ACCEPT
 sudo iptables -I FORWARD 1 -i "$HOST_IFACE" -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -I FORWARD 2 -i tap0 -p udp --dport 53 -j ACCEPT
-sudo iptables -I FORWARD 3 -i tap0 -p tcp --dport 53 -j ACCEPT
+sudo iptables -I FORWARD 2 -i tap0 -p udp -d "$DNS_RESOLVER" --dport 53 -j ACCEPT
+sudo iptables -I FORWARD 3 -i tap0 -p tcp -d "$DNS_RESOLVER" --dport 53 -j ACCEPT
 sudo iptables -I FORWARD 4 -i tap0 -j DROP
 sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
 sudo iptables -t nat -A PREROUTING -i tap0 -p tcp --dport 443 -j REDIRECT --to-ports 8080

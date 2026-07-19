@@ -86,7 +86,10 @@ async function main() {
   // device names in drive order (rootfs is vda, so the first extra drive is vdb).
   const { drives, initMounts } = planMounts(inputs);
 
-  fs.writeFileSync(path.join(ctx, "init.sh"), generateInitScript({ mounts: initMounts }));
+  fs.writeFileSync(
+    path.join(ctx, "init.sh"),
+    generateInitScript({ mounts: initMounts, dns: process.env.MV_DNS_RESOLVER || "8.8.8.8" })
+  );
   const shimNames = discovered.map((d) => d.name);
   for (const d of discovered) {
     fs.writeFileSync(path.join(ctx, d.name), generateShim({ name: d.name, inputSchema: d.inputSchema }));
