@@ -114,46 +114,33 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 
 ## Open questions (need @ericsciple input)
 
-- **Default `github` server — REOPENED (currently implemented as a host-side shim; likely should be
-  NATIVE-in-guest).** The current build runs `ghcr.io/github/github-mcp-server` host-side over stdio and
-  exposes it to the guest via CLI shims (like a safe output). **This works, but is probably the wrong
-  shape.** The proven prototype found the standalone Copilot CLI's 403 blocks only *non-default* MCP
-  servers and that **"the default `github` server is unaffected"** (`docs/prototype-lessons.md:85-88`).
-  So `github` can most likely be a **native MCP server in the guest** (no shim) — which also matches gh-aw
-  (it keeps `github` native and **never** CLI-mounts it; only `safeoutputs`/`mcpscripts` are always-CLI).
-  Resolve this empirically before locking in the shim.
-  - **Test (a `copilot-requests: write` KVM `ubuntu-latest` workflow; reuse the phase2 gateway + phase3
-    firewall recipes in `docs/proven-prototype/`):**
-    1. Boot the guest with the host credential gateway (guest holds a **fake** `COPILOT_GITHUB_TOKEN`;
-       gateway swaps to the real token on egress).
-    2. Enable the CLI's **default `github`** server in the *guest* config and determine which form the
-       standalone CLI expects: **(a)** built-in toolset via env only (no `mcpServers.github` entry), or
-       **(b)** an explicit `mcpServers.github` entry (capture transport + URL, e.g.
-       `https://api.githubcopilot.com/mcp/`).
-    3. Prompt a **github read** ("get issue #N, print its title"); confirm it returns **real data** with
-       **no** `Non-default MCP servers will be blocked` / `403` log line, and capture the **exact host(s)**
-       the request dials.
-    4. In the same run, register a **dummy custom stdio** server and confirm it **is** blocked (re-confirms
-       custom servers must stay shims). Upload guest console + gateway log as artifacts.
-  - **If native github works (expected):** keep `github` **native in the guest** — in `src/mcp-config.js`
-    restore a real guest `github` entry (the shape the test found) carrying only the **fake**
-    `COPILOT_GITHUB_TOKEN` (gateway swaps to real; `assertNoSecretsInGuestConfig` must stay green), and
-    **remove** the host-side `docker github-mcp-server` + shim path for github. Read-only comes from the
-    CLI's default-github config and/or the token scopes (no `GITHUB_READ_ONLY` here — we're not running the
-    server ourselves). Add whatever host the read lane dials to the `gw_addon.py` allowlist. Keep
-    name-override + `github-mcp: false`.
-  - **Only if `github` is ALSO 403'd (unexpected):** keep the **currently-implemented** host-side
-    `ghcr.io/github/github-mcp-server` stdio + shim path (env host-side:
-    `GITHUB_PERSONAL_ACCESS_TOKEN=<harness github-token>`, `GITHUB_READ_ONLY=1`, `GITHUB_TOOLSETS=default`,
-    `GITHUB_HOST=$GITHUB_SERVER_URL`). gh-aw refs in `.repos/gh-aw`: `pkg/workflow/docker.go:28`,
-    `pkg/workflow/mcp_renderer_github.go:179-195`, `pkg/workflow/mcp_github_config.go:119-120` (github MCP
-    is always read-only). Either way, do **not** use remote HTTP mode — per gh-aw it does not work with the
-    Actions `GITHUB_TOKEN` (needs a PAT/App token).
-  - **Either way — clarify the split (the current behavior is correct):** apart from `github`, **every**
-    MCP server (safe outputs + third-party) is **shim-only** in the guest — there is no dual-access
-    native-MCP path — because the 403 is transport-agnostic. Make this explicit in `src/mcp-config.js`
-    comments and in the agent prompt (custom tools are shell commands on `$PATH`; only `github` is a native
-    MCP server). Deliberate divergence from gh-aw, whose CLI-mount is opt-in + dual-access.
+- **Default `github` server — RESOLVED EMPIRICALLY: NATIVE-in-guest works (test run 29666521676).**
+  Ran `github-mcp-test.yml` (MV_GITHUB_MODE=native, dummy custom server, github-read prompt). Results:
+  - **Native github read WORKS:** agent returned issue #8's real title (`GH_TITLE: Typo: 'recieve'…`)
+    using its built-in github tools — **no** `Non-default MCP servers will be blocked`/403 line.
+  - **Transport = built-in REMOTE server:** the read hit **`api.githubcopilot.com/mcp/readonly`**
+    (read-only endpoint, chosen by the CLI automatically), authenticated via the gateway fake→real
+    token swap. So it's form **(a)**: built-in, enabled by env, **no `mcpServers.github` entry needed**.
+  - **Hosts dialed:** only `api.github.com` + `api.githubcopilot.com` — both already on the gw allowlist;
+    **no new allowlist entry required.** (Contrary to the earlier worry about remote mode needing a PAT:
+    the built-in remote github works because it rides the *copilot* auth via the gateway, not a raw
+    Actions token to a github.com MCP endpoint.)
+  - **Negative control was WEAK/inconclusive:** the dummy used `/bin/cat` (not a real MCP server), so it
+    would drop regardless of policy — "not available" doesn't prove policy blocking. Q1 stands alone; the
+    custom-server-blocked claim still rests on prototype-lessons.md.
+  - **SECURITY nuance to weigh before flipping the default:** native mode currently also exports the fake
+    token as `GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_PERSONAL_ACCESS_TOKEN` in the guest. Since the gateway swaps
+    fake→real for ANY allowlisted host (incl. `api.github.com`), a guest `gh`/`git`/`curl` to api.github.com
+    would be upgraded to the REAL token — and the default `${{ github.token }}` is write-scoped. This
+    api.github.com swap is a **pre-existing** property (COPILOT_GITHUB_TOKEN=fake was always present), but
+    broadcasting more token env vars widens it. Decide: (i) does the built-in github work with ONLY
+    COPILOT_GITHUB_TOKEN (drop the extra vars → least privilege)? and (ii) should api.github.com be removed
+    from the guest egress allowlist / the swap be scoped to api.githubcopilot.com only, so the guest can't
+    upgrade a fake token into real write access?
+  - **Productization (pending the above):** flip `githubMode` default to `native`; remove/retire the
+    host-side docker github-mcp-server shim (validated but unnecessary; keep as opt-in fallback for GHES);
+    keep name-override + `github-mcp:false` (needs a way to actually disable the built-in — likely a CLI
+    flag). `github-mcp-test.yml` + the MV_GITHUB_MODE / MV_EXTRA_GUEST_MCP knobs are the test harness.
 - **Shim ↔ host dispatch contract (RESOLVED).** A guest shim POSTs `{"tool","args"}` to the host
   dispatch at `http://172.16.0.1:9000/dispatch`; the dispatch forwards it as an MCP `tools/call` to
   the host-side server that advertises that tool. Tool names are discovered by launching each server
