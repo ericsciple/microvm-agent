@@ -73,6 +73,8 @@ test("init mounts harness + wires auth env and prompt", () => {
   assert.ok(init.includes("mount -o ro '/dev/vdb' '/__mcp'"));
   assert.ok(init.includes("S2STOKENS=true"));
   assert.ok(init.includes('-p "$(cat /etc/prompt.txt)"'));
+  // The CLI must be granted the /__mcp dir to execute the shims there.
+  assert.ok(init.includes("--add-dir '/__mcp'"));
 });
 
 test("init runs the agent from the workspace when mounted, else /root", () => {

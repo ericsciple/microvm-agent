@@ -123,6 +123,9 @@ export function generateInitScript({
 } = {}) {
   const mountSetup = generateMountSetup(mounts);
   const addDirs = ["/root"];
+  // The MCP shims live in the harness mount (/__mcp); the CLI can only execute files
+  // under directories it's been granted, so add it (and the workspace when mounted).
+  if (mounts.harness) addDirs.push(mounts.harness.path);
   if (mounts.workspace) addDirs.push(mounts.workspace.path);
   const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
   // Run the agent from the workspace when it's mounted (like Actions container jobs,
