@@ -97,24 +97,27 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
       this Codespace: Firecracker v1.16.1 + CI kernel boot under KVM; guest rootfs built via
       `docker export` + **`mkfs.ext4 -d <dir>`** (NOT a loop mount — Codespaces has no loop devices;
       `-d` also works on hosted runners); tap0/NAT; `chmod 666 /dev/kvm` (no `setfacl` here).
-- [ ] **Copilot inference in-guest (needs a real `copilot-requests` token).** The one piece not yet
-      validated locally — the Codespace token likely lacks the scope. Wired in `guest-assets.js`
-      init + `gw_addon.py` token-swap (`COPILOT_GITHUB_TOKEN` fake in guest, `S2STOKENS=true`,
-      `GITHUB_COPILOT_INTEGRATION_ID`, gateway swap). Validate via the `agent-e2e.yml` workflow run
-      on `ubuntu-latest` (`permissions: copilot-requests: write`).
-- [x] **Egress:** `firewall-allow` is threaded into the gateway allowlist (`EXTRA_ALLOW` in
-      `gw_addon.py`) on top of the deny-all baseline in `network-up.sh`.
+- [x] **Copilot inference in-guest** — VALIDATED via `agent-e2e.yml` on `ubuntu-latest`
+      (`permissions: copilot-requests: write`): real microVM boots, the standalone Copilot CLI
+      authenticates and runs the prompt inside the guest, streams live to the step log, and drives the
+      `/__mcp` shim → dispatch → safe-output → GitHub. Green runs: issues #11, #12 (`documentation`),
+      #13 (`bug`). Wired in `guest-assets.js` init + `gw_addon.py` (`COPILOT_GITHUB_TOKEN` fake in
+      guest, `S2STOKENS=true`, `GITHUB_COPILOT_INTEGRATION_ID`, gateway swap). Can't run locally (the
+      Codespace token lacks the `copilot-requests` scope) — only via a workflow run.
+- [x] **Egress:** `firewall-allow` is threaded into the gateway egress allowlist (`EGRESS_ALLOW` in
+      `gw_addon.py`, reachable with NO credential injected) on top of the deny-all baseline in
+      `network-up.sh`; credential swaps are lane-bound (`GW_LANES`, decision A).
 - [x] **Teardown + outputs:** `main.js` stops the gateway + dispatch and runs `network-down.sh` in a
       `finally`, sets the `status` output, and honors `timeout-minutes` via the boot timeout.
 - [ ] **Package:** tag `v0`, keep the `examples/` file as docs, document required permissions.
       (Action is runnable now; `agent-e2e.yml` demonstrates required permissions.)
-- [ ] **Prove end-to-end** — `.github/workflows/agent-e2e.yml` added (`issues: opened` → this action
-      with an add-labels safe output → label lands on the issue). Runs in-repo on `ubuntu-latest`.
-      **Pending its first real run** (needs the copilot-requests token at runtime).
+- [x] **Prove end-to-end** — `.github/workflows/agent-e2e.yml` (`issues: opened` → this action with an
+      add-labels safe output → label lands on the issue), in-repo on `ubuntu-latest`. **DONE:** multiple
+      green runs (issues #11, #12 → `documentation`, #13 → `bug`). This is the primary regression check.
 
-## Open questions (need @ericsciple input)
+## Open questions — ALL RESOLVED (kept for the decision record)
 
-- **Default `github` server — DECISION: keep the host-side SHIM as default; native is technically possible but NOT adopted (security). Empirical test: native works — run 29666521676.**
+- [x] **Default `github` server — DECISION: keep the host-side SHIM as default; native is technically possible but NOT adopted (security). Empirical test: native works — run 29666521676.**
   Ran `github-mcp-test.yml` (MV_GITHUB_MODE=native, dummy custom server, github-read prompt). Results:
   - **Native github read WORKS:** agent returned issue #8's real title (`GH_TITLE: Typo: 'recieve'…`)
     using its built-in github tools — **no** `Non-default MCP servers will be blocked`/403 line.
@@ -137,6 +140,11 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
     COPILOT_GITHUB_TOKEN (drop the extra vars → least privilege)? and (ii) should api.github.com be removed
     from the guest egress allowlist / the swap be scoped to api.githubcopilot.com only, so the guest can't
     upgrade a fake token into real write access?
+    - **UPDATE (decision A, DONE):** (ii) is now closed — the gateway is lane-bound; the real credential is
+      swapped ONLY on `api.githubcopilot.com` + `api.github.com/copilot_internal/`, and every other
+      `api.github.com` path is deny-by-default (403). A guest can no longer upgrade the fake into the
+      write-scoped token. (i) — dropping the extra native token vars — remains part of the deferred
+      hardened-native variant.
   - **DECISION (supersedes any "flip to native" note): keep `githubMode` default = `shim`.** Native is an
     **exfil/escalation vector as currently built**: it requires a **guest-held github credential** (the
     fake, gateway-swapped) and leans on the gateway not being blunt — a guest `curl` to `api.github.com`
@@ -148,12 +156,12 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
     credential bound to a *distinct* MCP host, extra token vars dropped, `api.github.com` write-swap
     closed). **Do NOT flip the default.** `github-mcp-test.yml` + MV_GITHUB_MODE/MV_EXTRA_GUEST_MCP remain
     the test harness.
-- **Shim ↔ host dispatch contract (RESOLVED).** A guest shim POSTs `{"tool","args"}` to the host
+- [x] **Shim ↔ host dispatch contract (RESOLVED).** A guest shim POSTs `{"tool","args"}` to the host
   dispatch at `http://172.16.0.1:9000/dispatch`; the dispatch forwards it as an MCP `tools/call` to
   the host-side server that advertises that tool. Tool names are discovered by launching each server
   and calling `tools/list` at startup (`src/dispatch.js` / `src/mcp-client.js`). Validated locally
   end-to-end (including through a real microVM).
-- **Node build from a Codespace (RESOLVED).** No bundler needed — the action is zero-dependency
+- [x] **Node build from a Codespace (RESOLVED).** No bundler needed — the action is zero-dependency
   ESM (`"type":"module"`) and `runs.main` points directly at `src/main.js`, so there's no `dist/`
   to build or commit.
 
