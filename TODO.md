@@ -211,6 +211,13 @@ of the reopened github item above where they conflict; read this section as the 
   with NO credential injected. Closes the write-escalation hole (guest `curl api.github.com/...`+sentinel
   can no longer obtain the write-scoped job token). Covered by `test/gw_addon_test.py` (10 cases) and
   validated via an agent-e2e run.
+  - **Empirical audit (run 29670863410, issue #13 -> `bug`):** real credential swapped ONLY on
+    `api.githubcopilot.com` (`/mcp/readonly`, `/models`, `/v1/messages`); ZERO swaps on `api.github.com`.
+    Deny-by-default 403'd `api.github.com /repos/github/copilot-cli/releases/latest` (CLI self-update
+    check) and `api.github.com /copilot/mcp_registry` (MCP policy probe) — both benign/tolerated; the
+    agent still triaged + labeled. Note: with `S2STOKENS`+integration-id the Copilot token exchange
+    happens server-side at `api.githubcopilot.com`, so the `/copilot_internal/` allowance wasn't even
+    exercised in this run (kept as a safety net).
 
 ### A. Gateway invariant (the ceiling principle)
 The guest can influence **nothing** about a trusted lane — not the upstream host, not the credential,
