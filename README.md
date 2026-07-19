@@ -60,7 +60,9 @@ runner (present on hosted runners). The one thing you add is the safe-outputs CL
   Servers the user adds (safe outputs, third-party tools) get their own secrets via their `env` block in
   `mcp-config`. Either way the guest gets only fake sentinels; real tokens are **never** placed in the
   guest's MCP config.
-- **Egress denied by default.** Host-enforced firewall + allowlist; extend with `firewall-allow`.
+- **Egress denied by default.** Host-enforced firewall + allowlist; extend with `firewall-allow`. The
+  gateway is **lane-bound**: the real credential is swapped in only on its allowlisted host/path
+  (inference), never on a general write API — see `docs/architecture.md`.
 - **Read-only mounts + throwaway overlay.** `GITHUB_WORKSPACE` and the Actions tool cache are mounted
   read-only; the agent writes into a discarded overlay. Persisting changes happens only via safe
   outputs.
@@ -69,6 +71,9 @@ runner (present on hosted runners). The one thing you add is the safe-outputs CL
 
 ## Related
 
+- **`docs/architecture.md`** — architecture & security model, with diagrams (trust boundary,
+  credential gateway, MCP shim/dispatch flow, network/firewall, mounts). Read this to understand *how*
+  the guest stays credential-free.
 - `ericsciple/safe-outputs` — the context-aware safe-output MCP servers this harness wires in.
 - **`docs/prototype-lessons.md`** — hard-won findings from the proven prototype (read this before
   building); **`docs/proven-prototype/`** — the verbatim, green phase workflows to lift recipes from.
