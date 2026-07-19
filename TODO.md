@@ -185,8 +185,9 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
       `proxy-chain`, `http-proxy`, `hoxy` are all **HTTP/1.1-only or not MITM** → would break inference.
     - **Binaries:** **`go-mitmproxy`** ships a ~3.8 MB Linux binary with h2+SSE, but has **NO transparent
       mode** and credential swap needs a custom Go plugin. `martian` (archived), `goproxy`/Caddy
-      (library/custom-build) rejected. mitmproxy's own standalone binary is a ~50–80 MB PyInstaller bundle
-      (not on GitHub releases; only mitmproxy.org).
+      (library/custom-build) rejected. mitmproxy's own standalone PyInstaller binary is **~119 MB**
+      (`downloads.mitmproxy.org/12.2.3/mitmproxy-12.2.3-linux-x86_64.tar.gz`, verified — not on GitHub
+      releases; embeds its own Python).
     - **Pure Node built-ins:** feasible (~500–700 LOC) but needs two small trusted deps — **`selfsigned`**
       (17.9M dl/wk; Node stdlib can't sign X.509) + **`http2-wrapper`** for upstream h2. `node-forge` is
       unmaintained — avoid.
@@ -197,6 +198,21 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
       per-run pip install) mostly **evaporates if we bake mitmproxy into a prebuilt base image** — then we
       keep transparent mode (the strongest posture) at zero per-run cost. Only pursue a replacement if we
       commit to **zero-Python-in-image**, in which case **mockttp (explicit proxy mode)** is the top pick.
+
+- **Bundle mitmproxy with the action (drop the per-run `pip install`, keep transparent mode).** Today
+  `provision.sh` runs `pip install mitmproxy` (needs host Python+pip+network, compiles native wheels).
+  Three ways to bundle it instead, in order of preference:
+  1. **⭐ Official Docker image** — run the gateway as `docker run --network host -v <gw_addon.py> …
+     mitmproxy/mitmproxy:12.2.3 mitmdump …` (pinned; ~103 MB image). **Requirement becomes Docker, which
+     the harness ALREADY requires** (rootfs built via `docker export`; github-mcp shim runs via Docker) —
+     **no host Python at all**, no ABI drift, reproducible. `--network host` preserves `--mode transparent`
+     (binds `:8080` in the host netns, sees the iptables REDIRECT, `SO_ORIGINAL_DST` intact). Mount
+     `gw_addon.py`, pass `GW_LANES`/`EGRESS_ALLOW` via `-e`, and a volume for `GW_LOG_DIR`. Folds into the
+     prebuilt-image work: per-run cost becomes a cached image pull, not a pip compile.
+  2. **Standalone PyInstaller binary** (~119 MB, embeds its own Python) → **zero host requirements**, but
+     too big to commit; fetch at provision (like Firecracker/kernel) or host as a release asset.
+  3. **Vendor `cp312-manylinux` wheels / a frozen venv** + `pip install --no-index` → requirement becomes
+     a **specific Python minor** (fragile: a cp312 wheel breaks on a future 3.13 runner). Least preferred.
 
 ## Key correctness notes
 
