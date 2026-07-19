@@ -50,8 +50,8 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 - [x] **Mounts (implemented — 2026-07-18; validated locally in a real microVM).** Two axes:
       - **`mounts` input (cumulative enum, default `workspace`):** `none` / `workspace` / `workspace+toolcache`.
         `workspace` mounts `GITHUB_WORKSPACE` as a hypervisor read-only virtio-block lower with a
-        throwaway tmpfs **overlay** at the identical guest path; `workspace+toolcache` also mounts
-        `RUNNER_TOOL_CACHE` read-only at its identical path (opt-in — the glibc/ABI caveat still applies;
+        throwaway tmpfs **overlay** at the well-known guest path `/__w`; `workspace+toolcache` also mounts
+        `RUNNER_TOOL_CACHE` read-only at `/__t` (opt-in — the glibc/ABI caveat still applies;
         verify a `setup-node`/`setup-go` build in-guest before relying on it). No full-FS mount.
       - **Well-known guest paths** (Actions container-job convention): workspace -> `/__w`,
         toolcache -> `/__t`, with `GITHUB_WORKSPACE`/`RUNNER_TOOL_CACHE` set in the guest to match;
@@ -67,7 +67,7 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
       - Implementation: `mounts` in `action.yml`/`inputs.js`; `scripts/build-mount-image.sh`
         (`mkfs.ext4 -d`, no loop mount); `generateMountSetup`/`generateInitScript` in `guest-assets.js`;
         `planMounts` + drive wiring in `main.js`. Unit-tested (42 tests). Real-microVM validation proved:
-        RO read at identical path, overlay write succeeds, toolcache write + remount-rw both blocked
+        RO read at the guest mount path, overlay write succeeds, toolcache write + remount-rw both blocked
         (hypervisor-enforced), and the host images stay pristine (writes discarded).
 - [x] **Default GitHub MCP (read-only):** inject `github` server; implement name-override +
       `github-mcp: false`. (`src/mcp-config.js`, unit-tested.) **DONE + validated locally:** runs the
@@ -114,7 +114,7 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 
 ## Open questions (need @ericsciple input)
 
-- **Default `github` server — RESOLVED EMPIRICALLY: NATIVE-in-guest works (test run 29666521676).**
+- **Default `github` server — DECISION: keep the host-side SHIM as default; native is technically possible but NOT adopted (security). Empirical test: native works — run 29666521676.**
   Ran `github-mcp-test.yml` (MV_GITHUB_MODE=native, dummy custom server, github-read prompt). Results:
   - **Native github read WORKS:** agent returned issue #8's real title (`GH_TITLE: Typo: 'recieve'…`)
     using its built-in github tools — **no** `Non-default MCP servers will be blocked`/403 line.
@@ -137,10 +137,17 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
     COPILOT_GITHUB_TOKEN (drop the extra vars → least privilege)? and (ii) should api.github.com be removed
     from the guest egress allowlist / the swap be scoped to api.githubcopilot.com only, so the guest can't
     upgrade a fake token into real write access?
-  - **Productization (pending the above):** flip `githubMode` default to `native`; remove/retire the
-    host-side docker github-mcp-server shim (validated but unnecessary; keep as opt-in fallback for GHES);
-    keep name-override + `github-mcp:false` (needs a way to actually disable the built-in — likely a CLI
-    flag). `github-mcp-test.yml` + the MV_GITHUB_MODE / MV_EXTRA_GUEST_MCP knobs are the test harness.
+  - **DECISION (supersedes any "flip to native" note): keep `githubMode` default = `shim`.** Native is an
+    **exfil/escalation vector as currently built**: it requires a **guest-held github credential** (the
+    fake, gateway-swapped) and leans on the gateway not being blunt — a guest `curl` to `api.github.com`
+    gets the **write-scoped** token swapped in. The `mcp/readonly` endpoint only limits writes *through
+    that one endpoint*; it does **not** close the `api.github.com` write-swap. **Shim keeps ZERO github
+    credential in the guest** (real token host-side in the docker container, `GITHUB_READ_ONLY=1`), so it
+    is strictly stronger — see the finalized "Design decisions" section (A/C). Native stays
+    **experimental (`githubMode: native`), deferred** until a hardened variant (read-only *downscoped*
+    credential bound to a *distinct* MCP host, extra token vars dropped, `api.github.com` write-swap
+    closed). **Do NOT flip the default.** `github-mcp-test.yml` + MV_GITHUB_MODE/MV_EXTRA_GUEST_MCP remain
+    the test harness.
 - **Shim ↔ host dispatch contract (RESOLVED).** A guest shim POSTs `{"tool","args"}` to the host
   dispatch at `http://172.16.0.1:9000/dispatch`; the dispatch forwards it as an MCP `tools/call` to
   the host-side server that advertises that tool. Tool names are discovered by launching each server
@@ -178,3 +185,91 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 - **Node action, bash provisioning.** Logic (input parsing, MCP merge, safe-output wiring) in Node;
   low-level host setup shelled out to `scripts/*.sh`.
 - **Zero-dependency ESM action.** `runs.main` -> `src/main.js` directly; no `dist/` bundle to build.
+
+## Design decisions — guest security model, MCP delivery, discovery (finalized 2026-07-18)
+
+Captured from a design review. These supersede the "shim everything incl. github via docker" phrasing
+of the reopened github item above where they conflict; read this section as the source of truth.
+
+### A. Gateway invariant (the ceiling principle)
+The guest can influence **nothing** about a trusted lane — not the upstream host, not the credential,
+not its scope (read/write), not the enabled tool set. The gateway/firewall/servers define the ceiling;
+the guest may only operate at or below it. Concretely:
+- **Per-lane sentinel↔credential binding.** Use a *distinct* fake token ("sentinel") per lane, each
+  mapped to exactly one real credential + one destination (and path where needed). Never cross-apply a
+  sentinel across lanes. (Today `gw_addon.py` uses ONE fake→ONE real for every allowlisted host — the
+  hole; a guest `curl`+fake to `api.github.com` gets the write-scoped job token. Fix this.)
+- **Never inject a write-capable credential for any guest-reachable request.** The write (job) token is
+  used ONLY host-side by safe-output servers; the guest has no path to it.
+- **Inference lane:** swap the sentinel only on `api.githubcopilot.com` + the specific Copilot
+  *token-exchange path* on `api.github.com`; reject other `api.github.com` paths; present an
+  inference-scoped credential there, not the full job token.
+- This is a deliberate, **stronger divergence from gh-aw**, which trusts its OS sandbox and (in default
+  mode) hands the agent the real token.
+
+### B. Firewall vs gateway (how URL/destination is actually pinned)
+- Guest `:443` is **REDIRECTed to the host gateway** (`nat PREROUTING … --dport 443 REDIRECT :8080`);
+  it does NOT traverse the FORWARD allowlist. The **gateway** (`gw_addon.py` `ALLOW`) enforces the
+  HTTPS destination allowlist; **iptables** forces all `:443` into the gateway and DROPs everything else
+  (deny-by-default), making the gateway **unbypassable**.
+- Therefore the guest has **zero control over the inference URL**: even with full URL control it can only
+  reach allowlisted GitHub hosts. **Do NOT adopt gh-aw's guest-settable base-URL (BYOK) approach** — keep
+  transparent interception.
+- **Tighten DNS:** `network-up.sh` currently allows `:53` to ANY resolver → a DNS-tunneling exfil
+  channel (no token needed). Pin DNS to a specific resolver, or run a host-side resolver that only
+  answers allowlisted names.
+
+### C. MCP delivery — all servers host-side, exposed as CLIs
+- **Every** MCP server (safe outputs, third-party, AND github) runs **host-side**; the guest gets only
+  thin forwarder shims → host dispatch. Nothing with a credential or policy decision lives in the VM.
+  This is both the 403 workaround (non-default MCP servers blocked in-guest, transport-agnostic) AND
+  security-aligned (servers + creds outside guest control).
+- **github stays a host-side shim for the prototype** (guest holds NO github credential; no
+  `api.github.com` write swap). Native-in-guest github is deferred until a *hardened* variant exists: a
+  **read-only, downscoped** github credential bound to a **distinct** github-MCP host, so even full guest
+  control of that lane can't exceed read. (The `github-mcp-test.yml` result informs feasibility, but the
+  security invariant, not the 403 test, is the deciding factor.)
+- **One shim per SERVER**, not per tool: `<server> <tool> <args>`. The server name namespaces tools
+  (avoids cross-server tool-name collisions) and bounds the file count. (Currently one-per-tool in
+  `main.js` — change.)
+
+### D. Shim + injected-artifact location
+- **Shims do NOT go on `$PATH`** — avoids shadowing real CLI tools in either direction. Put them in a
+  **harness-owned, read-only, off-PATH directory** (suggested `/__mcp`, echoing the runner's `__w`/`__t`
+  convention), surfaced via an env var + the preamble. A **read-only mount** makes integrity
+  hypervisor-enforced (agent can't tamper) — stronger than gh-aw's `chmod 555`.
+- **Event payload:** inject ONLY the single `event.json` (never `RUNNER_TEMP` — it holds the
+  `actions/checkout@v7` push token) into a well-known harness location and set the standard
+  **`GITHUB_EVENT_PATH`** env var to it. Default ON, independent of the mount enum. It can ride the same
+  small read-only "harness config" mount as the shims.
+- **All guest mounts use `__`-prefixed well-known paths — NO host-path mirroring** (matches the built
+  code: `main.js` `GUEST_WORKSPACE_PATH="/__w"`, `GUEST_TOOLCACHE_PATH="/__t"`). Workspace -> `/__w`,
+  toolcache -> `/__t` (Actions container-job convention), with `GITHUB_WORKSPACE`/`RUNNER_TOOL_CACHE` set
+  to match and only the tool-cache PATH entries rewritten to `/__t` (`src/paths.js`); shims -> `/__mcp`;
+  `event.json` surfaced via `GITHUB_EVENT_PATH`. We do **not** mount at identical host paths — an earlier
+  draft (in this doc and the base-image notes) proposed that to skip PATH translation, but it was
+  **rejected**; the guest never mirrors host paths.
+- Deliver these per-run artifacts via a small **read-only mount** (fits prebuilt base images; don't bake
+  per-run shims into the rootfs).
+
+### E. Tool discovery — lazy / piecemeal (token- and time-efficient)
+- **No startup `tools/list`, no giant manifest JSON.** Generate the shims from the **server list
+  (config) alone**.
+- **Preamble (tiny, ~4–6 lines):** state it's an isolated microVM; point to `$GITHUB_EVENT_PATH` for run
+  context; list the tool **servers** + a one-line description each + "run `<server> --help`"; then the
+  user prompt.
+- **Lazy detail:** `<server> --help` / `<server> <tool> --help` resolve tool lists/schemas **on demand**
+  via dispatch → `tools/list` for that one server, **cached** host-side. Detail is pulled only for tools
+  the agent actually uses.
+- **Lazy server startup:** don't boot a server (e.g. the github docker container, if used) until first
+  invoked.
+- This can be **more token-efficient than native MCP**, which front-loads every tool's schema into
+  context each turn. Also: keep the tool `description` from `tools/list` (`dispatch.js` currently drops
+  it).
+
+### F. Copilot auth (confirmed — no change)
+Default (non-BYOK) Copilot path: `COPILOT_GITHUB_TOKEN` (fake in guest, swapped at the gateway) +
+`S2STOKENS=true` + `GITHUB_COPILOT_INTEGRATION_ID=agentic-workflows` + `COPILOT_AGENT_RUNNER_TYPE=STANDALONE`
++ `XDG_CONFIG_HOME`. Matches gh-aw's default. gh-aw's `byok-copilot` (dummy `COPILOT_API_KEY` + custom
+`api-target` base URL) is the future **multi-provider / agent-agnostic** seam — not needed now, and we do
+NOT want its guest-settable base URL (see B).
