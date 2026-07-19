@@ -46,6 +46,22 @@ test("never writes the harness token into the guest config", () => {
   assert.ok(!JSON.stringify(guestConfig).includes("ghs_REAL_HARNESS_TOKEN"));
 });
 
+test("githubMode 'native' skips the host github docker server (rely on builtin)", () => {
+  const { guestConfig, hostServers } = buildGuestMcpConfig({ ...base, githubMode: "native" });
+  assert.ok(!hostServers.some((s) => s.name === "github"));
+  assert.equal(guestConfig.mcpServers.github, undefined);
+});
+
+test("extraGuestMcp merges a custom server into the guest config (negative control)", () => {
+  const { guestConfig } = buildGuestMcpConfig({
+    ...base,
+    githubMode: "native",
+    extraGuestMcp: JSON.stringify({ mcpServers: { dummy: { command: "/bin/echo", args: ["hi"] } } }),
+  });
+  assert.ok(guestConfig.mcpServers.dummy);
+  assert.equal(guestConfig.mcpServers.dummy.command, "/bin/echo");
+});
+
 test("custom servers go host-side with their env; nothing about them reaches the guest", () => {
   const mcpConfig = JSON.stringify({
     mcpServers: {

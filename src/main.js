@@ -99,6 +99,14 @@ async function main() {
   // GITHUB_EVENT_PATH repointed at the guest copy — ONLY event.json is copied,
   // never RUNNER_TEMP (checkout persists a push token there).
   let agentEnv = `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`;
+  // In native github mode, the CLI's built-in github server may read the token from a
+  // different env var; export the SAME fake sentinel under the common names so the
+  // gateway's fake->real swap covers whichever one it uses (all fake — safe).
+  if (inputs.githubMode === "native") {
+    agentEnv += `export GITHUB_PERSONAL_ACCESS_TOKEN=${FAKE_TOKEN}\n`;
+    agentEnv += `export GITHUB_TOKEN=${FAKE_TOKEN}\n`;
+    agentEnv += `export GH_TOKEN=${FAKE_TOKEN}\n`;
+  }
   // Point the guest's GITHUB_WORKSPACE / RUNNER_TOOL_CACHE at the well-known mount
   // points, so the agent and tooling resolve them correctly inside the guest.
   if (initMounts.workspace) agentEnv += `export GITHUB_WORKSPACE=${initMounts.workspace.path}\n`;

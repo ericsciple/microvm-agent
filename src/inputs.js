@@ -42,6 +42,12 @@ export function readInputs() {
     eventPath: process.env.GITHUB_EVENT_PATH || "",
     // Base URL for the default github MCP server (GHES-aware); host-side only.
     githubServerUrl: process.env.GITHUB_SERVER_URL || "https://github.com",
+    // EXPERIMENTAL (test-only) knobs for resolving the github-MCP shape:
+    //   MV_GITHUB_MODE=native  -> rely on the CLI's built-in github server (no host docker shim)
+    //   MV_GITHUB_MODE=shim    -> host-side github-mcp-server via docker + CLI shim (default)
+    githubMode: process.env.MV_GITHUB_MODE || "shim",
+    //   MV_EXTRA_GUEST_MCP=<json> -> extra mcpServers merged into the GUEST config (negative control)
+    extraGuestMcp: process.env.MV_EXTRA_GUEST_MCP || "",
     // Host-side only. Never written into the guest MCP config.
     githubToken: input("github-token") || process.env.GITHUB_TOKEN || "",
   };

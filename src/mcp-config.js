@@ -50,11 +50,14 @@ export function buildGuestMcpConfig(inputs) {
     DEFAULT_GITHUB_SERVER_NAME
   );
 
-  // (1) Default read-only github server — the official github-mcp-server run
-  // host-side over stdio (docker), holding the REAL token host-side with
-  // GITHUB_READ_ONLY=1. Not written into the guest config; discovered like any
-  // other server and delivered to the guest as `github_*` CLI shims.
-  if (inputs.githubMcp && !userDefinedGithub) {
+  // (1) Default read-only github server.
+  //   - "shim" (default): run the official github-mcp-server host-side over docker
+  //     stdio with the real token host-side (GITHUB_READ_ONLY=1), discovered like any
+  //     server and delivered as `github_*` CLI shims. No guest MCP entry.
+  //   - "native" (experimental): rely on the CLI's BUILT-IN github server in the guest
+  //     (on by default unless --disable-builtin-mcps). No host server, no shim — the
+  //     built-in is a default server, unaffected by the custom-MCP 403 policy block.
+  if (inputs.githubMcp && !userDefinedGithub && inputs.githubMode !== "native") {
     hostServers.push({
       name: DEFAULT_GITHUB_SERVER_NAME,
       kind: "github",
@@ -83,6 +86,21 @@ export function buildGuestMcpConfig(inputs) {
   // written into the guest config.
   for (const [name, rawDef] of Object.entries(userServers)) {
     hostServers.push(normalizeCustomServer(name, rawDef));
+  }
+
+  // EXPERIMENTAL (test-only): merge extra servers directly into the GUEST config.
+  // Used as the negative control to confirm the CLI blocks a custom guest MCP server
+  // under registry policy. Must not carry secrets (it reaches the guest verbatim).
+  if (inputs.extraGuestMcp) {
+    let extra;
+    try {
+      extra = JSON.parse(inputs.extraGuestMcp);
+    } catch (e) {
+      throw new Error(`MV_EXTRA_GUEST_MCP is not valid JSON: ${e.message}`);
+    }
+    for (const [name, def] of Object.entries(extra.mcpServers || extra || {})) {
+      guestServers[name] = def;
+    }
   }
 
   return { guestConfig: { mcpServers: guestServers }, hostServers };

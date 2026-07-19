@@ -1,0 +1,84 @@
+# EMPIRICAL TEST (not the product path): resolve whether the Copilot CLI's default
+# `github` MCP server works NATIVELY inside the guest (no host-side shim), and confirm
+# a custom (non-default) MCP server is still blocked by the CLI's registry policy.
+#
+# Runs the harness with MV_GITHUB_MODE=native (skip the host docker github shim; rely on
+# the CLI's built-in github server) and MV_EXTRA_GUEST_MCP (inject a dummy custom stdio
+# server into the guest config = negative control). The prompt asks the agent to read the
+# triggering issue via its GitHub tools (NOT shell), then try the dummy server. We then
+# read the guest console + gateway logs to determine the outcome.
+name: github-mcp-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number for the agent to read via github tools."
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+  copilot-requests: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the microVM agent (native github + dummy custom server)
+        id: agent
+        continue-on-error: true
+        env:
+          MV_WORKDIR: ${{ runner.temp }}/microvm-agent-work
+          MV_GITHUB_MODE: native
+          # Negative control: a bogus custom stdio server. The CLI should refuse to
+          # register it ("Non-default MCP servers will be blocked").
+          MV_EXTRA_GUEST_MCP: '{"mcpServers":{"dummy":{"command":"/bin/cat","args":[]}}}'
+        uses: ./
+        with:
+          prompt: |
+            You are running inside a sandbox with the built-in GitHub MCP tools available.
+            Do all of the following, then stop:
+            1. Using your GITHUB MCP TOOLS (not shell/bash, not curl), fetch issue number
+               ${{ inputs.issue_number }} in the repository ${{ github.repository }} and print its
+               title on its own line prefixed exactly with: GH_TITLE:
+            2. Attempt to list or call any tool from the MCP server named "dummy". Print one line
+               prefixed exactly with DUMMY_RESULT: describing whether it was available or blocked.
+            3. Reply with exactly: DONE
+          github-token: ${{ github.token }}
+          github-mcp: "true"
+          timeout-minutes: "10"
+
+      - name: Analyze guest console + gateway logs
+        run: |
+          work="${{ runner.temp }}/microvm-agent-work"
+          echo "=================== GUEST CONSOLE (tail) ==================="
+          tail -n 200 "$work/console.log" 2>/dev/null || echo "(no console.log)"
+          echo
+          echo "=================== POLICY / GITHUB SIGNALS ==================="
+          echo "-- 403 / policy block lines --"
+          grep -niE 'registry policy|Non-default MCP servers|403 Forbidden|will be blocked' "$work/console.log" 2>/dev/null || echo "(none found)"
+          echo "-- GH_TITLE (did native github read return data?) --"
+          grep -n 'GH_TITLE:' "$work/console.log" 2>/dev/null || echo "(no GH_TITLE)"
+          echo "-- DUMMY_RESULT (was the custom server blocked?) --"
+          grep -n 'DUMMY_RESULT:' "$work/console.log" 2>/dev/null || echo "(no DUMMY_RESULT)"
+          echo
+          echo "=================== GATEWAY HOSTS DIALED ==================="
+          # gw_addon.py writes /tmp/gw-hosts.log; it may not be under $work. Show both.
+          echo "-- all hosts dialed --"; sort -u /tmp/gw-hosts.log 2>/dev/null || true
+          echo "-- BLOCKED hosts (not on allowlist) --"; sort -u /tmp/gw-blocked.log 2>/dev/null || echo "(none blocked)"
+          echo "-- token swaps performed --"; sort -u /tmp/gw-swaps.log 2>/dev/null || echo "(no swaps)"
+          echo "-- gateway log tail --"
+          tail -n 40 "$work/gateway.log" 2>/dev/null || echo "(no gateway.log)"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-mcp-test-logs
+          path: |
+            ${{ runner.temp }}/microvm-agent-work/console.log
+            ${{ runner.temp }}/microvm-agent-work/gateway.log
+          if-no-files-found: ignore
