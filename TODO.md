@@ -191,6 +191,21 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 Captured from a design review. These supersede the "shim everything incl. github via docker" phrasing
 of the reopened github item above where they conflict; read this section as the source of truth.
 
+**Implementation status (2026-07-18):**
+- [x] **B (DNS pinning)** — network-up/down.sh pin egress :53 to one resolver (MV_DNS_RESOLVER); guest
+  resolv.conf threaded. (Stronger allowlisted-name host resolver still deferred.)
+- [x] **C/D/E (MCP delivery + off-PATH shims + lazy discovery)** — one shim per server at `/__mcp/<server>`,
+  delivered via a READ-ONLY `/__mcp` virtio-block mount (not baked); OFF $PATH (absolute path), CLI granted
+  `/__mcp` via `--add-dir`. Lazy per-server tools/list (cached host-side); host-side `convertArgs`; preamble
+  lists servers + `$GITHUB_EVENT_PATH`; event.json rides the `/__mcp` mount. Mounts stay `__`-prefixed
+  (`/__mcp`,`/__w`,`/__t`), no host-path mirroring. Validated via unit tests + a real-microVM run
+  (`/__mcp/labeler --help` lazy-listed, `add_labels` applied) AND the full agent-e2e (issue #11 -> label).
+  E-minor: dispatch keeps tool `description`. **NOTE:** github still runs as a host-side docker shim in
+  the default `shim` mode (per the github decision); one-shim-per-server + lazy startup means the github
+  container is only launched on first `/__mcp/github` use.
+- [ ] **A (gateway per-lane sentinel binding)** — NOT YET DONE. gw_addon.py still uses ONE fake->ONE real
+  for every allowlisted host (the api.github.com write-swap hole). Highest-value remaining hardening.
+
 ### A. Gateway invariant (the ceiling principle)
 The guest can influence **nothing** about a trusted lane — not the upstream host, not the credential,
 not its scope (read/write), not the enabled tool set. The gateway/firewall/servers define the ceiling;
