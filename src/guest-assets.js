@@ -1,59 +1,68 @@
-// Generate the guest-side assets: the CLI shims (one per host-dispatched tool),
-// the init script, and the Dockerfile used to build the guest rootfs.
+// Generate the guest-side assets: the per-server CLI shims, the MCP preamble, the
+// mount setup, the init script, and the Dockerfile.
 //
-// The shims are the guest's only view of a custom/safe-output server: a thin
-// bash forwarder on PATH that POSTs `{tool, args}` to the host dispatch endpoint
-// (see dispatch.js). We generate each shim from the tool's advertised JSON Schema
-// so the agent gets an ergonomic command, without hardcoding per-tool knowledge:
-//
-//   - one array-of-strings property  -> positional args   (add_labels bug triage)
-//   - one string property            -> the whole line     (add_comment hello there)
-//   - anything else                  -> a single JSON arg   (update_issue '{"state":"closed"}')
+// Shims are the guest's only view of an MCP server. There is ONE shim per server
+// (not per tool), delivered off-PATH in a read-only /__mcp mount. A shim is a thin
+// forwarder that POSTs to the host dispatch endpoint (see dispatch.js):
+//   /__mcp/<server>                 -> list the server's tools        (lazy tools/list)
+//   /__mcp/<server> <tool> --help   -> show a tool's input schema
+//   /__mcp/<server> <tool> <args>   -> run a tool
+// The shim carries NO schema — discovery is lazy and host-side (dispatch caches
+// tools/list per server), so the guest rootfs/base image needs no per-run baking.
 
 export const DEFAULT_DISPATCH_ENDPOINT = "http://172.16.0.1:9000/dispatch";
+export const DEFAULT_MCP_DIR = "/__mcp";
 
 /**
- * @param {{name: string, inputSchema?: object}} tool
+ * One shim per server. POSIX sh; needs jq + curl in the guest.
+ * @param {string} serverName
  * @param {{endpoint?: string}} [opts]
- * @returns {string} bash script contents for the shim
+ * @returns {string} shell script contents for the shim
  */
-export function generateShim(tool, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
-  const schema = tool.inputSchema || {};
-  const props = schema.properties || {};
-  const keys = Object.keys(props);
-  const post = `  | curl -s -X POST ${endpoint} -H 'Content-Type: application/json' --data-binary @-\necho`;
+export function generateServerShim(serverName, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
+  return `#!/bin/sh
+# MCP shim for server '${serverName}'.
+#   ${serverName}                 list this server's tools
+#   ${serverName} <tool> --help   show a tool's input schema
+#   ${serverName} <tool> [args]   run a tool
+S=${shq(serverName)}
+EP=${shq(endpoint)}
+post() { curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-; echo; }
+if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  jq -nc --arg s "$S" '{server:$s,help:true}' | post
+  exit 0
+fi
+tool=$1; shift
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,help:true}' | post
+  exit 0
+fi
+jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,args:$ARGS.positional}' --args "$@" | post
+`;
+}
 
-  if (keys.length === 1) {
-    const key = keys[0];
-    const prop = props[key] || {};
-    if (prop.type === "array" && prop.items && prop.items.type === "string") {
-      return (
-        `#!/bin/bash\n` +
-        `# ${tool.name}: positional args become the '${key}' array.\n` +
-        `jq -nc --args '{tool:"${tool.name}",args:{${key}:$ARGS.positional}}' "$@" \\\n` +
-        post +
-        `\n`
-      );
-    }
-    if (prop.type === "string") {
-      return (
-        `#!/bin/bash\n` +
-        `# ${tool.name}: the whole command line becomes the '${key}' string.\n` +
-        `jq -nc --arg v "$*" '{tool:"${tool.name}",args:{${key}:$v}}' \\\n` +
-        post +
-        `\n`
-      );
-    }
+/**
+ * The preamble prepended to the user prompt: tells the agent it's in an isolated
+ * microVM, where the event payload is, and how to discover + run MCP tools.
+ * @param {string[]} serverNames
+ * @param {{mcpDir?: string}} [opts]
+ * @returns {string}
+ */
+export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = {}) {
+  const lines = [
+    "You are an autonomous agent inside an isolated, ephemeral Firecracker microVM.",
+    "The triggering event payload (issue/PR JSON) is at the path in $GITHUB_EVENT_PATH.",
+  ];
+  if (serverNames.length) {
+    lines.push("Tools are provided by MCP servers, exposed as commands (use the absolute path):");
+    for (const s of serverNames) lines.push(`  ${mcpDir}/${s}`);
+    lines.push(
+      `List a server's tools: \`${mcpDir}/<server>\`. Show a tool's inputs: \`${mcpDir}/<server> <tool> --help\`.`,
+      `Run a tool: \`${mcpDir}/<server> <tool> <args>\`.`
+    );
   }
-
-  // Generic fallback: the single argument is a JSON object of the tool arguments.
-  return (
-    `#!/bin/bash\n` +
-    `# ${tool.name}: pass tool arguments as a single JSON object, e.g. ${tool.name} '{"...":"..."}'.\n` +
-    `jq -nc --argjson args "\${1:-{}}" '{tool:"${tool.name}",args:$args}' \\\n` +
-    post +
-    `\n`
-  );
+  lines.push("---");
+  return lines.join("\n") + "\n";
 }
 
 /**
@@ -65,8 +74,14 @@ export function generateShim(tool, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}
  * @param {{workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
  * @returns {string}
  */
-export function generateMountSetup({ workspace = null, toolcache = null } = {}) {
+export function generateMountSetup({ harness = null, workspace = null, toolcache = null } = {}) {
   let out = "";
+  if (harness) {
+    out +=
+      `\n# --- harness config (shims + event.json): hypervisor read-only ---\n` +
+      `mkdir -p ${shq(harness.path)}\n` +
+      `mount -o ro ${shq(harness.dev)} ${shq(harness.path)}\n`;
+  }
   if (workspace) {
     out +=
       `\n# --- workspace: hypervisor read-only lower + throwaway tmpfs overlay ---\n` +
@@ -97,7 +112,7 @@ function shq(s) {
  * @param {string} [opts.guestIp]
  * @param {string} [opts.hostIp]
  * @param {string} [opts.dns]
- * @param {{workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @param {{harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
  * @returns {string}
  */
 export function generateInitScript({
@@ -151,14 +166,12 @@ sleep infinity
 
 /**
  * Dockerfile for the guest rootfs: Debian slim + the standalone Copilot CLI +
- * device nodes + the generated shims. Ported from phase4. `util-linux` provides
- * `mount` for the virtio-block workspace/toolcache mounts (phase6).
- * @param {string[]} shimNames
+ * device nodes. Ported from phase4. `util-linux` provides `mount` for the
+ * virtio-block mounts (phase6); `jq`/`curl` are used by the /__mcp shims. Shims
+ * are NOT baked in — they are delivered per-run via the read-only /__mcp mount.
  * @returns {string}
  */
-export function generateDockerfile(shimNames) {
-  const copyShims = shimNames.map((n) => `COPY ${n} /usr/local/bin/${n}`).join("\n");
-  const chmodShims = shimNames.map((n) => `/usr/local/bin/${n}`).join(" ");
+export function generateDockerfile() {
   return `FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \\
       ca-certificates curl iproute2 iptables procps jq util-linux \\
@@ -175,7 +188,6 @@ RUN mknod -m 622 /dev/console c 5 1 || true; \\
     mknod -m 444 /dev/urandom c 1 9 || true; \\
     mknod -m 620 /dev/ttyS0 c 4 64 || true
 COPY init.sh /init
-${copyShims}
-RUN chmod +x /init ${chmodShims}
+RUN chmod +x /init
 `;
 }

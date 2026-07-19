@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { listTools, callTool } from "../src/mcp-client.js";
-import { buildToolRegistry, createDispatchServer } from "../src/dispatch.js";
+import { buildToolRegistry, createDispatchServer, convertArgs } from "../src/dispatch.js";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-mcp-server.mjs", import.meta.url));
 
@@ -37,7 +37,24 @@ test("callTool rejects when the command cannot be spawned", async () => {
   );
 });
 
-// --- dispatch registry ---
+// --- convertArgs (host-side positional -> argument object) ---
+
+test("convertArgs maps positional args to a single array-of-strings property", () => {
+  const schema = { type: "object", properties: { labels: { type: "array", items: { type: "string" } } } };
+  assert.deepEqual(convertArgs(schema, ["bug", "triage"]), { labels: ["bug", "triage"] });
+});
+
+test("convertArgs joins positional args for a single string property", () => {
+  const schema = { type: "object", properties: { body: { type: "string" } } };
+  assert.deepEqual(convertArgs(schema, ["hello", "there"]), { body: "hello there" });
+});
+
+test("convertArgs parses a single JSON arg for multi-property tools", () => {
+  const schema = { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } };
+  assert.deepEqual(convertArgs(schema, ['{"a":"x","b":"y"}']), { a: "x", b: "y" });
+});
+
+// --- buildToolRegistry (used by probes/tests) ---
 
 test("buildToolRegistry maps each tool to its server and skips servers with no command", async () => {
   const registry = await buildToolRegistry([
@@ -48,16 +65,10 @@ test("buildToolRegistry maps each tool to its server and skips servers with no c
   assert.equal(registry.add_labels.name, "fixture");
 });
 
-test("buildToolRegistry rejects a tool-name collision", async () => {
-  const a = { ...server({ FIXTURE_TOOL: "dup" }), name: "a" };
-  const b = { ...server({ FIXTURE_TOOL: "dup" }), name: "b" };
-  await assert.rejects(() => buildToolRegistry([a, b]), /collision/);
-});
+// --- dispatch HTTP endpoint (server-keyed, lazy) ---
 
-// --- dispatch HTTP endpoint ---
-
-async function withDispatch(registry, fn) {
-  const srv = createDispatchServer(registry);
+async function withDispatch(serverMap, fn) {
+  const srv = createDispatchServer(serverMap);
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   const { port } = srv.address();
   try {
@@ -83,27 +94,49 @@ function post(port, obj, path = "/dispatch") {
   });
 }
 
-test("dispatch forwards a shim call to the mapped server", async () => {
-  const registry = await buildToolRegistry([server({ FIXTURE_TOOL: "add_labels" })]);
-  await withDispatch(registry, async (port) => {
-    const res = await post(port, { tool: "add_labels", args: { labels: ["triage"] } });
+test("dispatch --help lists a server's tools", async () => {
+  await withDispatch({ fixture: server({ FIXTURE_TOOL: "add_labels" }) }, async (port) => {
+    const res = await post(port, { server: "fixture", help: true });
+    assert.equal(res.status, 200);
+    assert.match(res.body.text, /add_labels/);
+  });
+});
+
+test("dispatch tool --help shows the schema", async () => {
+  await withDispatch({ fixture: server() }, async (port) => {
+    const res = await post(port, { server: "fixture", tool: "echo_tool", help: true });
+    assert.equal(res.status, 200);
+    assert.match(res.body.text, /input schema/);
+  });
+});
+
+test("dispatch invokes a tool with converted args", async () => {
+  await withDispatch({ fixture: server() }, async (port) => {
+    // fixture tool has schema {type:object} (no properties) -> generic JSON arg.
+    const res = await post(port, { server: "fixture", tool: "echo_tool", args: ['{"labels":["triage"]}'] });
     assert.equal(res.status, 200);
     assert.equal(res.body.status, "ok");
     assert.equal(res.body.text, 'echo:{"labels":["triage"]}');
   });
 });
 
-test("dispatch returns 404 for an unknown tool", async () => {
+test("dispatch returns 404 for an unknown server", async () => {
   await withDispatch({}, async (port) => {
-    const res = await post(port, { tool: "nope", args: {} });
+    const res = await post(port, { server: "nope", help: true });
+    assert.equal(res.status, 404);
+  });
+});
+
+test("dispatch returns 404 for an unknown tool on a known server", async () => {
+  await withDispatch({ fixture: server() }, async (port) => {
+    const res = await post(port, { server: "fixture", tool: "missing", args: [] });
     assert.equal(res.status, 404);
   });
 });
 
 test("dispatch reports a tool error without failing the request", async () => {
-  const registry = await buildToolRegistry([server({ FIXTURE_TOOL: "add_labels", FIXTURE_ERROR: "1" })]);
-  await withDispatch(registry, async (port) => {
-    const res = await post(port, { tool: "add_labels", args: {} });
+  await withDispatch({ fixture: server({ FIXTURE_ERROR: "1" }) }, async (port) => {
+    const res = await post(port, { server: "fixture", tool: "echo_tool", args: [] });
     assert.equal(res.status, 200);
     assert.equal(res.body.status, "error");
   });

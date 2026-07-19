@@ -52,7 +52,7 @@ jobs:
             Choose the SINGLE most appropriate label from EXACTLY this list:
               bug, documentation, enhancement, question, wontfix
             Apply it by ACTUALLY RUNNING this command with your bash tool (do not just describe it):
-              add_labels <label>
+              /__mcp/labeler add_labels <label>
             The label applies to the issue this workflow is running on — you do not need an
             issue number. After it succeeds, reply with exactly: DONE
           github-token: ${{ github.token }}

@@ -19,8 +19,8 @@ import { fileURLToPath } from "node:url";
 
 import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
-import { discoverTools, createDispatchServer } from "./dispatch.js";
-import { generateShim, generateInitScript, generateDockerfile } from "./guest-assets.js";
+import { createDispatchServer } from "./dispatch.js";
+import { generateServerShim, generateMcpPreamble, generateInitScript, generateDockerfile, DEFAULT_MCP_DIR } from "./guest-assets.js";
 import { translateToolCachePathEntries } from "./paths.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -66,14 +66,15 @@ async function main() {
   const { guestConfig, hostServers } = buildGuestMcpConfig(inputs);
   assertNoSecretsInGuestConfig({ guestConfig, hostServers });
 
-  // 2. Discover the tools each custom server advertises -> shims + dispatch registry.
-  const discovered = await discoverTools(hostServers, { log });
-  const registry = {};
-  for (const { server, name } of discovered) {
-    if (registry[name]) throw new Error(`Tool name collision on '${name}'.`);
-    registry[name] = server;
+  // 2. Build the server map for lazy dispatch (keyed by server name). No startup
+  // tools/list — discovery is lazy (dispatch fetches + caches per server on demand).
+  const serverMap = {};
+  for (const s of hostServers) {
+    if (!s.command) continue;
+    serverMap[s.name] = s;
   }
-  log(`tools exposed to the guest as shims: ${discovered.map((d) => d.name).join(", ") || "(none)"}`);
+  const serverNames = Object.keys(serverMap);
+  log(`MCP servers exposed to the guest as shims: ${serverNames.join(", ") || "(none)"}`);
 
   // 3. Generate the guest build context + the runtime injection tree.
   const ctx = freshDir(path.join(WORK, "guest"));
@@ -82,25 +83,39 @@ async function main() {
   fs.mkdirSync(path.join(inject, "root", ".copilot"), { recursive: true });
   fs.mkdirSync(path.join(inject, "usr", "local", "share", "ca-certificates"), { recursive: true });
 
+  // Assemble the read-only /__mcp "harness config" mount: one shim per server, plus
+  // the event payload (agent context). Delivered as a mount so the base rootfs needs
+  // no per-run baking, and RO makes the shims/event tamper-proof (hypervisor-enforced).
+  const harnessSrc = freshDir(path.join(WORK, "harness"));
+  for (const name of serverNames) {
+    const shimPath = path.join(harnessSrc, name);
+    fs.writeFileSync(shimPath, generateServerShim(name));
+    fs.chmodSync(shimPath, 0o755);
+  }
+  let guestEventPath = "";
+  if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
+    fs.copyFileSync(inputs.eventPath, path.join(harnessSrc, "event.json"));
+    guestEventPath = `${DEFAULT_MCP_DIR}/event.json`;
+    log("copied event.json into the /__mcp harness mount (GITHUB_EVENT_PATH repointed).");
+  }
+  const harnessHasContent = serverNames.length > 0 || guestEventPath !== "";
+
   // Plan the mounts: build a virtio-block image per host path and assign guest
   // device names in drive order (rootfs is vda, so the first extra drive is vdb).
-  const { drives, initMounts } = planMounts(inputs);
+  const { drives, initMounts } = planMounts(inputs, harnessHasContent ? harnessSrc : null);
 
   fs.writeFileSync(
     path.join(ctx, "init.sh"),
     generateInitScript({ mounts: initMounts, dns: process.env.MV_DNS_RESOLVER || "8.8.8.8" })
   );
-  const shimNames = discovered.map((d) => d.name);
-  for (const d of discovered) {
-    fs.writeFileSync(path.join(ctx, d.name), generateShim({ name: d.name, inputSchema: d.inputSchema }));
-  }
-  fs.writeFileSync(path.join(ctx, "Dockerfile"), generateDockerfile(shimNames));
+  fs.writeFileSync(path.join(ctx, "Dockerfile"), generateDockerfile());
 
-  fs.writeFileSync(path.join(inject, "etc", "prompt.txt"), inputs.prompt + "\n");
+  // The prompt = MCP preamble (isolation notice, event path, how to run tools) + the
+  // user's prompt.
+  const preamble = generateMcpPreamble(serverNames, { mcpDir: DEFAULT_MCP_DIR });
+  fs.writeFileSync(path.join(inject, "etc", "prompt.txt"), preamble + inputs.prompt + "\n");
 
-  // Runtime agent env. The event payload is copied in (agent context only) and
-  // GITHUB_EVENT_PATH repointed at the guest copy — ONLY event.json is copied,
-  // never RUNNER_TEMP (checkout persists a push token there).
+  // Runtime agent env (no secrets — all fake sentinels).
   let agentEnv = `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`;
   // In native github mode, the CLI's built-in github server may read the token from a
   // different env var; export the SAME fake sentinel under the common names so the
@@ -127,13 +142,10 @@ async function main() {
       log(`guest PATH += ${guestPathAdds.join(":")}`);
     }
   }
-  if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
-    fs.copyFileSync(inputs.eventPath, path.join(inject, "etc", "event.json"));
-    agentEnv += `export GITHUB_EVENT_PATH=/etc/event.json\n`;
-    log("copied event.json into the guest (GITHUB_EVENT_PATH repointed).");
-  }
+  if (guestEventPath) agentEnv += `export GITHUB_EVENT_PATH=${guestEventPath}\n`;
   fs.writeFileSync(path.join(inject, "etc", "agent.env"), agentEnv);
-  // Guest MCP config carries NO secret (asserted above).
+  // Guest MCP config carries NO secret (asserted above). Empty by default — every
+  // server reaches the guest as a /__mcp shim, not a native guest MCP entry.
   fs.writeFileSync(
     path.join(inject, "root", ".copilot", "mcp-config.json"),
     JSON.stringify(guestConfig, null, 2)
@@ -144,7 +156,7 @@ async function main() {
   if (!process.env.MV_DRY_RUN) generateGatewayCa(inject);
 
   // 5. Build the guest rootfs (docker export -> mkfs.ext4 -d, no loop mount) and
-  //    any requested mount images (workspace/toolcache -> virtio-block ext4).
+  //    any requested mount images (harness/workspace/toolcache -> virtio-block ext4).
   const rootfs = path.join(WORK, "rootfs.ext4");
   runScript("build-rootfs.sh", [ctx, inject, rootfs, "3G"]);
   for (const drive of drives) {
@@ -169,7 +181,7 @@ async function main() {
       env: { ...GATEWAY_ENV, REAL_TOKEN: inputs.githubToken, FAKE_TOKEN, EXTRA_ALLOW: inputs.firewallAllow.join(",") },
     }
   );
-  const dispatch = createDispatchServer(registry, { log });
+  const dispatch = createDispatchServer(serverMap, { log });
   await new Promise((r) => dispatch.listen(DISPATCH_PORT, "0.0.0.0", r));
   log(`dispatch on 0.0.0.0:${DISPATCH_PORT}, gateway on :${GATEWAY_PORT}`);
 
@@ -283,16 +295,29 @@ function writeVmConfig(rootfs, extraDrives = []) {
  * Decide which host paths to expose as virtio-block drives, assigning guest device
  * names in drive order (rootfs=vda, so the first extra drive is vdb). Returns the
  * drives to build/attach and the mount plan handed to the guest init.
+ *
+ * The /__mcp "harness config" mount (shims + event.json) is independent of the
+ * `mounts` enum and comes first when present. workspace/toolcache follow per the enum.
  * @param {ReturnType<import("./inputs.js").readInputs>} inputs
+ * @param {string|null} harnessSrc - assembled /__mcp source dir, or null if empty
  */
-function planMounts(inputs) {
+function planMounts(inputs, harnessSrc = null) {
   const drives = [];
   const initMounts = {};
-  if (inputs.mounts === "none") return { drives, initMounts };
 
   const letters = "bcdefg";
   let i = 0;
   const nextDev = () => `/dev/vd${letters[i++]}`;
+
+  // harness (/__mcp): shims + event.json, read-only. Always first when present.
+  if (harnessSrc) {
+    const dev = nextDev();
+    drives.push({ id: "harness", src: harnessSrc, image: path.join(WORK, "harness.ext4") });
+    initMounts.harness = { dev, path: DEFAULT_MCP_DIR };
+    log(`mount: harness ${harnessSrc} (ro) -> ${dev} at ${DEFAULT_MCP_DIR}`);
+  }
+
+  if (inputs.mounts === "none") return { drives, initMounts };
 
   // workspace (RO lower + throwaway overlay), mounted at the well-known guest path.
   if (inputs.workspace && fs.existsSync(inputs.workspace)) {
@@ -300,7 +325,7 @@ function planMounts(inputs) {
     drives.push({ id: "workspace", src: inputs.workspace, image: path.join(WORK, "workspace.ext4") });
     initMounts.workspace = { dev, path: GUEST_WORKSPACE_PATH };
     log(`mount: workspace ${inputs.workspace} (ro+overlay) -> ${dev} at ${GUEST_WORKSPACE_PATH}`);
-  } else if (inputs.mounts !== "none") {
+  } else {
     log(`mount: workspace requested but GITHUB_WORKSPACE is unset/missing; skipping.`);
   }
 
