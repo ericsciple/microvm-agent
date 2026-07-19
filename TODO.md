@@ -176,6 +176,27 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
   TLS termination + SNI/ALPN handling, CA trust in the guest (same as today), HTTP/2, and streaming.
   A dependency-light approach (built-in `node:tls`/`node:http2` + a tiny cert-gen) is preferred over a
   heavy proxy library.
+  - **Research findings (2026-07-18).** The decisive constraints are (1) upstream **HTTP/2** — Copilot
+    inference on `api.githubcopilot.com` uses h2 + SSE streaming; and (2) our gateway runs
+    **`--mode transparent`** (iptables REDIRECT `:443`→`:8080`, guest holds no `HTTPS_PROXY` and can't
+    opt out). Nearly every alternative is disqualified by one of these:
+    - **Node libs:** only **`mockttp`** (httptoolkit, Apache-2.0, ~434k dl/wk, Node≥20, real h2 in+out via
+      `http2-wrapper`+`httpolyglot`, CA + per-SNI leaf gen, request rewriting) is viable. `http-mitm-proxy`,
+      `proxy-chain`, `http-proxy`, `hoxy` are all **HTTP/1.1-only or not MITM** → would break inference.
+    - **Binaries:** **`go-mitmproxy`** ships a ~3.8 MB Linux binary with h2+SSE, but has **NO transparent
+      mode** and credential swap needs a custom Go plugin. `martian` (archived), `goproxy`/Caddy
+      (library/custom-build) rejected. mitmproxy's own standalone binary is a ~50–80 MB PyInstaller bundle
+      (not on GitHub releases; only mitmproxy.org).
+    - **Pure Node built-ins:** feasible (~500–700 LOC) but needs two small trusted deps — **`selfsigned`**
+      (17.9M dl/wk; Node stdlib can't sign X.509) + **`http2-wrapper`** for upstream h2. `node-forge` is
+      unmaintained — avoid.
+    - **The catch for ALL of them:** mockttp / go-mitmproxy / pure-Node all require **explicit proxy mode**
+      (set `HTTPS_PROXY` in the guest, or handle `SO_ORIGINAL_DST` which Node lacks). Only mitmproxy
+      preserves our current transparent, un-opt-out-able interception out of the box.
+    - **Recommendation: DEFER; revisit after the prebuilt-image decision.** The main motivation (avoid the
+      per-run pip install) mostly **evaporates if we bake mitmproxy into a prebuilt base image** — then we
+      keep transparent mode (the strongest posture) at zero per-run cost. Only pursue a replacement if we
+      commit to **zero-Python-in-image**, in which case **mockttp (explicit proxy mode)** is the top pick.
 
 ## Key correctness notes
 
