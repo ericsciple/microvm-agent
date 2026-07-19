@@ -41,6 +41,29 @@ const FAKE_TOKEN = "ghs_FAKE_GUEST_TOKEN_DO_NOT_USE";
 const DISPATCH_PORT = 9000;
 const GATEWAY_PORT = 8080;
 
+// Decision A: the gateway binds each sentinel to ONE real credential and an explicit
+// set of targets. The inference lane's real credential (the job token, host-side only)
+// is swapped in ONLY on the inference host and the Copilot token-exchange path; every
+// other api.github.com path is deny-by-default, so the guest can never turn the
+// sentinel into the write-scoped job token. Hosts the guest may merely reach (no
+// credential injected) go in EGRESS_ALLOW, not here.
+function buildGatewayLanes(inputs) {
+  return [
+    {
+      name: "inference",
+      sentinel: FAKE_TOKEN,
+      real: inputs.githubToken,
+      targets: [
+        // Copilot inference + the built-in read-only github MCP (rides copilot auth).
+        { host: "api.githubcopilot.com" },
+        // The Copilot token-exchange namespace (POST /copilot_internal/v2/token, etc.).
+        // No general-write REST endpoint lives under this prefix.
+        { host: "api.github.com", path_prefix: "/copilot_internal/" },
+      ],
+    },
+  ];
+}
+
 // provision.sh installs mitmproxy (the gateway) to ~/.local/bin; make sure that's
 // on PATH when we invoke mitmdump, even if the runner hasn't added it yet.
 const LOCAL_BIN = path.join(process.env.HOME || "/root", ".local", "bin");
@@ -173,12 +196,21 @@ async function main() {
 
   // 7. Host services: credential gateway + MCP dispatch.
   const gwLog = fs.openSync(path.join(WORK, "gateway.log"), "a");
+  // Copilot support hosts the guest may reach for plain egress (NO credential
+  // injected) + the user's firewall-allow hosts. api.github.com is deliberately NOT
+  // here — it is reachable only via the inference lane's token-exchange path prefix.
+  const egressAllow = ["api.mcp.github.com", ...inputs.firewallAllow].join(",");
   const gateway = spawn(
     "mitmdump",
     ["--mode", "transparent", "--listen-host", "0.0.0.0", "--listen-port", String(GATEWAY_PORT), "-s", path.join(SCRIPTS, "gw_addon.py"), "-q", "--set", "block_global=false"],
     {
       stdio: ["ignore", gwLog, gwLog],
-      env: { ...GATEWAY_ENV, REAL_TOKEN: inputs.githubToken, FAKE_TOKEN, EXTRA_ALLOW: inputs.firewallAllow.join(",") },
+      env: {
+        ...GATEWAY_ENV,
+        GW_LANES: JSON.stringify(buildGatewayLanes(inputs)),
+        EGRESS_ALLOW: egressAllow,
+        GW_LOG_DIR: WORK,
+      },
     }
   );
   const dispatch = createDispatchServer(serverMap, { log });

@@ -86,4 +86,8 @@ jobs:
           path: |
             ${{ runner.temp }}/microvm-agent-work/console.log
             ${{ runner.temp }}/microvm-agent-work/gateway.log
+            ${{ runner.temp }}/microvm-agent-work/gw-hosts.log
+            ${{ runner.temp }}/microvm-agent-work/gw-swaps.log
+            ${{ runner.temp }}/microvm-agent-work/gw-blocked.log
+            ${{ runner.temp }}/microvm-agent-work/gw-misuse.log
           if-no-files-found: ignore

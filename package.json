@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "echo 'No build step: zero-dependency ESM action; runs.main points directly at src/main.js.'",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js && npm run test:gateway",
+    "test:gateway": "python3 test/gw_addon_test.py"
   },
   "engines": {
     "node": ">=20"

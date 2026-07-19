@@ -203,8 +203,14 @@ of the reopened github item above where they conflict; read this section as the 
   E-minor: dispatch keeps tool `description`. **NOTE:** github still runs as a host-side docker shim in
   the default `shim` mode (per the github decision); one-shim-per-server + lazy startup means the github
   container is only launched on first `/__mcp/github` use.
-- [ ] **A (gateway per-lane sentinel binding)** — NOT YET DONE. gw_addon.py still uses ONE fake->ONE real
-  for every allowlisted host (the api.github.com write-swap hole). Highest-value remaining hardening.
+- [x] **A (gateway per-lane sentinel binding)** — DONE. `gw_addon.py` reworked to a per-lane
+  sentinel↔credential model (`GW_LANES`): the inference sentinel is swapped for the real credential
+  ONLY on `api.githubcopilot.com` + `api.github.com` `/copilot_internal/` (token exchange); every other
+  `api.github.com` path is deny-by-default (403); a sentinel seen off its lane (EGRESS_ALLOW host, other
+  path) is rejected as misuse. `EGRESS_ALLOW` hosts (`api.mcp.github.com` + firewall-allow) are reachable
+  with NO credential injected. Closes the write-escalation hole (guest `curl api.github.com/...`+sentinel
+  can no longer obtain the write-scoped job token). Covered by `test/gw_addon_test.py` (10 cases) and
+  validated via an agent-e2e run.
 
 ### A. Gateway invariant (the ceiling principle)
 The guest can influence **nothing** about a trusted lane — not the upstream host, not the credential,
