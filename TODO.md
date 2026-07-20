@@ -227,8 +227,13 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     on something **trusted, reliable, high-use** — prefer first-party `@actions/*`; a non-toolkit dep must
     clear the same bar (reputable org, large downloads, active maintenance). All four cleared it (verified
     downloads/provenance). `@actions/exec` also added per @ericsciple (nice console tracing).
-  - Follow-up: **safe-outputs** is still zero-dep — same treatment (bundler + `@actions/*`) is a candidate.
-    A CI check that `dist/` is in sync with `src/` (rebuild + `git diff --exit-code`) would prevent drift.
+  - Follow-up: **safe-outputs is an MCP server/CLI, NOT a GitHub Action** (@ericsciple flagged this) — the
+    `@actions/*` toolkit does **not** apply to it (no `INPUT_*`/`GITHUB_OUTPUT`/`RUNNER_TOOL_CACHE` there).
+    The only relevant dependency for it is the **server side of `@modelcontextprotocol/sdk`** (`Server` +
+    `StdioServerTransport`) to replace the hand-rolled protocol in `safe-outputs/src/mcp.js` — same official
+    SDK, same trust bar; optional. (Its tiny `safe-outputs/setup/` Node action is the only actual Action in
+    that repo, where `@actions/*` could apply, but it's ~50 lines and intentionally minimal.)
+  - A CI check that `dist/` is in sync with `src/` (rebuild + `git diff --exit-code`) would prevent drift.
 
 - **Node-native TLS-intercepting gateway (drop the mitmproxy/Python dependency).** Today the
   credential gateway is `mitmproxy` (`mitmdump` + `gw_addon.py`), which the harness installs at
