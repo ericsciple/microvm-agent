@@ -295,6 +295,18 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 ## Key correctness notes
 
+- **[BUG — latent] mcp-config server names are unvalidated but used verbatim as the `/__mcp/<name>`
+  shim filename** (`src/main.js` `path.join(harnessSrc, name)`) **and referenced in the prompt.** A name
+  containing `/` (or other unsafe chars) breaks shim generation with no clear error. Fix: validate each
+  server name at parse time against a safe charset (`[A-Za-z0-9._-]`, length-capped) and reject with an
+  actionable error. (Also a prerequisite for the safe-outputs op-count `MCP_STATE_DIR` design, which
+  reuses the name verbatim as a per-instance state-dir segment — see
+  `safe-outputs/docs/parity-gh-aw.md` §3.1.)
+- **[FUTURE] Per-MCP-server scratch dir (`MCP_STATE_DIR`).** For safe-outputs run-wide op-count limits,
+  the harness should give **every** host MCP server a private per-(step, instance) dir via a generic
+  `MCP_STATE_DIR` env var = `${RUNNER_TEMP}/mcp-state/${STEP_GUID}/${serverName}` (GUID minted once per
+  run; removed in teardown). Generic primitive, not safe-outputs-specific. See parity doc §3.1(1).
+
 - **Tokens stay host-side.** The harness `github-token` input (default `${{ github.token }}`) is for
   the harness's own use — the inference gateway (guest gets a fake `COPILOT_GITHUB_TOKEN`, swapped at
   the gateway) and the default read-only `github` server. User-added servers (safe outputs, third-party
