@@ -212,6 +212,19 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 ## Options on the table (future)
 
+- **Downscope the github MCP toolsets by default (one-job least-privilege gap).** gh-aw splits work
+  across jobs so the *agent* job gets a minimal (read-only) token while a separate job holds the write
+  scope. We **collapse everything into one job/step**, so the single `GITHUB_TOKEN` must carry the
+  **union** of permissions (write, for safe outputs) — meaning the agent step runs alongside a
+  broader-than-it-needs token. Mitigations already in place: the guest holds **no** token (gateway), and
+  the default github MCP is **read-only** (`GITHUB_READ_ONLY=1`). But the read surface is still wide —
+  `GITHUB_TOOLSETS=default` exposes the full default read toolset (issues, PRs, repo contents, code
+  search, …), and the job token's *read* scope is whatever the workflow granted. Consider a **safer
+  default**: ship a narrower default toolset (e.g. only what a triage agent needs), expose a
+  `github-toolsets` input for authors to widen deliberately, and document minimizing job `permissions:`.
+  Weigh usability (too narrow → the agent can't see what it needs) vs. least privilege. (`src/mcp-config.js`
+  `GITHUB_TOOLSETS`/`GITHUB_READ_ONLY`.)
+
 - **Built-in "agent diagnostics/report" MCP (always-on) → Actions annotations + step status.** The agent
   needs a structured way to say "I'm blocked" that surfaces the Actions-native way. Add a **built-in**
   MCP server (delivered as a `/__mcp` shim, always present, NOT user-configured — independent of any
