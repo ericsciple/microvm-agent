@@ -212,6 +212,20 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 ## Options on the table (future)
 
+- **Consider a prompt-file input.** Today `prompt` is an inline string input (verbose in YAML for long
+  prompts, no syntax highlighting, awkward to reuse/version). Consider adding a `prompt-file` input (a
+  path, e.g. a Markdown file in the repo, whose contents become the prompt) — and/or supporting the
+  gh-aw-style convention of authoring the prompt as a Markdown file. Decide precedence if both `prompt`
+  and `prompt-file` are given, and how the MCP preamble composes with a file-sourced prompt.
+
+- **Evaluate whether to deprecate / relate to `actions/ai-inference`.** `actions/ai-inference` is
+  GitHub's action for a single GitHub Models inference call (prompt → completion; no tools, no sandbox,
+  no safe outputs). microvm-agent is a full sandboxed *agentic* harness (tools, MCP, egress firewall,
+  safe outputs). Question: are they complementary (simple inference step vs. sandboxed agent) or does
+  microvm-agent's direction overlap enough to supersede it for some use cases? Decide positioning — not
+  necessarily a deprecation, could just be guidance on when to use which. (Verify the current scope of
+  `actions/ai-inference` before deciding.)
+
 - **Benchmark Firecracker startup vs. a Docker-sandbox (SBX) approach.** Measure end-to-end
   time-to-agent-running for our Firecracker microVM path vs. running the agent in a Docker container
   sandbox (à la gh-aw's AWF: container + squid egress proxy, no hardware VM). Compare: boot/startup
