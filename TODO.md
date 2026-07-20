@@ -241,6 +241,10 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     instead of hardcoding `/__mcp` / the helper path, so we can change the actual dir names freely. **Also
     fix the existing preamble**, which hardcodes `/__mcp` (`generateMcpPreamble`) → use `$MV_MCP_DIR`.
     (Could colocate both in one dir + one var; two keeps forwarders vs. local helpers distinct.)
+    **Folder name:** `$MV_HELPERS_DIR = /__helpers` (matches `/__w`/`/__t`/`/__mcp`/`/__rt`); must be
+    `--add-dir`'d so the CLI can execute the helpers. Physical delivery hidden by the env var — dedicated
+    `/__helpers` RO mount OR colocate on `/__rt` (`/__rt/helpers`) to skip a virtio drive for a few tiny
+    scripts (leaning colocate). `MV_HELPERS_DIR` (not `MV_TOOLS_DIR`) avoids confusion with the tool cache.
   - **Status signal is the one thing needing the host.** Printing `::error::` can't fail the step (that's
     microvm-agent's exit code, not a message). `report-incomplete` (name open: `report-failure`/`fail`,
     asymmetric fail-only — success is the default) prints an `::error::` **plus a machine-readable
