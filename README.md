@@ -45,16 +45,20 @@ server. The harness keeps that secret host-side and never puts it in the guest's
 ## Requirements
 
 Runs on a KVM-capable Linux runner (standard `ubuntu-latest` works — `/dev/kvm` is available).
-The harness installs its own dependencies (Firecracker, kernel, and **mitmproxy** for the
-credential gateway) during provisioning; `docker`, `sudo`, and `iptables` are expected on the
-runner (present on hosted runners). The one thing you add is the safe-outputs CLI, via
+The harness installs/fetches its own dependencies during provisioning: the Firecracker binary, a
+**prebuilt guest kernel + bare rootfs** (from [`ericsciple/microvm-images`](https://github.com/ericsciple/microvm-images)
+releases), the Copilot CLI (mounted, not baked), and **mitmproxy** for the credential gateway. `sudo`,
+`iptables`, and `e2fsprogs`/`zstd` are expected on the runner (present on hosted runners); `docker` is
+**not** needed on the default path. The one thing you add is the safe-outputs CLI, via
 `ericsciple/safe-outputs/setup@v1`.
 
 ## Design (what the action does)
 
 - **Runs on the host (trusted side).** Node.js entrypoint owns the logic (inputs, MCP config merge,
   safe-output wiring) and shells out to bash for host provisioning.
-- **microVM sandbox by default.** Firecracker; `/dev/kvm` on standard hosted runners (proven).
+- **microVM sandbox by default.** Firecracker; `/dev/kvm` on standard hosted runners (proven). The guest
+  kernel + bare rootfs are **prebuilt** (fetched from `microvm-images`); the Copilot CLI is mounted, not
+  baked, so the base image is generic and cacheable.
 - **Credentials stay host-side.** The `github-token` input (default `${{ github.token }}`) is what the
   **harness itself** uses host-side — for the inference gateway and the default read-only `github` server.
   Servers the user adds (safe outputs, third-party tools) get their own secrets via their `env` block in
@@ -63,9 +67,9 @@ runner (present on hosted runners). The one thing you add is the safe-outputs CL
 - **Egress denied by default.** Host-enforced firewall + allowlist; extend with `firewall-allow`. The
   gateway is **lane-bound**: the real credential is swapped in only on its allowlisted host/path
   (inference), never on a general write API — see `docs/architecture.md`.
-- **Read-only mounts + throwaway overlay.** `GITHUB_WORKSPACE` and the Actions tool cache are mounted
-  read-only; the agent writes into a discarded overlay. Persisting changes happens only via safe
-  outputs.
+- **Read-only mounts + throwaway overlay.** `GITHUB_WORKSPACE`, the Actions tool cache, and the Copilot
+  CLI are mounted from read-only images with a discard tmpfs overlay; the agent can write but changes are
+  discarded. Persisting changes happens only via safe outputs.
 - **MCP is the one surface.** Read tools and safe outputs are all MCP servers added via `mcp-config`.
   The default read-only `github` server is on unless `github-mcp: false` or overridden by name.
 

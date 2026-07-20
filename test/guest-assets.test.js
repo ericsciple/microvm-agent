@@ -4,7 +4,6 @@ import {
   generateServerShim,
   generateMcpPreamble,
   generateMountSetup,
-  generateDockerfile,
   generateInitScript,
   DEFAULT_DISPATCH_ENDPOINT,
   DEFAULT_MCP_DIR,
@@ -55,30 +54,37 @@ test("workspace mount is an RO lower + tmpfs overlay at /__w", () => {
   assert.ok(s.includes("'/__w'"));
 });
 
-test("toolcache mount is a plain RO mount at /__t", () => {
+test("toolcache mount is an RO lower + tmpfs overlay at /__t", () => {
   const s = generateMountSetup({ toolcache: { dev: "/dev/vdd", path: "/__t" } });
-  assert.ok(s.includes("mount -o ro '/dev/vdd' '/__t'"));
+  assert.ok(s.includes("mount -o ro '/dev/vdd' /mnt/mv-tc-lower"));
+  assert.ok(s.includes("mount -t overlay overlay"));
+  assert.ok(s.includes("'/__t'"));
 });
 
-test("Dockerfile installs jq/curl/util-linux and does NOT bake shims", () => {
-  const df = generateDockerfile();
-  assert.ok(df.includes("jq util-linux"));
-  assert.ok(df.includes("copilot-linux-x64.tar.gz"));
-  assert.ok(!df.includes("/usr/local/bin/add_labels"));
-  assert.ok(!/COPY \w+ \/usr\/local\/bin/.test(df));
+test("copilot mount is an RO lower + tmpfs discard overlay", () => {
+  const s = generateMountSetup({ copilot: { dev: "/dev/vdc", path: "/opt/copilot" } });
+  assert.ok(s.includes("mount -o ro '/dev/vdc' /mnt/mv-cp-lower"));
+  assert.ok(s.includes("mount -t overlay overlay"));
+  assert.ok(s.includes("'/opt/copilot'"));
 });
 
-test("init mounts harness + wires auth env and prompt", () => {
-  const init = generateInitScript({ mounts: { harness: { dev: "/dev/vdb", path: "/__mcp" } } });
-  assert.ok(init.includes("mount -o ro '/dev/vdb' '/__mcp'"));
+test("init mounts harness + wires auth env and prompt from /__rt", () => {
+  const init = generateInitScript({ mounts: { harness: { dev: "/dev/vdd", path: "/__mcp" } } });
+  assert.ok(init.includes("mount -o ro '/dev/vdd' '/__mcp'"));
   assert.ok(init.includes("S2STOKENS=true"));
-  assert.ok(init.includes('-p "$(cat /etc/prompt.txt)"'));
+  assert.ok(init.includes('-p "$(cat "$RT/prompt.txt")"'));
+  assert.ok(init.includes('. "$RT/agent.env"'));
   // The CLI must be granted the /__mcp dir to execute the shims there.
   assert.ok(init.includes("--add-dir '/__mcp'"));
 });
 
+test("init puts the copilot mount on PATH", () => {
+  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/opt/copilot" } } });
+  assert.ok(init.includes("export PATH='/opt/copilot':$PATH"));
+});
+
 test("init runs the agent from the workspace when mounted, else /root", () => {
-  const mounted = generateInitScript({ mounts: { workspace: { dev: "/dev/vdc", path: "/__w" } } });
+  const mounted = generateInitScript({ mounts: { workspace: { dev: "/dev/vde", path: "/__w" } } });
   assert.ok(mounted.includes("cd '/__w' 2>/dev/null || cd /root"));
   const bare = generateInitScript();
   assert.ok(bare.includes("cd '/root'"));

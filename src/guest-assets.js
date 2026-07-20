@@ -1,5 +1,12 @@
 // Generate the guest-side assets: the per-server CLI shims, the MCP preamble, the
-// mount setup, the init script, and the Dockerfile.
+// mount setup, and the init script.
+//
+// The guest rootfs is a prebuilt BARE image (from ericsciple/microvm-images) that
+// carries no per-run content. Everything run-specific is delivered via mounts:
+//   - the runtime config drive (vdb, /__rt): init.sh + prompt + agent.env + gateway CA
+//   - the Copilot CLI (its own drive, mounted with a discard overlay)
+//   - the /__mcp shims + event.json (read-only)
+//   - the workspace / tool cache (read-only lower + discard overlay)
 //
 // Shims are the guest's only view of an MCP server. There is ONE shim per server
 // (not per tool), delivered off-PATH in a read-only /__mcp mount. A shim is a thin
@@ -12,6 +19,12 @@
 
 export const DEFAULT_DISPATCH_ENDPOINT = "http://172.16.0.1:9000/dispatch";
 export const DEFAULT_MCP_DIR = "/__mcp";
+// The per-run runtime config drive is ALWAYS the first extra drive (vdb); the bare
+// rootfs's baked /init stub mounts it here and execs /__rt/init.sh (see microvm-images).
+export const DEFAULT_RUNTIME_DIR = "/__rt";
+// Where the Copilot CLI binary is mounted (its own drive, with a discard overlay so
+// anything it writes next to itself is captured in tmpfs and discarded).
+export const DEFAULT_COPILOT_DIR = "/opt/copilot";
 
 /**
  * One shim per server. POSIX sh; needs jq + curl in the guest.
@@ -67,36 +80,34 @@ export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = 
 
 /**
  * Generate the bash that mounts the requested host images inside the guest.
- * - workspace: mount the RO image as an overlay lowerdir, with a tmpfs upper, at
- *   the identical host path — so writes are captured in memory and discarded, and
- *   GITHUB_WORKSPACE/PATH need no translation. The RO lower is hypervisor-enforced.
- * - toolcache: mount the RO image directly at its identical host path.
- * @param {{workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
+ * Install-type mounts (copilot, workspace, tool cache) use a read-only lower + a
+ * throwaway tmpfs overlay, so tools that write into their own directory don't fail,
+ * yet nothing persists and the underlying image stays pristine (hypervisor RO). The
+ * /__mcp harness is a pure read-only mount (tamper-proof shims + event.json).
+ * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
  * @returns {string}
  */
-export function generateMountSetup({ harness = null, workspace = null, toolcache = null } = {}) {
+export function generateMountSetup({ copilot = null, harness = null, workspace = null, toolcache = null } = {}) {
+  // A read-only image + throwaway tmpfs overlay at `path`. `tag` namespaces the temp
+  // dirs so multiple overlays don't collide.
+  const overlay = (tag, dev, mountPath) =>
+    `\n# --- ${tag}: hypervisor read-only lower + throwaway tmpfs overlay ---\n` +
+    `mkdir -p /mnt/mv-${tag}-lower /mnt/mv-${tag}-rw ${shq(mountPath)}\n` +
+    `mount -o ro ${shq(dev)} /mnt/mv-${tag}-lower\n` +
+    `mount -t tmpfs tmpfs /mnt/mv-${tag}-rw\n` +
+    `mkdir -p /mnt/mv-${tag}-rw/upper /mnt/mv-${tag}-rw/work\n` +
+    `mount -t overlay overlay -o lowerdir=/mnt/mv-${tag}-lower,upperdir=/mnt/mv-${tag}-rw/upper,workdir=/mnt/mv-${tag}-rw/work ${shq(mountPath)}\n`;
+
   let out = "";
+  if (copilot) out += overlay("cp", copilot.dev, copilot.path);
   if (harness) {
     out +=
       `\n# --- harness config (shims + event.json): hypervisor read-only ---\n` +
       `mkdir -p ${shq(harness.path)}\n` +
       `mount -o ro ${shq(harness.dev)} ${shq(harness.path)}\n`;
   }
-  if (workspace) {
-    out +=
-      `\n# --- workspace: hypervisor read-only lower + throwaway tmpfs overlay ---\n` +
-      `mkdir -p /mnt/mv-ws-lower /mnt/mv-ws-rw ${shq(workspace.path)}\n` +
-      `mount -o ro ${shq(workspace.dev)} /mnt/mv-ws-lower\n` +
-      `mount -t tmpfs tmpfs /mnt/mv-ws-rw\n` +
-      `mkdir -p /mnt/mv-ws-rw/upper /mnt/mv-ws-rw/work\n` +
-      `mount -t overlay overlay -o lowerdir=/mnt/mv-ws-lower,upperdir=/mnt/mv-ws-rw/upper,workdir=/mnt/mv-ws-rw/work ${shq(workspace.path)}\n`;
-  }
-  if (toolcache) {
-    out +=
-      `\n# --- toolcache: hypervisor read-only mount at its identical path ---\n` +
-      `mkdir -p ${shq(toolcache.path)}\n` +
-      `mount -o ro ${shq(toolcache.dev)} ${shq(toolcache.path)}\n`;
-  }
+  if (workspace) out += overlay("ws", workspace.dev, workspace.path);
+  if (toolcache) out += overlay("tc", toolcache.dev, toolcache.path);
   return out;
 }
 
@@ -105,14 +116,17 @@ function shq(s) {
 }
 
 /**
- * The guest init script: bring up networking, trust the gateway CA, set up any
- * requested mounts, export the Copilot CLI auth env, and run the agent with the
- * prompt. Ported from the proven phase1/phase4/phase6 init.
+ * The per-run init script, delivered on the runtime config drive and run as
+ * /__rt/init.sh by the bare rootfs's baked /init stub (which has already mounted
+ * proc/sys/dev and /__rt). It brings up networking, trusts the gateway CA, sets up
+ * the mounts (Copilot + /__mcp + workspace + tool cache), exports the Copilot auth
+ * env, and runs the agent. All run-specific files are read from /__rt.
  * @param {Object} [opts]
  * @param {string} [opts.guestIp]
  * @param {string} [opts.hostIp]
  * @param {string} [opts.dns]
- * @param {{harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @param {string} [opts.runtimeDir]
  * @returns {string}
  */
 export function generateInitScript({
@@ -120,8 +134,10 @@ export function generateInitScript({
   hostIp = "172.16.0.1",
   dns = "8.8.8.8",
   mounts = {},
+  runtimeDir = DEFAULT_RUNTIME_DIR,
 } = {}) {
   const mountSetup = generateMountSetup(mounts);
+  const copilotDir = mounts.copilot ? mounts.copilot.path : DEFAULT_COPILOT_DIR;
   const addDirs = ["/root"];
   // The MCP shims live in the harness mount (/__mcp); the CLI can only execute files
   // under directories it's been granted, so add it (and the workspace when mounted).
@@ -132,65 +148,41 @@ export function generateInitScript({
   // whose working directory is the workspace); otherwise fall back to /root.
   const workDir = mounts.workspace ? mounts.workspace.path : "/root";
 
-  return `#!/bin/bash
+  return `#!/bin/sh
 set -x
-mount -t proc proc /proc 2>/dev/null || true
-mount -t sysfs sys /sys 2>/dev/null || true
-mount -t devtmpfs dev /dev 2>/dev/null || true
+RT=${shq(runtimeDir)}
 ip link set lo up
 ip addr add ${guestIp}/30 dev eth0
 ip link set eth0 up
 ip route add default via ${hostIp}
 echo 'nameserver ${dns}' > /etc/resolv.conf
+# Trust the per-run gateway CA (delivered on the runtime drive; rootfs is writable).
+cp "$RT/mitmproxy-ca.pem" /usr/local/share/ca-certificates/mitmproxy.crt 2>/dev/null || true
 update-ca-certificates 2>/dev/null || true
+# Guest MCP config (no secrets) — the CLI reads it from HOME/.copilot.
+mkdir -p /root/.copilot
+cp "$RT/mcp-config.json" /root/.copilot/mcp-config.json 2>/dev/null || true
 ${mountSetup}
 export HOME=/root
 export XDG_CONFIG_HOME=/root
+export PATH=${shq(copilotDir)}:$PATH
 export COPILOT_AGENT_RUNNER_TYPE=STANDALONE
 export S2STOKENS=true
 export GITHUB_COPILOT_INTEGRATION_ID=agentic-workflows
-export NODE_EXTRA_CA_CERTS=/etc/mitmproxy-ca.pem
+export NODE_EXTRA_CA_CERTS="$RT/mitmproxy-ca.pem"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-[ -f /etc/agent.env ] && . /etc/agent.env
+[ -f "$RT/agent.env" ] && . "$RT/agent.env"
 cd ${shq(workDir)} 2>/dev/null || cd /root
 
 echo "=== GUEST: starting copilot ==="
 copilot --no-ask-user --allow-all-tools \\
   ${addDirFlags} --log-level all --log-dir /tmp/cplogs \\
-  -p "$(cat /etc/prompt.txt)" 2>&1 | tee /dev/console
-echo "=== GUEST: AGENT_EXIT=\${PIPESTATUS[0]} ==="
+  -p "$(cat "$RT/prompt.txt")" 2>&1
+echo "=== GUEST: AGENT_EXIT=$? ==="
 
 sync
 echo 1 > /proc/sys/kernel/sysrq
 echo b > /proc/sysrq-trigger
 sleep infinity
-`;
-}
-
-/**
- * Dockerfile for the guest rootfs: Debian slim + the standalone Copilot CLI +
- * device nodes. Ported from phase4. `util-linux` provides `mount` for the
- * virtio-block mounts (phase6); `jq`/`curl` are used by the /__mcp shims. Shims
- * are NOT baked in — they are delivered per-run via the read-only /__mcp mount.
- * @returns {string}
- */
-export function generateDockerfile() {
-  return `FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-      ca-certificates curl iproute2 iptables procps jq util-linux \\
-    && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL --retry 3 -o /tmp/copilot.tgz \\
-      https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz \\
-    && tar -xz -C /usr/local/bin -f /tmp/copilot.tgz \\
-    && chmod +x /usr/local/bin/copilot \\
-    && rm /tmp/copilot.tgz
-RUN mknod -m 622 /dev/console c 5 1 || true; \\
-    mknod -m 666 /dev/null c 1 3 || true; \\
-    mknod -m 666 /dev/zero c 1 5 || true; \\
-    mknod -m 444 /dev/random c 1 8 || true; \\
-    mknod -m 444 /dev/urandom c 1 9 || true; \\
-    mknod -m 620 /dev/ttyS0 c 4 64 || true
-COPY init.sh /init
-RUN chmod +x /init
 `;
 }

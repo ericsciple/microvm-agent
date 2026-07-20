@@ -42,6 +42,15 @@ export function readInputs() {
     eventPath: process.env.GITHUB_EVENT_PATH || "",
     // Base URL for the default github MCP server (GHES-aware); host-side only.
     githubServerUrl: process.env.GITHUB_SERVER_URL || "https://github.com",
+    // Prebuilt guest artifacts: which microvm-images release to fetch the pinned
+    // kernel + bare rootfs from. A harness @ref maps to a known-compatible set.
+    imagesRepo: input("images-repo", "ericsciple/microvm-images"),
+    imagesTag: input("images-tag", "v0.0.1"),
+    // Optional custom rootfs ext4 (advanced). Default = our fetched bare rootfs.
+    // Must satisfy the contract: x86_64 + glibc >= 2.28 + libstdc++.so.6 (no musl).
+    rootfs: input("rootfs", ""),
+    // Optional override for the Copilot CLI tarball URL (else provision.sh's default).
+    copilotUrl: process.env.MV_COPILOT_URL || "",
     // EXPERIMENTAL (test-only) knobs for resolving the github-MCP shape:
     //   MV_GITHUB_MODE=native  -> rely on the CLI's built-in github server (no host docker shim)
     //   MV_GITHUB_MODE=shim    -> host-side github-mcp-server via docker + CLI shim (default)

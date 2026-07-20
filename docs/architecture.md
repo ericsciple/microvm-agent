@@ -188,21 +188,31 @@ sequenceDiagram
 ```mermaid
 flowchart TB
   subgraph VM["Guest microVM filesystem"]
-    ROOT["/ rootfs (ext4)<br/>Copilot CLI, jq, curl<br/>throwaway — discarded on teardown"]
-    W["/__w  workspace<br/>read-only image + tmpfs overlay<br/>(agent writes go to the overlay,<br/>discarded)"]
-    T["/__t  tool cache<br/>read-only"]
-    MCP["/__mcp  harness config<br/>read-only: shims + event.json"]
+    ROOT["/ rootfs (ext4)<br/>BARE, prebuilt (microvm-images)<br/>per-run writable copy — discarded"]
+    RT["/__rt runtime config (vdb, ro)<br/>init.sh + prompt + agent.env + CA + mcp-config"]
+    CP["/opt/copilot  Copilot CLI<br/>ro image + discard overlay (on PATH)"]
+    W["/__w  workspace<br/>ro image + discard overlay"]
+    T["/__t  tool cache<br/>ro image + discard overlay"]
+    MCP["/__mcp  shims + event.json<br/>pure read-only (tamper-proof)"]
   end
-  HOSTFS[("Host: workspace, tool cache,<br/>event.json")] -->|"built into virtio-block<br/>ext4 images (mkfs.ext4 -d)"| W & T & MCP
+  IMAGES[("microvm-images release:<br/>vmlinux + bare-rootfs.ext4.zst")] -->|fetched + cached, boots as-is| ROOT
+  HOSTFS[("Host: runtime cfg, Copilot CLI,<br/>workspace, tool cache, event.json")] -->|"virtio-block ext4 images<br/>(mkfs.ext4 -d)"| RT & CP & W & T & MCP
 ```
 
-- Well-known guest paths mirror the Actions container-job convention: workspace → `/__w`,
-  tool cache → `/__t` (with `GITHUB_WORKSPACE` / `RUNNER_TOOL_CACHE` set to match). **No
-  host-path mirroring** — the guest never sees real host paths.
-- Workspace is a **read-only lower + throwaway tmpfs overlay**: the agent can write, but
-  changes are discarded. **Persisting anything happens only via safe outputs** (lane 2).
-- Only the single `event.json` is injected (via `/__mcp`, surfaced as
-  `GITHUB_EVENT_PATH`) — never `RUNNER_TEMP` (which holds the checkout push token).
+- The rootfs is a **prebuilt bare image** fetched from `microvm-images` (pinned kernel + rootfs) and
+  cached; the action boots a **per-run sparse copy** so the cache stays pristine. Nothing run-specific
+  is baked in — it rides the mounts.
+- Well-known guest paths mirror the Actions container-job convention: workspace → `/__w`, tool cache →
+  `/__t` (with `GITHUB_WORKSPACE` / `RUNNER_TOOL_CACHE` set to match). **No host-path mirroring.**
+- **Install-type mounts (Copilot, workspace, tool cache) use a read-only image + throwaway tmpfs
+  overlay** — writable so tools can scribble into their own dir, but nothing persists and the underlying
+  image stays pristine. The `/__mcp` shims + `event.json` are a **pure read-only** mount (tamper-proof).
+  **Persisting anything happens only via safe outputs** (lane 2).
+- The Copilot CLI is **mounted** at `/opt/copilot` (on PATH), not baked into the rootfs — so the base
+  image is generic and cacheable. Contract for a custom `rootfs`: **x86_64 + glibc ≥ 2.28 +
+  libstdc++.so.6** (preflighted; musl/Alpine unsupported).
+- Only the single `event.json` is injected (via `/__mcp`, surfaced as `GITHUB_EVENT_PATH`) — never
+  `RUNNER_TEMP` (which holds the checkout push token).
 
 ---
 

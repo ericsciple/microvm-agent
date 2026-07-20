@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
 import { createDispatchServer } from "./dispatch.js";
-import { generateServerShim, generateMcpPreamble, generateInitScript, generateDockerfile, DEFAULT_MCP_DIR } from "./guest-assets.js";
+import { generateServerShim, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_COPILOT_DIR } from "./guest-assets.js";
 import { translateToolCachePathEntries } from "./paths.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -77,8 +77,80 @@ const GUEST_WORKSPACE_PATH = "/__w";
 const GUEST_TOOLCACHE_PATH = "/__t";
 
 const log = (m) => process.stderr.write(`[microvm-agent] ${m}\n`);
-const runScript = (name, args = []) =>
-  execFileSync("bash", [path.join(SCRIPTS, name), ...args], { stdio: "inherit" });
+const runScript = (name, args = [], extraEnv = {}) =>
+  execFileSync("bash", [path.join(SCRIPTS, name), ...args], {
+    stdio: "inherit",
+    env: { ...process.env, ...extraEnv },
+  });
+
+// Env passed to provision.sh: which images release + Copilot build to fetch.
+function provisionEnv(inputs) {
+  const env = { IMAGES_REPO: inputs.imagesRepo, IMAGES_TAG: inputs.imagesTag };
+  if (inputs.copilotUrl) env.COPILOT_URL = inputs.copilotUrl;
+  return env;
+}
+
+// provision.sh writes the resolved cache dir (kernel/rootfs/copilot live there).
+function readCacheDir() {
+  const envFile = path.join(WORK, "provision.env");
+  const m = /^MV_CACHE_DIR=(.*)$/m.exec(fs.readFileSync(envFile, "utf8"));
+  if (!m) throw new Error("provision did not report a cache dir.");
+  return m[1].trim();
+}
+
+// A per-run writable rootfs, so the cached bare rootfs stays pristine across runs.
+// Sparse copy (the 2G ext4 is mostly empty), boot read-write, discard after.
+function copyRootfs(src, dest) {
+  execFileSync("cp", ["--reflink=auto", "--sparse=always", src, dest]);
+  log(`rootfs: per-run copy ${dest}`);
+}
+
+// The Copilot CLI compatibility floor (measured from the pinned linux-x64 build:
+// highest GLIBC symbol needed is 2.28; it also NEEDs libstdc++.so.6). musl unsupported.
+const GLIBC_FLOOR = [2, 28];
+
+// Fail fast if the rootfs can't run the Copilot CLI: x86_64 + glibc >= floor +
+// libstdc++ present, no musl. Reads the ext4 with debugfs (no mount needed). Best-effort
+// on a custom rootfs; a no-op-ish sanity check for our own bare rootfs.
+function preflightRootfs(img) {
+  if (os.arch() !== "x64") throw new Error(`microvm-agent supports x86_64 only (host arch: ${os.arch()}).`);
+  const debug = (cmd) => {
+    try {
+      return execFileSync("debugfs", ["-R", cmd, img], { stdio: ["ignore", "pipe", "ignore"] }).toString();
+    } catch {
+      return "";
+    }
+  };
+  const libDir = "/lib/x86_64-linux-gnu";
+  const lsLib = debug(`ls -l ${libDir}`);
+  if (!lsLib) { log("preflight: could not read rootfs libs via debugfs; skipping (custom rootfs?)."); return; }
+  if (/ld-musl|libc\.musl/.test(lsLib) || (!/libc\.so\.6/.test(lsLib) && !/libc-/.test(lsLib))) {
+    throw new Error("rootfs looks like musl/Alpine or has no glibc; the Copilot CLI needs glibc. Use a glibc rootfs (x86_64, glibc >= 2.28).");
+  }
+  if (!/libstdc\+\+\.so\.6/.test(lsLib)) {
+    throw new Error("rootfs is missing libstdc++.so.6, which the Copilot CLI requires. Install libstdc++6 in the rootfs.");
+  }
+  // Extract libc.so.6 and read its glibc release version.
+  try {
+    const tmp = path.join(WORK, "libc.probe");
+    execFileSync("debugfs", ["-R", `dump ${libDir}/libc.so.6 ${tmp}`, img], { stdio: "ignore" });
+    const s = fs.readFileSync(tmp);
+    const txt = s.toString("latin1");
+    const m = /GNU C Library.*?version (\d+)\.(\d+)/.exec(txt) || /release version (\d+)\.(\d+)/.exec(txt);
+    fs.rmSync(tmp, { force: true });
+    if (m) {
+      const v = [parseInt(m[1], 10), parseInt(m[2], 10)];
+      const ok = v[0] > GLIBC_FLOOR[0] || (v[0] === GLIBC_FLOOR[0] && v[1] >= GLIBC_FLOOR[1]);
+      if (!ok) throw new Error(`rootfs glibc ${v[0]}.${v[1]} is too old; the Copilot CLI needs glibc >= ${GLIBC_FLOOR.join(".")}.`);
+      log(`preflight: rootfs glibc ${v[0]}.${v[1]} (>= ${GLIBC_FLOOR.join(".")}), libstdc++ present — OK.`);
+    } else {
+      log("preflight: glibc version string not found; libstdc++ present, not musl — proceeding.");
+    }
+  } catch (e) {
+    if (/too old/.test(e.message)) throw e;
+    log(`preflight: glibc version probe inconclusive (${e.message}); libstdc++ present, not musl — proceeding.`);
+  }
+}
 
 async function main() {
   const inputs = readInputs();
@@ -99,16 +171,19 @@ async function main() {
   const serverNames = Object.keys(serverMap);
   log(`MCP servers exposed to the guest as shims: ${serverNames.join(", ") || "(none)"}`);
 
-  // 3. Generate the guest build context + the runtime injection tree.
-  const ctx = freshDir(path.join(WORK, "guest"));
-  const inject = freshDir(path.join(WORK, "inject"));
-  fs.mkdirSync(path.join(inject, "etc"), { recursive: true });
-  fs.mkdirSync(path.join(inject, "root", ".copilot"), { recursive: true });
-  fs.mkdirSync(path.join(inject, "usr", "local", "share", "ca-certificates"), { recursive: true });
+  // 3. Provision the host + fetch all guest artifacts (pinned kernel + bare rootfs
+  //    from the images release, the Copilot CLI tarball), cached. Populates WORK with
+  //    firecracker + vmlinux and the shared cache with bare-rootfs.ext4 + copilot/.
+  runScript("provision.sh", [WORK], provisionEnv(inputs));
+  const cache = readCacheDir();
 
-  // Assemble the read-only /__mcp "harness config" mount: one shim per server, plus
-  // the event payload (agent context). Delivered as a mount so the base rootfs needs
-  // no per-run baking, and RO makes the shims/event tamper-proof (hypervisor-enforced).
+  // 4. Preflight the rootfs compatibility contract (x86_64 + glibc >= floor +
+  //    libstdc++). For our bare rootfs this is a sanity check; it mainly guards a
+  //    custom rootfs. Fail fast with an actionable error, not a late boot hang.
+  const rootfsSrc = inputs.rootfs || path.join(cache, "bare-rootfs.ext4");
+  if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
+
+  // 5a. Assemble the read-only /__mcp harness mount: one shim per server + event.json.
   const harnessSrc = freshDir(path.join(WORK, "harness"));
   for (const name of serverNames) {
     const shimPath = path.join(harnessSrc, name);
@@ -123,20 +198,34 @@ async function main() {
   }
   const harnessHasContent = serverNames.length > 0 || guestEventPath !== "";
 
-  // Plan the mounts: build a virtio-block image per host path and assign guest
-  // device names in drive order (rootfs is vda, so the first extra drive is vdb).
-  const { drives, initMounts } = planMounts(inputs, harnessHasContent ? harnessSrc : null);
+  // 5b. The per-run runtime config mount (/__rt, always vdb): init.sh + prompt.txt +
+  //     agent.env + mitmproxy-ca.pem + mcp-config.json. The bare rootfs is prebuilt and
+  //     generic, so nothing is baked in — everything run-specific rides this mount.
+  const rtSrc = freshDir(path.join(WORK, "runtime"));
+  if (!process.env.MV_DRY_RUN) generateGatewayCa(rtSrc);
+  else fs.writeFileSync(path.join(rtSrc, "mitmproxy-ca.pem"), ""); // dry-run has no gateway
 
+  // 5c. The Copilot CLI mount (vdc): the fetched binary dir, mounted with a discard overlay.
+  const copilotSrc = path.join(cache, "copilot");
+
+  // 6. Plan drives + guest mount points. Order is fixed: vda rootfs, vdb runtime,
+  //    vdc copilot, then harness/workspace/toolcache.
+  const { drives, initMounts } = planMounts(inputs, {
+    rtSrc,
+    copilotSrc,
+    harnessSrc: harnessHasContent ? harnessSrc : null,
+  });
+
+  // init.sh (delivered on /__rt) — references its config files from /__rt.
   fs.writeFileSync(
-    path.join(ctx, "init.sh"),
+    path.join(rtSrc, "init.sh"),
     generateInitScript({ mounts: initMounts, dns: process.env.MV_DNS_RESOLVER || "8.8.8.8" })
   );
-  fs.writeFileSync(path.join(ctx, "Dockerfile"), generateDockerfile());
 
   // The prompt = MCP preamble (isolation notice, event path, how to run tools) + the
   // user's prompt.
   const preamble = generateMcpPreamble(serverNames, { mcpDir: DEFAULT_MCP_DIR });
-  fs.writeFileSync(path.join(inject, "etc", "prompt.txt"), preamble + inputs.prompt + "\n");
+  fs.writeFileSync(path.join(rtSrc, "prompt.txt"), preamble + inputs.prompt + "\n");
 
   // Runtime agent env (no secrets — all fake sentinels).
   let agentEnv = `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`;
@@ -166,28 +255,27 @@ async function main() {
     }
   }
   if (guestEventPath) agentEnv += `export GITHUB_EVENT_PATH=${guestEventPath}\n`;
-  fs.writeFileSync(path.join(inject, "etc", "agent.env"), agentEnv);
+  fs.writeFileSync(path.join(rtSrc, "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above). Empty by default — every
   // server reaches the guest as a /__mcp shim, not a native guest MCP entry.
-  fs.writeFileSync(
-    path.join(inject, "root", ".copilot", "mcp-config.json"),
-    JSON.stringify(guestConfig, null, 2)
-  );
+  fs.writeFileSync(path.join(rtSrc, "mcp-config.json"), JSON.stringify(guestConfig, null, 2));
 
-  // 4. Provision KVM + firecracker + kernel, then the gateway CA (needed in the rootfs).
-  runScript("provision.sh", [WORK]);
-  if (!process.env.MV_DRY_RUN) generateGatewayCa(inject);
-
-  // 5. Build the guest rootfs (docker export -> mkfs.ext4 -d, no loop mount) and
-  //    any requested mount images (harness/workspace/toolcache -> virtio-block ext4).
+  // 7. Build images: a per-run writable sparse copy of the bare rootfs (so the cached
+  //    original stays pristine) + one virtio-block ext4 per drive. The Copilot image is
+  //    large and static, so it is built once in the cache and reused.
   const rootfs = path.join(WORK, "rootfs.ext4");
-  runScript("build-rootfs.sh", [ctx, inject, rootfs, "3G"]);
+  copyRootfs(rootfsSrc, rootfs);
   for (const drive of drives) {
-    runScript("build-mount-image.sh", [drive.src, drive.image]);
+    if (drive.id === "copilot") {
+      if (!fs.existsSync(drive.image)) runScript("build-mount-image.sh", [drive.src, drive.image, "64"]);
+      else log(`copilot image cached: ${drive.image}`);
+    } else {
+      runScript("build-mount-image.sh", [drive.src, drive.image]);
+    }
   }
 
   if (process.env.MV_DRY_RUN) {
-    log(`MV_DRY_RUN set: guest rootfs + ${drives.length} mount image(s) built; skipping boot.`);
+    log(`MV_DRY_RUN set: rootfs copy + ${drives.length} mount image(s) built; skipping boot.`);
     return setStatus("dry-run");
   }
 
@@ -253,10 +341,17 @@ async function main() {
  */
 function bootVm(seconds, consoleLog) {
   return new Promise((resolve) => {
+    const sock = path.join(WORK, "mv-fc.sock");
+    // Remove any stale API socket so a retry in the same workdir doesn't fail to bind.
+    try {
+      execFileSync("sudo", ["rm", "-f", sock], { stdio: "ignore" });
+    } catch {
+      /* best effort */
+    }
     const fileStream = fs.createWriteStream(consoleLog);
     const child = spawn(
       "sudo",
-      ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", "/tmp/mv-fc.sock", "--config-file", path.join(WORK, "vm_config.json")],
+      ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", sock, "--config-file", path.join(WORK, "vm_config.json")],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
     // Stream the guest's serial console live to BOTH this action's stdout (so the
@@ -288,7 +383,7 @@ function freshDir(p) {
   return p;
 }
 
-function generateGatewayCa(inject) {
+function generateGatewayCa(rtDir) {
   // A short mitmdump run generates ~/.mitmproxy/mitmproxy-ca-cert.pem.
   try {
     execFileSync("bash", ["-c", "timeout 8 mitmdump -q >/dev/null 2>&1 || true"], { stdio: "ignore", env: GATEWAY_ENV });
@@ -297,8 +392,8 @@ function generateGatewayCa(inject) {
   }
   const ca = path.join(process.env.HOME || "/root", ".mitmproxy", "mitmproxy-ca-cert.pem");
   if (!fs.existsSync(ca)) throw new Error("gateway CA was not generated (is mitmproxy installed?).");
-  fs.copyFileSync(ca, path.join(inject, "etc", "mitmproxy-ca.pem"));
-  fs.copyFileSync(ca, path.join(inject, "usr", "local", "share", "ca-certificates", "mitmproxy.crt"));
+  // Delivered on the runtime drive (/__rt); init.sh copies it into the guest trust store.
+  fs.copyFileSync(ca, path.join(rtDir, "mitmproxy-ca.pem"));
 }
 
 function writeVmConfig(rootfs, extraDrives = []) {
@@ -325,15 +420,13 @@ function writeVmConfig(rootfs, extraDrives = []) {
 
 /**
  * Decide which host paths to expose as virtio-block drives, assigning guest device
- * names in drive order (rootfs=vda, so the first extra drive is vdb). Returns the
- * drives to build/attach and the mount plan handed to the guest init.
- *
- * The /__mcp "harness config" mount (shims + event.json) is independent of the
- * `mounts` enum and comes first when present. workspace/toolcache follow per the enum.
+ * names in a FIXED order: rootfs=vda, runtime=vdb (the bare rootfs's /init stub
+ * hardcodes vdb -> /__rt), copilot=vdc, then the /__mcp harness, workspace, toolcache.
+ * Install-type mounts (copilot/workspace/toolcache) get a discard overlay in-guest.
  * @param {ReturnType<import("./inputs.js").readInputs>} inputs
- * @param {string|null} harnessSrc - assembled /__mcp source dir, or null if empty
+ * @param {{rtSrc:string, copilotSrc:string, harnessSrc:string|null}} sources
  */
-function planMounts(inputs, harnessSrc = null) {
+function planMounts(inputs, { rtSrc, copilotSrc, harnessSrc = null }) {
   const drives = [];
   const initMounts = {};
 
@@ -341,7 +434,19 @@ function planMounts(inputs, harnessSrc = null) {
   let i = 0;
   const nextDev = () => `/dev/vd${letters[i++]}`;
 
-  // harness (/__mcp): shims + event.json, read-only. Always first when present.
+  // runtime config (/__rt): ALWAYS vdb — the baked /init stub mounts vdb and execs
+  // /__rt/init.sh. Not exposed to the agent (plumbing), so it's not in initMounts.
+  const rtDev = nextDev();
+  drives.push({ id: "runtime", src: rtSrc, image: path.join(WORK, "runtime.ext4") });
+  log(`mount: runtime ${rtSrc} (ro) -> ${rtDev} at ${DEFAULT_RUNTIME_DIR}`);
+
+  // copilot: ALWAYS present; mounted with a discard overlay, added to PATH by init.sh.
+  const cpDev = nextDev();
+  drives.push({ id: "copilot", src: copilotSrc, image: path.join(readCacheDirSafe(), "copilot.ext4") });
+  initMounts.copilot = { dev: cpDev, path: DEFAULT_COPILOT_DIR };
+  log(`mount: copilot ${copilotSrc} (ro+overlay) -> ${cpDev} at ${DEFAULT_COPILOT_DIR}`);
+
+  // harness (/__mcp): shims + event.json, read-only. First agent-facing mount when present.
   if (harnessSrc) {
     const dev = nextDev();
     drives.push({ id: "harness", src: harnessSrc, image: path.join(WORK, "harness.ext4") });
@@ -361,19 +466,28 @@ function planMounts(inputs, harnessSrc = null) {
     log(`mount: workspace requested but GITHUB_WORKSPACE is unset/missing; skipping.`);
   }
 
-  // toolcache (RO), opt-in via workspace+toolcache, at its standard well-known path.
+  // toolcache (RO lower + throwaway overlay), opt-in, at its well-known path.
   if (inputs.mounts === "workspace+toolcache") {
     if (inputs.toolCache && fs.existsSync(inputs.toolCache)) {
       const dev = nextDev();
       drives.push({ id: "toolcache", src: inputs.toolCache, image: path.join(WORK, "toolcache.ext4") });
       initMounts.toolcache = { dev, path: GUEST_TOOLCACHE_PATH };
-      log(`mount: toolcache ${inputs.toolCache} (ro) -> ${dev} at ${GUEST_TOOLCACHE_PATH}`);
+      log(`mount: toolcache ${inputs.toolCache} (ro+overlay) -> ${dev} at ${GUEST_TOOLCACHE_PATH}`);
     } else {
       log(`mount: toolcache requested but RUNNER_TOOL_CACHE is unset/missing; skipping.`);
     }
   }
 
   return { drives, initMounts };
+}
+
+// The copilot image is cached alongside the fetched binary (large + static).
+function readCacheDirSafe() {
+  try {
+    return readCacheDir();
+  } catch {
+    return WORK;
+  }
 }
 
 function setStatus(status) {

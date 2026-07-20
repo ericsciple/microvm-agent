@@ -8,7 +8,9 @@ author: "ericsciple"
 # NOTE: Zero-dependency ESM action ("type": "module" in package.json), so
 # runs.main points directly at src/main.js — no dist bundle needed. The action
 # shells out to scripts/*.sh for host provisioning and requires a KVM-capable
-# ubuntu-latest runner, docker, sudo, and mitmproxy on PATH (see README/TODO).
+# ubuntu-latest runner, sudo, and mitmproxy on PATH. The guest kernel + rootfs are
+# prebuilt (fetched from the microvm-images release), so docker is not needed on the
+# default path (see README/TODO).
 
 inputs:
   prompt:
@@ -67,6 +69,21 @@ inputs:
       Requires 'copilot-requests: write' for inference. The caller must pass this
       (e.g. github-token set to the workflow's github.token); the action also falls back to the
       GITHUB_TOKEN environment variable.
+    required: false
+    default: ""
+  images-repo:
+    description: "Repo publishing the prebuilt guest kernel + bare rootfs releases."
+    required: false
+    default: "ericsciple/microvm-images"
+  images-tag:
+    description: "Release tag in images-repo to fetch the pinned kernel + rootfs from."
+    required: false
+    default: "v0.0.1"
+  rootfs:
+    description: >-
+      Advanced: path to a custom guest rootfs ext4 to boot instead of the fetched bare
+      rootfs. Must satisfy the contract: x86_64 + glibc >= 2.28 + libstdc++.so.6 present
+      (no musl/Alpine). Preflighted before boot.
     required: false
     default: ""
 
