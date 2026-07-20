@@ -212,6 +212,19 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 ## Options on the table (future)
 
+- **Built-in "agent diagnostics/report" MCP (always-on) → Actions annotations + step status.** The agent
+  needs a structured way to say "I'm blocked" that surfaces the Actions-native way. Add a **built-in**
+  MCP server (delivered as a `/__mcp` shim, always present, NOT user-configured — independent of any
+  safe-outputs config) exposing tools like `report_error` / `report_warning` / `report_missing_tool` /
+  `report_missing_data` / `report_incomplete` / `noop`. The **host-side** dispatch handler turns these
+  into `core.error()` / `core.warning()` **annotations** on the run, and records status for teardown —
+  `report_incomplete` makes microvm-agent **fail the step** (`setFailed` / `status=failed`) even if the
+  agent process exited 0. This is the "Actions way" of surfacing agent problems and is the reason these
+  are **not** safe outputs (see `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs = optional
+  GitHub-write MCP; diagnostics = harness built-in). A structured channel is also **safer** than letting
+  the guest print raw `::error::` (see the workflow-command-injection bug above): the guest never emits
+  `::` directly; the host validates + emits.
+
 - **Consider a prompt-file input.** Today `prompt` is an inline string input (verbose in YAML for long
   prompts, no syntax highlighting, awkward to reuse/version). Consider adding a `prompt-file` input (a
   path, e.g. a Markdown file in the repo, whose contents become the prompt) — and/or supporting the
@@ -308,6 +321,14 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
      a **specific Python minor** (fragile: a cp312 wheel breaks on a future 3.13 runner). Least preferred.
 
 ## Key correctness notes
+
+- **[BUG — security] Guest console is streamed raw to the action's stdout → workflow-command injection.**
+  `bootVm` runs firecracker via `exec.exec`, which echoes the guest serial console to the step's stdout
+  (live logs). But the runner interprets **any** `::command::` line on stdout, so a compromised/
+  hallucinating guest could emit `::set-output::`, `::add-path::`, `::save-state::`, `::error::` spam,
+  etc. Fix: wrap the streamed guest output in a `::stop-commands::<random-token>` … `::<token>::` block
+  (GitHub's canonical guard for echoing untrusted content) — or strip/escape `^::` lines — so nothing
+  the guest prints is interpreted as a workflow command. (`src/main.js` `bootVm`.)
 
 - **[BUG — latent] mcp-config server names are unvalidated but used verbatim as the `/__mcp/<name>`
   shim filename** (`src/main.js` `path.join(harnessSrc, name)`) **and referenced in the prompt.** A name
