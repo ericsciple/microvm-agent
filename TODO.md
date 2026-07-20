@@ -230,13 +230,19 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
   MCP server (delivered as a `/__mcp` shim, always present, NOT user-configured — independent of any
   safe-outputs config) exposing tools like `report_error` / `report_warning` / `report_missing_tool` /
   `report_missing_data` / `report_incomplete` / `noop`. The **host-side** dispatch handler turns these
-  into `core.error()` / `core.warning()` **annotations** on the run, and records status for teardown —
-  `report_incomplete` makes microvm-agent **fail the step** (`setFailed` / `status=failed`) even if the
-  agent process exited 0. This is the "Actions way" of surfacing agent problems and is the reason these
-  are **not** safe outputs (see `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs = optional
-  GitHub-write MCP; diagnostics = harness built-in). A structured channel is also **safer** than letting
-  the guest print raw `::error::` (see the workflow-command-injection bug above): the guest never emits
-  `::` directly; the host validates + emits.
+  into `core.error()` / `core.warning()` annotations.
+  - **Inline, not post-processed.** The dispatch server is **alive during the run** (it answers the
+    guest's shim calls in real time), so `core.error()` fires the instant the agent calls the tool →
+    the `::error::` line appears **inline in the step log** (and as an annotation) right then. The
+    **only** thing deferred to teardown is the final step **conclusion** — `report_incomplete` →
+    `setFailed`/`status=failed` even if the agent exited 0 — which is inherent to how a step ends, not a
+    post-processing pass over messages.
+  - **Relationship to the stdout allowlist filter (below).** With that filter in place, the agent can
+    surface plain `error`/`warning` just by printing `::error::…` (passed through inline). So this MCP
+    is mainly for the **status-affecting** signal (`report_incomplete` → fail the step) and structured
+    outputs; plain error/warning text can flow through the filter instead. Both give inline behavior.
+  - Why these are **not** safe outputs: `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs =
+    optional GitHub-write MCP; diagnostics = harness built-in.
 
 - **Consider a prompt-file input.** Today `prompt` is an inline string input (verbose in YAML for long
   prompts, no syntax highlighting, awkward to reuse/version). Consider adding a `prompt-file` input (a
@@ -338,10 +344,18 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 - **[BUG — security] Guest console is streamed raw to the action's stdout → workflow-command injection.**
   `bootVm` runs firecracker via `exec.exec`, which echoes the guest serial console to the step's stdout
   (live logs). But the runner interprets **any** `::command::` line on stdout, so a compromised/
-  hallucinating guest could emit `::set-output::`, `::add-path::`, `::save-state::`, `::error::` spam,
-  etc. Fix: wrap the streamed guest output in a `::stop-commands::<random-token>` … `::<token>::` block
-  (GitHub's canonical guard for echoing untrusted content) — or strip/escape `^::` lines — so nothing
-  the guest prints is interpreted as a workflow command. (`src/main.js` `bootVm`.)
+  hallucinating guest could emit `::set-output::`, `::add-path::`, `::save-state::`, `::add-mask::`,
+  `::stop-commands::`, etc. **Fix (preferred): an allowlist filter.** Stop `exec.exec` echoing raw
+  (`silent: true` + our own listener) and have microvm-agent process guest stdout/stderr **line by
+  line**, re-emitting to `process.stdout`:
+  - **Allow** informational, no-capability commands through verbatim (so errors surface **inline**):
+    `::error::`, `::warning::`, `::notice::`, `::debug::`, `::group::`/`::endgroup::`.
+  - **Neutralize** everything else (capability/state changes): `::set-output::`, `::save-state::`,
+    `::add-path::`, `::set-env::`, `::add-mask::`, `::stop-commands::`, `::echo::`, … — escape the line
+    so the runner doesn't interpret it.
+  This is better than the blunt `::stop-commands::<token>` wrap (which would suppress `::error::` too):
+  the allowlist **keeps inline error/warning while blocking injection**, and pairs with the diagnostics
+  MCP above (which owns the status-affecting `report_incomplete`). (`src/main.js` `bootVm`.)
 
 - **[BUG — latent] mcp-config server names are unvalidated but used verbatim as the `/__mcp/<name>`
   shim filename** (`src/main.js` `path.join(harnessSrc, name)`) **and referenced in the prompt.** A name
