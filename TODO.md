@@ -260,6 +260,13 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     reason" (+ `report_error`/`report_warning` to surface problems). Lazy `<server> --help` discovery
     conveys a tool's *inputs*, not *when to use it*, so this status-affecting signal won't fire unless
     the agent is explicitly told. Deliberate exception to the tiny/lazy-preamble rule (1–2 lines).
+  - **Delivery: reuse the existing shim; add an in-process dispatch handler.** The diagnostics tools ride
+    the standard `/__mcp/<server>` shim (`generateServerShim`) — no bespoke script. That shim builds the
+    call with `jq --args "$@"`, which safely encodes **newlines**/quotes/special chars; and host-side
+    `core.error()` escapes the message for `::error::` (`\n`→`%0A`), so multi-line messages round-trip.
+    The one real change is a **built-in/in-process handler** in `dispatch.js`: the diagnostics "server"
+    isn't an external stdio MCP process to spawn — its `tools/call` runs in-process and calls `core.*` /
+    the fail path directly. (Usability: a multi-line message must be one quoted argument.)
   - Why these are **not** safe outputs: `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs =
     optional GitHub-write MCP; diagnostics = harness built-in.
 
