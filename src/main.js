@@ -24,7 +24,8 @@ import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
 import { createDispatchServer } from "./dispatch.js";
 import { fetchArtifacts } from "./artifacts.js";
-import { generateServerShim, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_COPILOT_DIR } from "./guest-assets.js";
+import { generateServerShim, generateHelperScripts, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_HELPERS_DIR, DEFAULT_COPILOT_DIR } from "./guest-assets.js";
+import { filterConsoleLine, gradeConsoleText } from "./console-filter.js";
 import { translateToolCachePathEntries } from "./paths.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -187,27 +188,43 @@ async function main() {
   const rootfsSrc = inputs.rootfs || rootfsPath;
   if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
 
-  // 5a. Assemble the read-only /__mcp harness mount: one shim per server + event.json.
+  // 5a. Assemble the read-only /__mcp harness mount: one shim per server. (event.json
+  //     moved to /__rt below — it's per-run context/data, not a tool, so /__mcp is
+  //     shims-only and is created only when there are actually MCP servers.)
   const harnessSrc = freshDir(path.join(WORK, "harness"));
   for (const name of serverNames) {
     const shimPath = path.join(harnessSrc, name);
     fs.writeFileSync(shimPath, generateServerShim(name));
     fs.chmodSync(shimPath, 0o755);
   }
-  let guestEventPath = "";
-  if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
-    fs.copyFileSync(inputs.eventPath, path.join(harnessSrc, "event.json"));
-    guestEventPath = `${DEFAULT_MCP_DIR}/event.json`;
-    log("copied event.json into the /__mcp harness mount (GITHUB_EVENT_PATH repointed).");
-  }
-  const harnessHasContent = serverNames.length > 0 || guestEventPath !== "";
+  const harnessHasContent = serverNames.length > 0;
 
   // 5b. The per-run runtime config mount (/__rt, always vdb): init.sh + prompt.txt +
-  //     agent.env + mitmproxy-ca.pem + mcp-config.json. The bare rootfs is prebuilt and
-  //     generic, so nothing is baked in — everything run-specific rides this mount.
+  //     agent.env + mitmproxy-ca.pem + mcp-config.json + event.json + the report-*
+  //     helper scripts (/__rt/helpers). The bare rootfs is prebuilt and generic, so
+  //     nothing is baked in — everything run-specific rides this mount.
   const rtSrc = freshDir(path.join(WORK, "runtime"));
   if (!process.env.MV_DRY_RUN) generateGatewayCa(rtSrc);
   else fs.writeFileSync(path.join(rtSrc, "mitmproxy-ca.pem"), ""); // dry-run has no gateway
+
+  // event.json rides /__rt (per-run context, not a tool). The agent reads it via
+  // $GITHUB_EVENT_PATH; /__rt is --add-dir'd below so the CLI can read it.
+  let guestEventPath = "";
+  if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
+    fs.copyFileSync(inputs.eventPath, path.join(rtSrc, "event.json"));
+    guestEventPath = `${DEFAULT_RUNTIME_DIR}/event.json`;
+    log("copied event.json onto the /__rt runtime mount (GITHUB_EVENT_PATH repointed).");
+  }
+
+  // Guest-side diagnostics helpers (report-error/warning/notice/incomplete), off-PATH
+  // in /__rt/helpers, surfaced to the agent via $MV_HELPERS_DIR.
+  const helpersDir = path.join(rtSrc, "helpers");
+  fs.mkdirSync(helpersDir, { recursive: true });
+  for (const [name, body] of Object.entries(generateHelperScripts())) {
+    const p = path.join(helpersDir, name);
+    fs.writeFileSync(p, body);
+    fs.chmodSync(p, 0o755);
+  }
 
   // 5c. The Copilot CLI mount (vdc): the fetched binary dir, mounted with a discard overlay.
   const copilotSrc = copilotDir;
@@ -259,6 +276,11 @@ async function main() {
     }
   }
   if (guestEventPath) agentEnv += `export GITHUB_EVENT_PATH=${guestEventPath}\n`;
+  // Well-known dirs for the guest-side tools, so prompts/authors never hardcode paths:
+  // $MV_HELPERS_DIR (report-* diagnostics helpers, always present) and $MV_MCP_DIR (the
+  // MCP shims, only when there are servers).
+  agentEnv += `export MV_HELPERS_DIR=${DEFAULT_HELPERS_DIR}\n`;
+  if (harnessHasContent) agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
   fs.writeFileSync(path.join(rtSrc, "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above). Empty by default — every
   // server reaches the guest as a /__mcp shim, not a native guest MCP entry.
@@ -329,7 +351,11 @@ async function main() {
     }
   }
   setStatus(status);
-  if (status !== "completed") core.setFailed(`agent did not complete (status=${status}).`);
+  if (status === "incomplete") {
+    core.setFailed("agent reported it could not complete the task (report-incomplete).");
+  } else if (status !== "completed") {
+    core.setFailed(`agent did not complete (status=${status}).`);
+  }
 }
 
 /**
@@ -349,19 +375,34 @@ async function bootVm(seconds, consoleLog) {
   } catch {
     /* best effort */
   }
+  // The guest serial console is untrusted. Capture it RAW to console.log (grading reads
+  // ground truth), but re-emit to the step's live log through an allowlist filter so a
+  // compromised/hallucinating guest can't inject capability workflow commands
+  // (::set-output::, ::add-path::, ::stop-commands::, …). silent:true stops @actions/exec
+  // from echoing the raw stream itself.
   const fileStream = fs.createWriteStream(consoleLog);
-  const capture = (chunk) => fileStream.write(chunk);
+  let pending = "";
+  const onData = (chunk) => {
+    fileStream.write(chunk); // raw capture for grading
+    pending += chunk.toString("utf8");
+    let nl;
+    while ((nl = pending.indexOf("\n")) !== -1) {
+      const line = pending.slice(0, nl);
+      pending = pending.slice(nl + 1);
+      process.stdout.write(filterConsoleLine(line) + "\n");
+    }
+  };
   await exec.exec(
     "sudo",
     ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", sock, "--config-file", path.join(WORK, "vm_config.json")],
-    { ignoreReturnCode: true, listeners: { stdout: capture, stderr: capture } }
+    { silent: true, ignoreReturnCode: true, listeners: { stdout: onData, stderr: onData } }
   );
+  if (pending.length) process.stdout.write(filterConsoleLine(pending) + "\n");
   await new Promise((r) => fileStream.end(r));
 }
 
 function gradeConsole(consoleLog) {
-  const text = fs.readFileSync(consoleLog, "utf8");
-  return /GUEST: starting copilot/.test(text) ? "completed" : "failed";
+  return gradeConsoleText(fs.readFileSync(consoleLog, "utf8"));
 }
 
 function freshDir(p) {

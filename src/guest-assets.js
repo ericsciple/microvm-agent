@@ -22,9 +22,18 @@ export const DEFAULT_MCP_DIR = "/__mcp";
 // The per-run runtime config drive is ALWAYS the first extra drive (vdb); the bare
 // rootfs's baked /init stub mounts it here and execs /__rt/init.sh (see microvm-images).
 export const DEFAULT_RUNTIME_DIR = "/__rt";
+// Guest-side helper scripts (report-error/warning/notice/incomplete) live here,
+// colocated on the runtime drive and OFF-PATH (like the /__mcp shims). Surfaced to
+// the agent via $MV_HELPERS_DIR so nothing hardcodes the path.
+export const DEFAULT_HELPERS_DIR = `${DEFAULT_RUNTIME_DIR}/helpers`;
 // Where the Copilot CLI binary is mounted (its own drive, with a discard overlay so
 // anything it writes next to itself is captured in tmpfs and discarded).
 export const DEFAULT_COPILOT_DIR = "/opt/copilot";
+
+// A plain-text (NOT a ::workflow-command::) sentinel that report-incomplete prints so
+// the host console grader can detect an agent-declared failure. It must NOT be a
+// `::...::` line, or the stdout allowlist filter would neutralize it before grading.
+export const REPORT_INCOMPLETE_SENTINEL = "__MICROVM_AGENT_REPORT_INCOMPLETE__";
 
 /**
  * One shim per server. POSIX sh; needs jq + curl in the guest.
@@ -55,26 +64,78 @@ jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,args:$ARGS.positional}' 
 }
 
 /**
+ * Guest-side helper scripts the agent runs to surface diagnostics the Actions-native
+ * way — inline `::error::`/`::warning::`/`::notice::` annotations — and to declare
+ * failure. Each takes the raw message as its first arg and does the workflow-command
+ * escaping (`%`->`%25`, CR->`%0D`, LF->`%0A`) itself, so the agent NEVER hand-formats
+ * `::error::` (the fragile part). They print to the guest console; the host stdout
+ * allowlist filter passes these informational commands through so the runner renders
+ * them inline. `report-incomplete` additionally prints a plain-text sentinel that the
+ * host console grader detects to fail the step (an agent that ran fine but could not
+ * achieve the task — neither an exit code nor a workflow command can express that).
+ *
+ * POSIX sh + awk (mawk/gawk); the escape is line-by-line (joined with %0A) so it works
+ * in mawk, which lacks gawk's whole-file RS slurp.
+ * @returns {Record<string,string>} filename -> script contents
+ */
+export function generateHelperScripts() {
+  // Line-by-line escape: mawk-safe (default RS splits on \n); rejoin multi-line
+  // messages with the literal %0A escape. Escapes % first so we don't double-escape
+  // the %0D/%0A we introduce.
+  const escape = `awk '
+  { gsub(/%/, "%25"); gsub(/\\r/, "%0D"); out = out (NR > 1 ? "%0A" : "") $0 }
+  END { printf "%s", out }
+'`;
+  const emit = (command, description) =>
+    `#!/bin/sh
+# ${command} — ${description}
+# Usage: ${command} "message"
+# Escapes the message and prints an Actions workflow command; the agent never
+# hand-formats '::...::' itself.
+msg=$(printf '%s' "\${1:-}" | ${escape})
+printf '::${command === "report-incomplete" ? "error" : command.replace(/^report-/, "")}::%s\\n' "$msg"
+`;
+  return {
+    "report-error": emit("report-error", "surface an inline error annotation"),
+    "report-warning": emit("report-warning", "surface an inline warning annotation"),
+    "report-notice": emit("report-notice", "surface an inline notice annotation"),
+    "report-incomplete":
+      emit("report-incomplete", "declare the task could not be completed (fails the run)") +
+      `printf '%s\\n' ${shq(REPORT_INCOMPLETE_SENTINEL)}\n`,
+  };
+}
+
+
+/**
  * The preamble prepended to the user prompt: tells the agent it's in an isolated
- * microVM, where the event payload is, and how to discover + run MCP tools.
+ * microVM, where the event payload is, how to discover + run MCP tools (via the
+ * $MV_MCP_DIR env var, never a hardcoded path), and how to surface diagnostics /
+ * declare failure via the $MV_HELPERS_DIR helper scripts.
  * @param {string[]} serverNames
  * @param {{mcpDir?: string}} [opts]
  * @returns {string}
  */
 export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = {}) {
+  void mcpDir; // paths are referenced via $MV_MCP_DIR, not baked in.
   const lines = [
     "You are an autonomous agent inside an isolated, ephemeral Firecracker microVM.",
     "The triggering event payload (issue/PR JSON) is at the path in $GITHUB_EVENT_PATH.",
   ];
   if (serverNames.length) {
-    lines.push("Tools are provided by MCP servers, exposed as commands (use the absolute path):");
-    for (const s of serverNames) lines.push(`  ${mcpDir}/${s}`);
+    lines.push("Tools are provided by MCP servers, exposed as commands under $MV_MCP_DIR:");
+    for (const s of serverNames) lines.push(`  $MV_MCP_DIR/${s}`);
     lines.push(
-      `List a server's tools: \`${mcpDir}/<server>\`. Show a tool's inputs: \`${mcpDir}/<server> <tool> --help\`.`,
-      `Run a tool: \`${mcpDir}/<server> <tool> <args>\`.`
+      'List a server\'s tools: `"$MV_MCP_DIR/<server>"`. Show a tool\'s inputs: `"$MV_MCP_DIR/<server>" <tool> --help`.',
+      'Run a tool: `"$MV_MCP_DIR/<server>" <tool> <args>`.'
     );
   }
-  lines.push("---");
+  lines.push(
+    'To surface a problem in the run log, run `"$MV_HELPERS_DIR/report-error" "<message>"` ' +
+      "(also report-warning and report-notice for less-severe notes).",
+    'If you cannot complete the task, run `"$MV_HELPERS_DIR/report-incomplete" "<reason>"` ' +
+      "to fail the run with an explanation.",
+    "---"
+  );
   return lines.join("\n") + "\n";
 }
 
@@ -139,8 +200,10 @@ export function generateInitScript({
   const mountSetup = generateMountSetup(mounts);
   const copilotDir = mounts.copilot ? mounts.copilot.path : DEFAULT_COPILOT_DIR;
   const addDirs = ["/root"];
-  // The MCP shims live in the harness mount (/__mcp); the CLI can only execute files
-  // under directories it's been granted, so add it (and the workspace when mounted).
+  // The MCP shims live in the harness mount (/__mcp) and the report-* helpers +
+  // event.json live on the runtime drive (/__rt); the CLI can only execute/read files
+  // under directories it's been granted, so add both (and the workspace when mounted).
+  addDirs.push(runtimeDir);
   if (mounts.harness) addDirs.push(mounts.harness.path);
   if (mounts.workspace) addDirs.push(mounts.workspace.path);
   const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");

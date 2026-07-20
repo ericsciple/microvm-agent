@@ -2,11 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   generateServerShim,
+  generateHelperScripts,
   generateMcpPreamble,
   generateMountSetup,
   generateInitScript,
   DEFAULT_DISPATCH_ENDPOINT,
   DEFAULT_MCP_DIR,
+  DEFAULT_HELPERS_DIR,
+  REPORT_INCOMPLETE_SENTINEL,
 } from "../src/guest-assets.js";
 
 test("generateServerShim forwards {server,tool,args} to the dispatch endpoint", () => {
@@ -26,19 +29,26 @@ test("generateServerShim endpoint is configurable", () => {
   assert.ok(!shim.includes(DEFAULT_DISPATCH_ENDPOINT));
 });
 
-test("generateMcpPreamble lists servers with absolute /__mcp paths + event path", () => {
+test("generateMcpPreamble lists servers via $MV_MCP_DIR + event path + helper guidance", () => {
   const p = generateMcpPreamble(["labeler", "github"]);
   assert.match(p, /isolated, ephemeral Firecracker microVM/);
   assert.match(p, /\$GITHUB_EVENT_PATH/);
-  assert.ok(p.includes(`${DEFAULT_MCP_DIR}/labeler`));
-  assert.ok(p.includes(`${DEFAULT_MCP_DIR}/github`));
+  // Paths are referenced through the env var, never hardcoded.
+  assert.ok(p.includes("$MV_MCP_DIR/labeler"));
+  assert.ok(p.includes("$MV_MCP_DIR/github"));
+  assert.ok(!p.includes(`${DEFAULT_MCP_DIR}/labeler`));
+  // The diagnostics helpers are advertised via $MV_HELPERS_DIR.
+  assert.ok(p.includes('"$MV_HELPERS_DIR/report-error"'));
+  assert.ok(p.includes('"$MV_HELPERS_DIR/report-incomplete"'));
   assert.match(p, /---\n$/);
 });
 
-test("generateMcpPreamble with no servers still gives isolation + event context", () => {
+test("generateMcpPreamble with no servers still gives isolation + event + helpers", () => {
   const p = generateMcpPreamble([]);
   assert.match(p, /microVM/);
-  assert.ok(!p.includes("/__mcp/"));
+  assert.ok(!p.includes("$MV_MCP_DIR"));
+  // Helpers are always available regardless of MCP servers.
+  assert.ok(p.includes('"$MV_HELPERS_DIR/report-error"'));
 });
 
 test("harness mount is a read-only mount at /__mcp", () => {
@@ -74,8 +84,37 @@ test("init mounts harness + wires auth env and prompt from /__rt", () => {
   assert.ok(init.includes("S2STOKENS=true"));
   assert.ok(init.includes('-p "$(cat "$RT/prompt.txt")"'));
   assert.ok(init.includes('. "$RT/agent.env"'));
-  // The CLI must be granted the /__mcp dir to execute the shims there.
+  // The CLI must be granted the /__mcp dir to execute the shims there, and /__rt for the
+  // report-* helpers + event.json.
   assert.ok(init.includes("--add-dir '/__mcp'"));
+  assert.ok(init.includes("--add-dir '/__rt'"));
+});
+
+test("generateHelperScripts emits the four report-* helpers with escaping", () => {
+  const h = generateHelperScripts();
+  assert.deepEqual(
+    Object.keys(h).sort(),
+    ["report-error", "report-incomplete", "report-notice", "report-warning"]
+  );
+  for (const [name, body] of Object.entries(h)) {
+    assert.match(body, /^#!\/bin\/sh/, `${name} is a sh script`);
+    // Escapes %, CR, LF so the agent never hand-formats the workflow command.
+    assert.ok(body.includes('gsub(/%/, "%25")'), `${name} escapes %`);
+    assert.ok(body.includes('gsub(/\\r/, "%0D")'), `${name} escapes CR`);
+    assert.ok(body.includes("%0A"), `${name} escapes LF`);
+  }
+  assert.ok(h["report-error"].includes("printf '::error::%s\\n'"));
+  assert.ok(h["report-warning"].includes("printf '::warning::%s\\n'"));
+  assert.ok(h["report-notice"].includes("printf '::notice::%s\\n'"));
+  // report-incomplete prints an error annotation AND the plain-text grading sentinel.
+  assert.ok(h["report-incomplete"].includes("printf '::error::%s\\n'"));
+  assert.ok(h["report-incomplete"].includes(REPORT_INCOMPLETE_SENTINEL));
+  // The sentinel must NOT be a ::workflow-command:: (the filter would neutralize it).
+  assert.ok(!/^::/.test(REPORT_INCOMPLETE_SENTINEL));
+});
+
+test("DEFAULT_HELPERS_DIR is colocated under the runtime dir", () => {
+  assert.equal(DEFAULT_HELPERS_DIR, "/__rt/helpers");
 });
 
 test("init puts the copilot mount on PATH", () => {

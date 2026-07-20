@@ -225,7 +225,13 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
   Weigh usability (too narrow → the agent can't see what it needs) vs. least privilege. (`src/mcp-config.js`
   `GITHUB_TOOLSETS`/`GITHUB_READ_ONLY`.)
 
-- **Agent → Actions error surfacing (guest-side helper scripts; no MCP needed).** The agent needs a way
+- **Agent → Actions error surfacing (guest-side helper scripts; no MCP needed). [DONE 2026-07-20]**
+  Implemented: `src/guest-assets.js` `generateHelperScripts()` emits `report-error`/`report-warning`/
+  `report-notice`/`report-incomplete` (POSIX sh + mawk-safe escaping) into `/__rt/helpers`; `src/main.js`
+  writes them per-run + exports `$MV_HELPERS_DIR`/`$MV_MCP_DIR` in agent.env; the preamble advertises them;
+  `--add-dir /__rt` grants execution; the stdout allowlist filter (`src/console-filter.js`) passes the
+  `::error::`/`::warning::`/`::notice::` they print; `report-incomplete` also prints a plain-text sentinel
+  the grader detects → `setFailed`. Original design notes kept below for the decision record.
   to surface errors/warnings inline and to declare failure, the Actions-native way. **Preferred design:
   tiny guest-side helper scripts** (`report-error`, `report-warning`, `report-notice`,
   `report-incomplete`) in a **harness-owned dir, OFF-PATH** (consistent with the `/__mcp` shims — not on
@@ -370,14 +376,24 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 ## Key correctness notes
 
-- **[BUG — grading gap] `gradeConsole` ignores the agent's exit code.** `gradeConsole` (`src/main.js:362`)
+- **[BUG — grading gap] [FIXED 2026-07-20] `gradeConsole` ignores the agent's exit code.** Fixed in
+  `src/console-filter.js` `gradeConsoleText`: requires `GUEST: starting copilot`, treats the
+  report-incomplete sentinel as "incomplete", and grades on `AGENT_EXIT` (non-zero or missing → failed,
+  exactly 0 → completed). Unit-tested in `test/console-filter.test.js`. Original note kept below.
+
+  `gradeConsole` (`src/main.js:362`)
   returns "completed" whenever the console contains `GUEST: starting copilot` — it does **not** check the
   `=== GUEST: AGENT_EXIT=$? ===` line the init script emits (`src/guest-assets.js:181`). So a Copilot CLI
   that **starts and then crashes** (non-zero exit) currently grades as **success** and the step passes.
   Fix: parse `AGENT_EXIT=N` and treat non-zero as failure (result-model layer 2, above). This is
   independent of the diagnostics MCP (layer 3, the exited-0-but-unachievable case).
 
-- **[BUG — security] Guest console is streamed raw to the action's stdout → workflow-command injection.**
+- **[BUG — security] [FIXED 2026-07-20] Guest console is streamed raw to the action's stdout → workflow-command injection.**
+  Fixed: `src/main.js` `bootVm` now runs firecracker with `silent: true` and re-emits the guest console
+  line-by-line through `filterConsoleLine` (`src/console-filter.js`), which passes informational
+  annotations (`::error::`/`::warning::`/`::notice::`/`::debug::`/`::group::`/`::endgroup::`) verbatim and
+  neutralizes every other `::…::` (capability/state commands). Raw console still captured to console.log
+  for grading. Unit-tested. Original note kept below.
   `bootVm` runs firecracker via `exec.exec`, which echoes the guest serial console to the step's stdout
   (live logs). But the runner interprets **any** `::command::` line on stdout, so a compromised/
   hallucinating guest could emit `::set-output::`, `::add-path::`, `::save-state::`, `::add-mask::`,
@@ -393,8 +409,9 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
   the allowlist **keeps inline error/warning while blocking injection**, and pairs with the diagnostics
   MCP above (which owns the status-affecting `report_incomplete`). (`src/main.js` `bootVm`.)
 
-- **[BUG — latent] mcp-config server names are unvalidated but used verbatim as the `/__mcp/<name>`
-  shim filename** (`src/main.js` `path.join(harnessSrc, name)`) **and referenced in the prompt.** A name
+- **[BUG — latent] [FIXED 2026-07-20] mcp-config server names are unvalidated but used verbatim as the `/__mcp/<name>`
+  shim filename** — fixed in `src/mcp-config.js` `normalizeCustomServer`: rejects any name outside
+  `^[A-Za-z0-9._-]{1,64}$` with an actionable error (unit-tested in `test/mcp-config.test.js`). Original note:
   containing `/` (or other unsafe chars) breaks shim generation with no clear error. Fix: validate each
   server name at parse time against a safe charset (`[A-Za-z0-9._-]`, length-capped) and reject with an
   actionable error. (Also a prerequisite for the safe-outputs op-count `MCP_STATE_DIR` design, which

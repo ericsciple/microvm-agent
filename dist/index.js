@@ -42097,6 +42097,14 @@ function buildGuestMcpConfig(inputs) {
  * @returns {HostServer}
  */
 function normalizeCustomServer(name, rawDef) {
+  // The server name is used verbatim as the /__mcp/<name> shim filename (and as a
+  // per-instance state-dir segment), so reject anything outside a safe charset before
+  // it can escape the directory or break shim generation.
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+    throw new Error(
+      `mcp-config server name '${name}' is invalid: use only letters, digits, '.', '_', or '-' (1–64 chars).`
+    );
+  }
   const def = rawDef && typeof rawDef === "object" ? rawDef : {};
   const { env = {}, command, args = [], ...rest } = def;
   if (env && typeof env !== "object") {
@@ -56863,9 +56871,18 @@ const DEFAULT_MCP_DIR = "/__mcp";
 // The per-run runtime config drive is ALWAYS the first extra drive (vdb); the bare
 // rootfs's baked /init stub mounts it here and execs /__rt/init.sh (see microvm-images).
 const DEFAULT_RUNTIME_DIR = "/__rt";
+// Guest-side helper scripts (report-error/warning/notice/incomplete) live here,
+// colocated on the runtime drive and OFF-PATH (like the /__mcp shims). Surfaced to
+// the agent via $MV_HELPERS_DIR so nothing hardcodes the path.
+const DEFAULT_HELPERS_DIR = `${DEFAULT_RUNTIME_DIR}/helpers`;
 // Where the Copilot CLI binary is mounted (its own drive, with a discard overlay so
 // anything it writes next to itself is captured in tmpfs and discarded).
 const DEFAULT_COPILOT_DIR = "/opt/copilot";
+
+// A plain-text (NOT a ::workflow-command::) sentinel that report-incomplete prints so
+// the host console grader can detect an agent-declared failure. It must NOT be a
+// `::...::` line, or the stdout allowlist filter would neutralize it before grading.
+const REPORT_INCOMPLETE_SENTINEL = "__MICROVM_AGENT_REPORT_INCOMPLETE__";
 
 /**
  * One shim per server. POSIX sh; needs jq + curl in the guest.
@@ -56896,26 +56913,78 @@ jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,args:$ARGS.positional}' 
 }
 
 /**
+ * Guest-side helper scripts the agent runs to surface diagnostics the Actions-native
+ * way — inline `::error::`/`::warning::`/`::notice::` annotations — and to declare
+ * failure. Each takes the raw message as its first arg and does the workflow-command
+ * escaping (`%`->`%25`, CR->`%0D`, LF->`%0A`) itself, so the agent NEVER hand-formats
+ * `::error::` (the fragile part). They print to the guest console; the host stdout
+ * allowlist filter passes these informational commands through so the runner renders
+ * them inline. `report-incomplete` additionally prints a plain-text sentinel that the
+ * host console grader detects to fail the step (an agent that ran fine but could not
+ * achieve the task — neither an exit code nor a workflow command can express that).
+ *
+ * POSIX sh + awk (mawk/gawk); the escape is line-by-line (joined with %0A) so it works
+ * in mawk, which lacks gawk's whole-file RS slurp.
+ * @returns {Record<string,string>} filename -> script contents
+ */
+function generateHelperScripts() {
+  // Line-by-line escape: mawk-safe (default RS splits on \n); rejoin multi-line
+  // messages with the literal %0A escape. Escapes % first so we don't double-escape
+  // the %0D/%0A we introduce.
+  const escape = `awk '
+  { gsub(/%/, "%25"); gsub(/\\r/, "%0D"); out = out (NR > 1 ? "%0A" : "") $0 }
+  END { printf "%s", out }
+'`;
+  const emit = (command, description) =>
+    `#!/bin/sh
+# ${command} — ${description}
+# Usage: ${command} "message"
+# Escapes the message and prints an Actions workflow command; the agent never
+# hand-formats '::...::' itself.
+msg=$(printf '%s' "\${1:-}" | ${escape})
+printf '::${command === "report-incomplete" ? "error" : command.replace(/^report-/, "")}::%s\\n' "$msg"
+`;
+  return {
+    "report-error": emit("report-error", "surface an inline error annotation"),
+    "report-warning": emit("report-warning", "surface an inline warning annotation"),
+    "report-notice": emit("report-notice", "surface an inline notice annotation"),
+    "report-incomplete":
+      emit("report-incomplete", "declare the task could not be completed (fails the run)") +
+      `printf '%s\\n' ${shq(REPORT_INCOMPLETE_SENTINEL)}\n`,
+  };
+}
+
+
+/**
  * The preamble prepended to the user prompt: tells the agent it's in an isolated
- * microVM, where the event payload is, and how to discover + run MCP tools.
+ * microVM, where the event payload is, how to discover + run MCP tools (via the
+ * $MV_MCP_DIR env var, never a hardcoded path), and how to surface diagnostics /
+ * declare failure via the $MV_HELPERS_DIR helper scripts.
  * @param {string[]} serverNames
  * @param {{mcpDir?: string}} [opts]
  * @returns {string}
  */
 function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = {}) {
+  void mcpDir; // paths are referenced via $MV_MCP_DIR, not baked in.
   const lines = [
     "You are an autonomous agent inside an isolated, ephemeral Firecracker microVM.",
     "The triggering event payload (issue/PR JSON) is at the path in $GITHUB_EVENT_PATH.",
   ];
   if (serverNames.length) {
-    lines.push("Tools are provided by MCP servers, exposed as commands (use the absolute path):");
-    for (const s of serverNames) lines.push(`  ${mcpDir}/${s}`);
+    lines.push("Tools are provided by MCP servers, exposed as commands under $MV_MCP_DIR:");
+    for (const s of serverNames) lines.push(`  $MV_MCP_DIR/${s}`);
     lines.push(
-      `List a server's tools: \`${mcpDir}/<server>\`. Show a tool's inputs: \`${mcpDir}/<server> <tool> --help\`.`,
-      `Run a tool: \`${mcpDir}/<server> <tool> <args>\`.`
+      'List a server\'s tools: `"$MV_MCP_DIR/<server>"`. Show a tool\'s inputs: `"$MV_MCP_DIR/<server>" <tool> --help`.',
+      'Run a tool: `"$MV_MCP_DIR/<server>" <tool> <args>`.'
     );
   }
-  lines.push("---");
+  lines.push(
+    'To surface a problem in the run log, run `"$MV_HELPERS_DIR/report-error" "<message>"` ' +
+      "(also report-warning and report-notice for less-severe notes).",
+    'If you cannot complete the task, run `"$MV_HELPERS_DIR/report-incomplete" "<reason>"` ' +
+      "to fail the run with an explanation.",
+    "---"
+  );
   return lines.join("\n") + "\n";
 }
 
@@ -56980,8 +57049,10 @@ function generateInitScript({
   const mountSetup = generateMountSetup(mounts);
   const copilotDir = mounts.copilot ? mounts.copilot.path : DEFAULT_COPILOT_DIR;
   const addDirs = ["/root"];
-  // The MCP shims live in the harness mount (/__mcp); the CLI can only execute files
-  // under directories it's been granted, so add it (and the workspace when mounted).
+  // The MCP shims live in the harness mount (/__mcp) and the report-* helpers +
+  // event.json live on the runtime drive (/__rt); the CLI can only execute/read files
+  // under directories it's been granted, so add both (and the workspace when mounted).
+  addDirs.push(runtimeDir);
   if (mounts.harness) addDirs.push(mounts.harness.path);
   if (mounts.workspace) addDirs.push(mounts.workspace.path);
   const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
@@ -57026,6 +57097,62 @@ echo 1 > /proc/sys/kernel/sysrq
 echo b > /proc/sysrq-trigger
 sleep infinity
 `;
+}
+
+;// CONCATENATED MODULE: ./src/console-filter.js
+// Host-side handling of the UNTRUSTED guest serial console.
+//
+// The guest's stdout is streamed to the Action's step log, but the runner interprets
+// ANY `::command::` line on stdout — so a compromised/hallucinating guest could inject
+// capability workflow commands (::set-output::, ::add-path::, ::save-state::,
+// ::stop-commands::, …). We pass through only the informational, no-capability
+// annotations (so agent errors/warnings surface INLINE) and neutralize the rest.
+//
+// Grading (gradeConsoleText) reads the RAW captured console (ground truth), not the
+// filtered live stream.
+
+
+
+// Workflow commands the guest may emit verbatim: informational only, no capability or
+// state change. Everything else is neutralized.
+const ALLOWED_GUEST_COMMANDS = new Set([
+  "error",
+  "warning",
+  "notice",
+  "debug",
+  "group",
+  "endgroup",
+]);
+
+/**
+ * Pass a guest console line through unchanged unless it is a workflow command that
+ * isn't on the informational allowlist, in which case neutralize every `::` in the
+ * line (insert a zero-width space between the colons) so the runner won't interpret it.
+ * @param {string} line
+ * @returns {string}
+ */
+function filterConsoleLine(line) {
+  const m = line.match(/^\s*::([A-Za-z][A-Za-z0-9_-]*)/);
+  if (!m) return line; // not a workflow command → pass through
+  if (ALLOWED_GUEST_COMMANDS.has(m[1].toLowerCase())) return line; // safe annotation
+  return "[microvm-agent blocked workflow command] " + line.replace(/::/g, ":\u200b:");
+}
+
+/**
+ * Grade a run from the captured (raw) guest console text. Three layers:
+ *  1. never reached the agent ("starting copilot" absent) → "failed";
+ *  2. the agent self-declared it couldn't finish (report-incomplete sentinel) → "incomplete";
+ *  3. the guest agent's own exit code (AGENT_EXIT): non-zero, or never reported
+ *     (crash/hang/timeout before it printed) → "failed"; exactly 0 → "completed".
+ * @param {string} text
+ * @returns {"failed"|"incomplete"|"completed"}
+ */
+function gradeConsoleText(text) {
+  if (!/GUEST: starting copilot/.test(text)) return "failed";
+  if (text.includes(REPORT_INCOMPLETE_SENTINEL)) return "incomplete";
+  const m = text.match(/GUEST: AGENT_EXIT=(\d+)/);
+  if (!m || Number(m[1]) !== 0) return "failed";
+  return "completed";
 }
 
 ;// CONCATENATED MODULE: ./src/paths.js
@@ -57083,6 +57210,7 @@ function stripTrailingSlash(p) {
 //
 // MV_DRY_RUN=1 stops after the rootfs is built (before booting), so the whole
 // provisioning path can be exercised without a Copilot inference token.
+
 
 
 
@@ -57260,27 +57388,43 @@ async function main() {
   const rootfsSrc = inputs.rootfs || rootfsPath;
   if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
 
-  // 5a. Assemble the read-only /__mcp harness mount: one shim per server + event.json.
+  // 5a. Assemble the read-only /__mcp harness mount: one shim per server. (event.json
+  //     moved to /__rt below — it's per-run context/data, not a tool, so /__mcp is
+  //     shims-only and is created only when there are actually MCP servers.)
   const harnessSrc = freshDir(external_node_path_namespaceObject.join(WORK, "harness"));
   for (const name of serverNames) {
     const shimPath = external_node_path_namespaceObject.join(harnessSrc, name);
     external_node_fs_namespaceObject.writeFileSync(shimPath, generateServerShim(name));
     external_node_fs_namespaceObject.chmodSync(shimPath, 0o755);
   }
-  let guestEventPath = "";
-  if (inputs.copyEvent && inputs.eventPath && external_node_fs_namespaceObject.existsSync(inputs.eventPath)) {
-    external_node_fs_namespaceObject.copyFileSync(inputs.eventPath, external_node_path_namespaceObject.join(harnessSrc, "event.json"));
-    guestEventPath = `${DEFAULT_MCP_DIR}/event.json`;
-    log("copied event.json into the /__mcp harness mount (GITHUB_EVENT_PATH repointed).");
-  }
-  const harnessHasContent = serverNames.length > 0 || guestEventPath !== "";
+  const harnessHasContent = serverNames.length > 0;
 
   // 5b. The per-run runtime config mount (/__rt, always vdb): init.sh + prompt.txt +
-  //     agent.env + mitmproxy-ca.pem + mcp-config.json. The bare rootfs is prebuilt and
-  //     generic, so nothing is baked in — everything run-specific rides this mount.
+  //     agent.env + mitmproxy-ca.pem + mcp-config.json + event.json + the report-*
+  //     helper scripts (/__rt/helpers). The bare rootfs is prebuilt and generic, so
+  //     nothing is baked in — everything run-specific rides this mount.
   const rtSrc = freshDir(external_node_path_namespaceObject.join(WORK, "runtime"));
   if (!process.env.MV_DRY_RUN) generateGatewayCa(rtSrc);
   else external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(rtSrc, "mitmproxy-ca.pem"), ""); // dry-run has no gateway
+
+  // event.json rides /__rt (per-run context, not a tool). The agent reads it via
+  // $GITHUB_EVENT_PATH; /__rt is --add-dir'd below so the CLI can read it.
+  let guestEventPath = "";
+  if (inputs.copyEvent && inputs.eventPath && external_node_fs_namespaceObject.existsSync(inputs.eventPath)) {
+    external_node_fs_namespaceObject.copyFileSync(inputs.eventPath, external_node_path_namespaceObject.join(rtSrc, "event.json"));
+    guestEventPath = `${DEFAULT_RUNTIME_DIR}/event.json`;
+    log("copied event.json onto the /__rt runtime mount (GITHUB_EVENT_PATH repointed).");
+  }
+
+  // Guest-side diagnostics helpers (report-error/warning/notice/incomplete), off-PATH
+  // in /__rt/helpers, surfaced to the agent via $MV_HELPERS_DIR.
+  const helpersDir = external_node_path_namespaceObject.join(rtSrc, "helpers");
+  external_node_fs_namespaceObject.mkdirSync(helpersDir, { recursive: true });
+  for (const [name, body] of Object.entries(generateHelperScripts())) {
+    const p = external_node_path_namespaceObject.join(helpersDir, name);
+    external_node_fs_namespaceObject.writeFileSync(p, body);
+    external_node_fs_namespaceObject.chmodSync(p, 0o755);
+  }
 
   // 5c. The Copilot CLI mount (vdc): the fetched binary dir, mounted with a discard overlay.
   const copilotSrc = copilotDir;
@@ -57332,6 +57476,11 @@ async function main() {
     }
   }
   if (guestEventPath) agentEnv += `export GITHUB_EVENT_PATH=${guestEventPath}\n`;
+  // Well-known dirs for the guest-side tools, so prompts/authors never hardcode paths:
+  // $MV_HELPERS_DIR (report-* diagnostics helpers, always present) and $MV_MCP_DIR (the
+  // MCP shims, only when there are servers).
+  agentEnv += `export MV_HELPERS_DIR=${DEFAULT_HELPERS_DIR}\n`;
+  if (harnessHasContent) agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
   external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(rtSrc, "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above). Empty by default — every
   // server reaches the guest as a /__mcp shim, not a native guest MCP entry.
@@ -57402,7 +57551,11 @@ async function main() {
     }
   }
   setStatus(status);
-  if (status !== "completed") setFailed(`agent did not complete (status=${status}).`);
+  if (status === "incomplete") {
+    setFailed("agent reported it could not complete the task (report-incomplete).");
+  } else if (status !== "completed") {
+    setFailed(`agent did not complete (status=${status}).`);
+  }
 }
 
 /**
@@ -57422,19 +57575,34 @@ async function bootVm(seconds, consoleLog) {
   } catch {
     /* best effort */
   }
+  // The guest serial console is untrusted. Capture it RAW to console.log (grading reads
+  // ground truth), but re-emit to the step's live log through an allowlist filter so a
+  // compromised/hallucinating guest can't inject capability workflow commands
+  // (::set-output::, ::add-path::, ::stop-commands::, …). silent:true stops @actions/exec
+  // from echoing the raw stream itself.
   const fileStream = external_node_fs_namespaceObject.createWriteStream(consoleLog);
-  const capture = (chunk) => fileStream.write(chunk);
+  let pending = "";
+  const onData = (chunk) => {
+    fileStream.write(chunk); // raw capture for grading
+    pending += chunk.toString("utf8");
+    let nl;
+    while ((nl = pending.indexOf("\n")) !== -1) {
+      const line = pending.slice(0, nl);
+      pending = pending.slice(nl + 1);
+      process.stdout.write(filterConsoleLine(line) + "\n");
+    }
+  };
   await exec_exec(
     "sudo",
     ["timeout", "-k", "5", String(seconds), external_node_path_namespaceObject.join(WORK, "firecracker"), "--api-sock", sock, "--config-file", external_node_path_namespaceObject.join(WORK, "vm_config.json")],
-    { ignoreReturnCode: true, listeners: { stdout: capture, stderr: capture } }
+    { silent: true, ignoreReturnCode: true, listeners: { stdout: onData, stderr: onData } }
   );
+  if (pending.length) process.stdout.write(filterConsoleLine(pending) + "\n");
   await new Promise((r) => fileStream.end(r));
 }
 
 function gradeConsole(consoleLog) {
-  const text = external_node_fs_namespaceObject.readFileSync(consoleLog, "utf8");
-  return /GUEST: starting copilot/.test(text) ? "completed" : "failed";
+  return gradeConsoleText(external_node_fs_namespaceObject.readFileSync(consoleLog, "utf8"));
 }
 
 function freshDir(p) {

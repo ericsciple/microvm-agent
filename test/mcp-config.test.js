@@ -113,3 +113,20 @@ test("rejects invalid JSON in mcp-config", () => {
 test("rejects a non-object mcp-config", () => {
   assert.throws(() => buildGuestMcpConfig({ ...base, mcpConfig: "[]" }), /must be a JSON object/);
 });
+
+test("rejects an unsafe server name (used verbatim as the /__mcp shim filename)", () => {
+  for (const bad of ["../evil", "a/b", "has space", "with:colon", ""]) {
+    const mcpConfig = JSON.stringify({ mcpServers: { [bad]: { command: "x" } } });
+    assert.throws(
+      () => buildGuestMcpConfig({ ...base, mcpConfig }),
+      /invalid/,
+      `server name ${JSON.stringify(bad)} should be rejected`
+    );
+  }
+});
+
+test("accepts safe server names (letters, digits, . _ -)", () => {
+  const mcpConfig = JSON.stringify({ mcpServers: { "safe-outputs.v2_1": { command: "x" } } });
+  const { hostServers } = buildGuestMcpConfig({ ...base, mcpConfig });
+  assert.ok(hostServers.some((s) => s.name === "safe-outputs.v2_1"));
+});

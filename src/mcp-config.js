@@ -114,6 +114,14 @@ export function buildGuestMcpConfig(inputs) {
  * @returns {HostServer}
  */
 function normalizeCustomServer(name, rawDef) {
+  // The server name is used verbatim as the /__mcp/<name> shim filename (and as a
+  // per-instance state-dir segment), so reject anything outside a safe charset before
+  // it can escape the directory or break shim generation.
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+    throw new Error(
+      `mcp-config server name '${name}' is invalid: use only letters, digits, '.', '_', or '-' (1–64 chars).`
+    );
+  }
   const def = rawDef && typeof rawDef === "object" ? rawDef : {};
   const { env = {}, command, args = [], ...rest } = def;
   if (env && typeof env !== "object") {
