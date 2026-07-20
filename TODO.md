@@ -255,6 +255,11 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     (success is the default; the agent only speaks up to force failure). A symmetric
     `set_result(success|failure)` is possible but heavier (agent must always call it; forgetting =
     ambiguous). Candidates: `report_incomplete` / `report_failure` / `fail`. Decide the name.
+  - **Preamble edit required.** `generateMcpPreamble` (`src/guest-assets.js`) must add a short
+    **behavioral** instruction — "if you cannot complete the task, call `report_incomplete` with a
+    reason" (+ `report_error`/`report_warning` to surface problems). Lazy `<server> --help` discovery
+    conveys a tool's *inputs*, not *when to use it*, so this status-affecting signal won't fire unless
+    the agent is explicitly told. Deliberate exception to the tiny/lazy-preamble rule (1–2 lines).
   - Why these are **not** safe outputs: `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs =
     optional GitHub-write MCP; diagnostics = harness built-in.
 
