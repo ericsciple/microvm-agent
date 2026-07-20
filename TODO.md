@@ -214,14 +214,26 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 - **Reconsider the zero-dependency stance — adopt a few well-maintained deps.** The action is currently
   zero-dependency ESM by choice, but that means we hand-roll common things and miss upstream security
   updates / bug fixes. @ericsciple: "Having dependencies for common things means we actually get security
-  updates, etc." Adopt vetted, high-use packages where they clearly beat hand-rolling. Candidates:
-  - **`@actions/tool-cache`** — replace our hand-rolled fetch+cache in `provision.sh` (download, extract,
-    `cacheDir`/`find`, keyed by version). The obvious first one (@ericsciple called it out).
-  - **`@actions/core`** — replace `src/inputs.js` (`getInput`/`getBooleanInput`, `setOutput`, `setFailed`,
-    `addPath`, masking, grouping/annotations). Standard, first-party, tiny.
-  - **`@modelcontextprotocol/sdk`** — replace the hand-rolled stdio MCP client (`src/mcp-client.js`,
-    initialize/`tools/list`/`tools/call` handshake) with the official client. Keeps us current with the
-    MCP spec.
+  updates, etc."
+  - **Dependency trust bar (@ericsciple's rule):** only take a production dependency on something
+    **trusted, reliable, and high-use (popular)** — "I don't want to take a production dependency on
+    something that a college kid wrote that is barely functional." Prefer the **first-party GitHub Actions
+    toolkit (`@actions/*`)** by default; a non-toolkit dep must clear the same bar (reputable org, large
+    download counts, active maintenance). Vet provenance + weekly downloads before adopting.
+  - Candidates that CLEAR the bar (verified 2026-07-19):
+    - **`@actions/tool-cache`** (~481k/wk, first-party) — replace our hand-rolled fetch+cache in
+      `provision.sh` (download, extract, `cacheDir`/`find`, keyed by version). @ericsciple called it out.
+    - **`@actions/core`** (~11.7M/wk, first-party) — replace `src/inputs.js` (`getInput`/`getBooleanInput`,
+      `setOutput`, `setFailed`, `addPath`, secret masking, grouping/annotations).
+    - **`@actions/exec`** (~10.7M/wk, first-party) — replace `execFileSync`/`spawn` script calls; nice
+      built-in command tracing to the step log. @ericsciple called it out.
+    - **`@modelcontextprotocol/sdk`** (~39.6M/wk, MIT, the official `modelcontextprotocol/typescript-sdk` —
+      the MCP standard's own org, Anthropic-originated) — replace the hand-rolled stdio MCP client
+      (`src/mcp-client.js`, initialize/`tools/list`/`tools/call` handshake) with the official client. This
+      is the canonical first-party SDK for the protocol, not a hobby project — clears the bar.
+  - Deps to VET carefully (from the gateway research — do NOT adopt without checking against the bar):
+    `mockttp` (commercial-backed, HTTP Toolkit — likely OK), `selfsigned` (~17.9M/wk, community),
+    `http2-wrapper` (smaller). **Avoid `node-forge`** (unmaintained per the mockttp author).
   - Lower value / keep as-is: the dispatch HTTP server (`node:http` is fine), `dispatch.js` arg conversion.
   - Trade-off to weigh: a `package.json` with deps means either committing `node_modules`/a bundle (a JS
     action must ship its deps) or a build step — currently we ship none. Adopting deps likely means adding
