@@ -225,50 +225,35 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
   Weigh usability (too narrow → the agent can't see what it needs) vs. least privilege. (`src/mcp-config.js`
   `GITHUB_TOOLSETS`/`GITHUB_READ_ONLY`.)
 
-- **Built-in "agent diagnostics/report" MCP (always-on) → Actions annotations + step status.** The agent
-  needs a structured way to say "I'm blocked" that surfaces the Actions-native way. Add a **built-in**
-  MCP server (delivered as a `/__mcp` shim, always present, NOT user-configured — independent of any
-  safe-outputs config) exposing tools like `report_error` / `report_warning` / `report_missing_tool` /
-  `report_missing_data` / `report_incomplete` / `noop`. The **host-side** dispatch handler turns these
-  into `core.error()` / `core.warning()` annotations.
-  - **Inline, not post-processed.** The dispatch server is **alive during the run** (it answers the
-    guest's shim calls in real time), so `core.error()` fires the instant the agent calls the tool →
-    the `::error::` line appears **inline in the step log** (and as an annotation) right then. The
-    **only** thing deferred to teardown is the final step **conclusion** — `report_incomplete` →
-    `setFailed`/`status=failed` even if the agent exited 0 — which is inherent to how a step ends, not a
-    post-processing pass over messages.
-  - **Relationship to the stdout allowlist filter (below).** With that filter in place, the agent can
-    surface plain `error`/`warning` just by printing `::error::…` (passed through inline). So this MCP
-    is mainly for the **status-affecting** signal (`report_incomplete` → fail the step) and structured
-    outputs; plain error/warning text can flow through the filter instead. Both give inline behavior.
+- **Agent → Actions error surfacing (guest-side helper scripts; no MCP needed).** The agent needs a way
+  to surface errors/warnings inline and to declare failure, the Actions-native way. **Preferred design:
+  tiny guest-side helper scripts on PATH** (`report-error`, `report-warning`, `report-notice`,
+  `report-incomplete`), delivered per-run (on `/__rt` or `/__mcp`, added to PATH — NOT baked into the
+  prebuilt rootfs). Each takes the raw message as an arg and does the workflow-command **escaping**
+  (`%`→`%25`, `\r`→`%0D`, `\n`→`%0A`) so the **agent never hand-formats** `::error::` (the fragile part).
+  The script prints `::error::<escaped>` to the guest console → the stdout allowlist filter (below) passes
+  it → the runner renders it **inline**. All **guest-side, no dispatch round-trip.**
+  - **Status signal is the one thing needing the host.** Printing `::error::` can't fail the step (that's
+    microvm-agent's exit code, not a message). `report-incomplete` (name open: `report-failure`/`fail`,
+    asymmetric fail-only — success is the default) prints an `::error::` **plus a machine-readable
+    sentinel**; microvm-agent's **console grader already reads the console**, detects the sentinel, and
+    does `setFailed`. So even this is a guest helper + the existing grader — **no diagnostics MCP.** (An
+    in-process MCP dispatch handler stays a possible alternative if we later want structured
+    outputs/aggregation, but helper+sentinel is simpler and meets the requirement.)
   - **How step success/fail actually works (result model).** GitHub Actions decides a step's result
-    purely from the **exit code of the step process** — for us that's `node dist/index.js`
-    (microvm-agent), NOT the guest agent. `core.setFailed()` = `process.exitCode=1` + an `::error::`
-    annotation. **There is no `::set-result::` workflow command.** The Copilot CLI's exit code lives
-    inside the guest and never becomes the step result directly; it surfaces to microvm-agent via the
-    console (`=== GUEST: AGENT_EXIT=$? ===`). So the step result is decided by microvm-agent in three
-    layers: (1) infra/boot failure → fail (detected by the harness); (2) **guest agent exited non-zero**
-    → fail (harness reads `AGENT_EXIT` — see the gradeConsole bug below); (3) **agent exited 0 but
-    couldn't do the job** → the agent must *declare* this, since neither an exit code nor a workflow
-    command can express "ran fine but task unachievable." Layer 3 is the ONLY one that needs the MCP.
-  - **Naming (open):** `report_incomplete` is gh-aw's term — it's an **asymmetric, fail-only** signal
-    (success is the default; the agent only speaks up to force failure). A symmetric
-    `set_result(success|failure)` is possible but heavier (agent must always call it; forgetting =
-    ambiguous). Candidates: `report_incomplete` / `report_failure` / `fail`. Decide the name.
+    purely from the **exit code of the step process** — for us `node dist/index.js` (microvm-agent), NOT
+    the guest agent. `core.setFailed()` = `process.exitCode=1` + an `::error::` annotation. **There is no
+    `::set-result::` workflow command.** The Copilot CLI's exit code lives in the guest and surfaces via
+    the console (`=== GUEST: AGENT_EXIT=$? ===`). microvm-agent grades in three layers: (1) infra/boot
+    failure → fail; (2) **guest agent exited non-zero** → fail (read `AGENT_EXIT` — see gradeConsole bug
+    below); (3) **agent exited 0 but couldn't do the job** → the agent declares via `report-incomplete`
+    (neither exit code nor a workflow command can express "ran fine but unachievable").
   - **Preamble edit required.** `generateMcpPreamble` (`src/guest-assets.js`) must add a short
-    **behavioral** instruction — "if you cannot complete the task, call `report_incomplete` with a
-    reason" (+ `report_error`/`report_warning` to surface problems). Lazy `<server> --help` discovery
-    conveys a tool's *inputs*, not *when to use it*, so this status-affecting signal won't fire unless
-    the agent is explicitly told. Deliberate exception to the tiny/lazy-preamble rule (1–2 lines).
-  - **Delivery: reuse the existing shim; add an in-process dispatch handler.** The diagnostics tools ride
-    the standard `/__mcp/<server>` shim (`generateServerShim`) — no bespoke script. That shim builds the
-    call with `jq --args "$@"`, which safely encodes **newlines**/quotes/special chars; and host-side
-    `core.error()` escapes the message for `::error::` (`\n`→`%0A`), so multi-line messages round-trip.
-    The one real change is a **built-in/in-process handler** in `dispatch.js`: the diagnostics "server"
-    isn't an external stdio MCP process to spawn — its `tools/call` runs in-process and calls `core.*` /
-    the fail path directly. (Usability: a multi-line message must be one quoted argument.)
+    **behavioral** instruction — "if you cannot complete the task, run `report-incomplete \"<reason>\"`" (+
+    `report-error`/`report-warning` to surface problems). The agent needs to be told *when* to use them.
+    Deliberate exception to the tiny-preamble rule (1–2 lines).
   - Why these are **not** safe outputs: `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs =
-    optional GitHub-write MCP; diagnostics = harness built-in.
+    optional GitHub-write MCP; error surfacing = harness built-in.
 
 - **Consider a prompt-file input.** Today `prompt` is an inline string input (verbose in YAML for long
   prompts, no syntax highlighting, awkward to reuse/version). Consider adding a `prompt-file` input (a
