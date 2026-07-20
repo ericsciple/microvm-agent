@@ -227,12 +227,20 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 - **Agent → Actions error surfacing (guest-side helper scripts; no MCP needed).** The agent needs a way
   to surface errors/warnings inline and to declare failure, the Actions-native way. **Preferred design:
-  tiny guest-side helper scripts on PATH** (`report-error`, `report-warning`, `report-notice`,
-  `report-incomplete`), delivered per-run (on `/__rt` or `/__mcp`, added to PATH — NOT baked into the
-  prebuilt rootfs). Each takes the raw message as an arg and does the workflow-command **escaping**
-  (`%`→`%25`, `\r`→`%0D`, `\n`→`%0A`) so the **agent never hand-formats** `::error::` (the fragile part).
-  The script prints `::error::<escaped>` to the guest console → the stdout allowlist filter (below) passes
-  it → the runner renders it **inline**. All **guest-side, no dispatch round-trip.**
+  tiny guest-side helper scripts** (`report-error`, `report-warning`, `report-notice`,
+  `report-incomplete`) in a **harness-owned dir, OFF-PATH** (consistent with the `/__mcp` shims — not on
+  PATH, so they don't shadow real tools), delivered per-run (on `/__rt` or `/__mcp`, granted via
+  `--add-dir`; NOT baked into the prebuilt rootfs). Each takes the raw message as an arg and does the
+  workflow-command **escaping** (`%`→`%25`, `\r`→`%0D`, `\n`→`%0A`) so the **agent never hand-formats**
+  `::error::` (the fragile part). The script prints `::error::<escaped>` to the guest console → the stdout
+  allowlist filter (below) passes it → the runner renders it **inline**. All **guest-side, no dispatch
+  round-trip.**
+  - **Well-known env vars for the tool dirs (no hardcoded paths).** Surface both the MCP shims dir and the
+    helpers dir via well-known env vars — `$MV_MCP_DIR`, `$MV_TOOLS_DIR` (names open) — exported into the
+    guest (agent.env). Authors/prompts then use `"$MV_MCP_DIR/<server>"` and `"$MV_TOOLS_DIR/report-error"`
+    instead of hardcoding `/__mcp` / the helper path, so we can change the actual dir names freely. **Also
+    fix the existing preamble**, which hardcodes `/__mcp` (`generateMcpPreamble`) → use `$MV_MCP_DIR`.
+    (Could colocate both in one dir + one var; two keeps forwarders vs. local helpers distinct.)
   - **Status signal is the one thing needing the host.** Printing `::error::` can't fail the step (that's
     microvm-agent's exit code, not a message). `report-incomplete` (name open: `report-failure`/`fail`,
     asymmetric fail-only — success is the default) prints an `::error::` **plus a machine-readable
@@ -249,9 +257,9 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     below); (3) **agent exited 0 but couldn't do the job** → the agent declares via `report-incomplete`
     (neither exit code nor a workflow command can express "ran fine but unachievable").
   - **Preamble edit required.** `generateMcpPreamble` (`src/guest-assets.js`) must add a short
-    **behavioral** instruction — "if you cannot complete the task, run `report-incomplete \"<reason>\"`" (+
-    `report-error`/`report-warning` to surface problems). The agent needs to be told *when* to use them.
-    Deliberate exception to the tiny-preamble rule (1–2 lines).
+    **behavioral** instruction — "if you cannot complete the task, run `\"$MV_TOOLS_DIR/report-incomplete\"
+    \"<reason>\"`" (+ report-error/report-warning to surface problems). The agent needs to be told *when*
+    to use them. Deliberate exception to the tiny-preamble rule (1–2 lines).
   - Why these are **not** safe outputs: `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs =
     optional GitHub-write MCP; error surfacing = harness built-in.
 
