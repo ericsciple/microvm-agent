@@ -241,6 +241,20 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     surface plain `error`/`warning` just by printing `::error::…` (passed through inline). So this MCP
     is mainly for the **status-affecting** signal (`report_incomplete` → fail the step) and structured
     outputs; plain error/warning text can flow through the filter instead. Both give inline behavior.
+  - **How step success/fail actually works (result model).** GitHub Actions decides a step's result
+    purely from the **exit code of the step process** — for us that's `node dist/index.js`
+    (microvm-agent), NOT the guest agent. `core.setFailed()` = `process.exitCode=1` + an `::error::`
+    annotation. **There is no `::set-result::` workflow command.** The Copilot CLI's exit code lives
+    inside the guest and never becomes the step result directly; it surfaces to microvm-agent via the
+    console (`=== GUEST: AGENT_EXIT=$? ===`). So the step result is decided by microvm-agent in three
+    layers: (1) infra/boot failure → fail (detected by the harness); (2) **guest agent exited non-zero**
+    → fail (harness reads `AGENT_EXIT` — see the gradeConsole bug below); (3) **agent exited 0 but
+    couldn't do the job** → the agent must *declare* this, since neither an exit code nor a workflow
+    command can express "ran fine but task unachievable." Layer 3 is the ONLY one that needs the MCP.
+  - **Naming (open):** `report_incomplete` is gh-aw's term — it's an **asymmetric, fail-only** signal
+    (success is the default; the agent only speaks up to force failure). A symmetric
+    `set_result(success|failure)` is possible but heavier (agent must always call it; forgetting =
+    ambiguous). Candidates: `report_incomplete` / `report_failure` / `fail`. Decide the name.
   - Why these are **not** safe outputs: `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs =
     optional GitHub-write MCP; diagnostics = harness built-in.
 
@@ -340,6 +354,13 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
      a **specific Python minor** (fragile: a cp312 wheel breaks on a future 3.13 runner). Least preferred.
 
 ## Key correctness notes
+
+- **[BUG — grading gap] `gradeConsole` ignores the agent's exit code.** `gradeConsole` (`src/main.js:362`)
+  returns "completed" whenever the console contains `GUEST: starting copilot` — it does **not** check the
+  `=== GUEST: AGENT_EXIT=$? ===` line the init script emits (`src/guest-assets.js:181`). So a Copilot CLI
+  that **starts and then crashes** (non-zero exit) currently grades as **success** and the step passes.
+  Fix: parse `AGENT_EXIT=N` and treat non-zero as failure (result-model layer 2, above). This is
+  independent of the diagnostics MCP (layer 3, the exited-0-but-unachievable case).
 
 - **[BUG — security] Guest console is streamed raw to the action's stdout → workflow-command injection.**
   `bootVm` runs firecracker via `exec.exec`, which echoes the guest serial console to the step's stdout
