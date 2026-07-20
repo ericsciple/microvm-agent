@@ -212,6 +212,14 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 ## Options on the table (future)
 
+- **Benchmark Firecracker startup vs. a Docker-sandbox (SBX) approach.** Measure end-to-end
+  time-to-agent-running for our Firecracker microVM path vs. running the agent in a Docker container
+  sandbox (à la gh-aw's AWF: container + squid egress proxy, no hardware VM). Compare: boot/startup
+  latency (we've seen Firecracker boot ~1.3s + rootfs/mount build), per-run overhead (image pulls vs.
+  our fetch+mount), warm-cache behavior, and the security tradeoff (hardware-VM isolation + zero-cred
+  guest vs. shared-kernel container). Goal: quantify what the microVM isolation costs us in startup so
+  we can decide where each model fits.
+
 - **Reconsider the zero-dependency stance — adopt a few well-maintained deps. [DONE 2026-07-19]**
   The action WAS zero-dependency ESM; hand-rolling common things meant missing upstream security updates.
   @ericsciple: "Having dependencies for common things means we actually get security updates, etc."
