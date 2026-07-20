@@ -242,9 +242,15 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     fix the existing preamble**, which hardcodes `/__mcp` (`generateMcpPreamble`) → use `$MV_MCP_DIR`.
     (Could colocate both in one dir + one var; two keeps forwarders vs. local helpers distinct.)
     **Folder name:** `$MV_HELPERS_DIR = /__helpers` (matches `/__w`/`/__t`/`/__mcp`/`/__rt`); must be
-    `--add-dir`'d so the CLI can execute the helpers. Physical delivery hidden by the env var — dedicated
-    `/__helpers` RO mount OR colocate on `/__rt` (`/__rt/helpers`) to skip a virtio drive for a few tiny
-    scripts (leaning colocate). `MV_HELPERS_DIR` (not `MV_TOOLS_DIR`) avoids confusion with the tool cache.
+    `--add-dir`'d so the CLI can execute the helpers. **Decided: colocate on `/__rt` as `/__rt/helpers`**
+    (skips a virtio drive for a few tiny scripts; env var hides the path). `MV_HELPERS_DIR` (not
+    `MV_TOOLS_DIR`) avoids confusion with the tool cache.
+  - **Move `event.json` from `/__mcp` → `/__rt`.** It's per-run agent *context* (data), not a tool, so it
+    belongs with `/__rt`'s prompt/env/config; `/__mcp` becomes shims-only. Transparent (agent reads it via
+    `$GITHUB_EVENT_PATH`). Also **simplifies mount logic**: `/__mcp` is then created only when there are
+    MCP servers (today `harnessHasContent` also forces it just to carry event.json), while `/__rt` always
+    exists. Requires `--add-dir /__rt` (granted anyway for `/__rt/helpers`; safe — `/__rt` is all
+    non-secrets: fake token, public CA, prompt, no-secret mcp-config). (`src/main.js:199-201`.)
   - **Status signal is the one thing needing the host.** Printing `::error::` can't fail the step (that's
     microvm-agent's exit code, not a message). `report-incomplete` (name open: `report-failure`/`fail`,
     asymmetric fail-only — success is the default) prints an `::error::` **plus a machine-readable
