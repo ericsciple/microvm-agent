@@ -182,7 +182,8 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
       reproducible. The action pins a release tag (kernel + rootfs move together as a known set) via the
       `images-tag` input.
 - [x] **Kernel (hard-coded for now).** Pinned x86_64 Firecracker CI `vmlinux-6.1.176` (6.1 LTS), recorded
-      in `images.json`. No customer choice / enum yet.
+      in `images.json`, published **zstd-compressed** (`vmlinux.zst`, 43M -> 9.4M); the action decompresses
+      once (cached). No customer choice / enum yet.
 - [x] **Bare rootfs (bare tier only).** Debian bookworm-slim ext4 with the guest-init + Copilot runtime deps
       (`iproute2`, `util-linux`, `procps`, `ca-certificates`, `curl`, `jq`, `git`, **`libstdc++6`**). NO
       Copilot/shims/event/CA baked. glibc **2.36** recorded. Ships a generic `/init` stub that mounts the
@@ -202,11 +203,30 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
       (`preflightRootfs` in main.js) reads the rootfs ext4 with `debugfs` (no mount): rejects musl / missing
       libstdc++ / glibc < 2.28 with an actionable error, before boot.
 - [x] **Open items (resolved):** repo name = `microvm-images`; glibc floor X = **2.28**; kernel provenance =
-      vendor the pinned Firecracker CI kernel (6.1.176); ext4 compression = **zstd -19** (~38 MB); cache keyed
-      by `images-tag` so a harness ref maps to a known {kernel, rootfs} set. Copilot build: still fetched as
-      `latest` (cached) — pinning an exact Copilot version is a future nicety.
+      vendor the pinned Firecracker CI kernel (6.1.176); ext4 compression = **zstd -19** (~38 MB), kernel
+      likewise (`vmlinux.zst`, 9.4 MB); the images repo + tag are **hardcoded** in `main.js` (a version of
+      the action maps to a known {kernel, rootfs} set) — NOT user inputs; only a `rootfs` override input
+      remains. Copilot build: still fetched as `latest` (cached) — pinning an exact Copilot version is a
+      future nicety.
 
 ## Options on the table (future)
+
+- **Reconsider the zero-dependency stance — adopt a few well-maintained deps.** The action is currently
+  zero-dependency ESM by choice, but that means we hand-roll common things and miss upstream security
+  updates / bug fixes. @ericsciple: "Having dependencies for common things means we actually get security
+  updates, etc." Adopt vetted, high-use packages where they clearly beat hand-rolling. Candidates:
+  - **`@actions/tool-cache`** — replace our hand-rolled fetch+cache in `provision.sh` (download, extract,
+    `cacheDir`/`find`, keyed by version). The obvious first one (@ericsciple called it out).
+  - **`@actions/core`** — replace `src/inputs.js` (`getInput`/`getBooleanInput`, `setOutput`, `setFailed`,
+    `addPath`, masking, grouping/annotations). Standard, first-party, tiny.
+  - **`@modelcontextprotocol/sdk`** — replace the hand-rolled stdio MCP client (`src/mcp-client.js`,
+    initialize/`tools/list`/`tools/call` handshake) with the official client. Keeps us current with the
+    MCP spec.
+  - Lower value / keep as-is: the dispatch HTTP server (`node:http` is fine), `dispatch.js` arg conversion.
+  - Trade-off to weigh: a `package.json` with deps means either committing `node_modules`/a bundle (a JS
+    action must ship its deps) or a build step — currently we ship none. Adopting deps likely means adding
+    a bundler (esbuild/ncc) + `dist/`, which is the main reason we went zero-dep. Decide bundler vs. vendored
+    `node_modules` when we take this on. **safe-outputs** (also zero-dep) has the same question.
 
 - **Node-native TLS-intercepting gateway (drop the mitmproxy/Python dependency).** Today the
   credential gateway is `mitmproxy` (`mitmdump` + `gw_addon.py`), which the harness installs at
@@ -235,23 +255,26 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     - **The catch for ALL of them:** mockttp / go-mitmproxy / pure-Node all require **explicit proxy mode**
       (set `HTTPS_PROXY` in the guest, or handle `SO_ORIGINAL_DST` which Node lacks). Only mitmproxy
       preserves our current transparent, un-opt-out-able interception out of the box.
-    - **Recommendation: DEFER; revisit after the prebuilt-image decision.** The main motivation (avoid the
-      per-run pip install) mostly **evaporates if we bake mitmproxy into a prebuilt base image** — then we
-      keep transparent mode (the strongest posture) at zero per-run cost. Only pursue a replacement if we
-      commit to **zero-Python-in-image**, in which case **mockttp (explicit proxy mode)** is the top pick.
+    - **Recommendation: DEFER (host-side concern, independent of the guest prebuilt images).** The
+      motivation is dropping the per-run `pip install mitmproxy` — a **HOST** dependency. NOTE (correcting an
+      earlier conflation): mitmproxy runs on the host, so the prebuilt **guest** kernel/rootfs work does
+      **not** touch it. The clean way to drop the per-run install is to **bundle mitmproxy host-side** (see
+      the next item), which keeps transparent mode. Only build a Node/other gateway if we specifically want
+      **zero Python on the host**, in which case **mockttp (explicit proxy mode)** is the top pick.
 
 - **Bundle mitmproxy with the action (drop the per-run `pip install`, keep transparent mode).** Today
   `provision.sh` runs `pip install mitmproxy` (needs host Python+pip+network, compiles native wheels).
   Three ways to bundle it instead, in order of preference:
-  1. **⭐ Official Docker image** — run the gateway as `docker run --network host -v <gw_addon.py> …
-     mitmproxy/mitmproxy:12.2.3 mitmdump …` (pinned; ~103 MB image). **Requirement becomes Docker, which
-     the harness ALREADY requires** (rootfs built via `docker export`; github-mcp shim runs via Docker) —
-     **no host Python at all**, no ABI drift, reproducible. `--network host` preserves `--mode transparent`
-     (binds `:8080` in the host netns, sees the iptables REDIRECT, `SO_ORIGINAL_DST` intact). Mount
-     `gw_addon.py`, pass `GW_LANES`/`EGRESS_ALLOW` via `-e`, and a volume for `GW_LOG_DIR`. Folds into the
-     prebuilt-image work: per-run cost becomes a cached image pull, not a pip compile.
-  2. **Standalone PyInstaller binary** (~119 MB, embeds its own Python) → **zero host requirements**, but
-     too big to commit; fetch at provision (like Firecracker/kernel) or host as a release asset.
+  1. **⭐ Standalone binary from the images release** — now that the guest rootfs is prebuilt (no docker on
+     the default path), the tidiest option is to publish the mitmproxy PyInstaller binary (~119 MB, embeds
+     its own Python) as a `microvm-images` release asset and `curl` + cache it in `provision.sh` (exactly
+     like the kernel/rootfs). **Zero host Python, no docker.** Keeps `--mode transparent`. Compresses well
+     for the asset. Preferred because it fits the fetch-and-cache pattern we already use.
+  2. **Official Docker image** — `docker run --network host -v <gw_addon.py> … mitmproxy/mitmproxy:12.2.3
+     mitmdump …` (pinned; ~103 MB). No host Python, no ABI drift. BUT docker is **no longer** otherwise
+     required on the default path (rootfs is prebuilt; the github-mcp shim is the only remaining docker
+     use, and only in shim mode), so this would re-introduce a docker dependency. `--network host`
+     preserves transparent mode; pass `GW_LANES`/`EGRESS_ALLOW` via `-e`, volume for `GW_LOG_DIR`.
   3. **Vendor `cp312-manylinux` wheels / a frozen venv** + `pip install --no-index` → requirement becomes
      a **specific Python minor** (fragile: a cp312 wheel breaks on a future 3.13 runner). Least preferred.
 

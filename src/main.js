@@ -83,9 +83,16 @@ const runScript = (name, args = [], extraEnv = {}) =>
     env: { ...process.env, ...extraEnv },
   });
 
+// Prebuilt guest artifacts: the pinned microvm-images release the harness fetches the
+// kernel + bare rootfs from. Hardcoded (not a user input) — a given version of this
+// action maps to a known-compatible {kernel, rootfs} set. Bump these together with the
+// action when cutting a new images release.
+const IMAGES_REPO = "ericsciple/microvm-images";
+const IMAGES_TAG = "v0.0.1";
+
 // Env passed to provision.sh: which images release + Copilot build to fetch.
 function provisionEnv(inputs) {
-  const env = { IMAGES_REPO: inputs.imagesRepo, IMAGES_TAG: inputs.imagesTag };
+  const env = { IMAGES_REPO, IMAGES_TAG };
   if (inputs.copilotUrl) env.COPILOT_URL = inputs.copilotUrl;
   return env;
 }

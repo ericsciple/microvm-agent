@@ -71,14 +71,6 @@ inputs:
       GITHUB_TOKEN environment variable.
     required: false
     default: ""
-  images-repo:
-    description: "Repo publishing the prebuilt guest kernel + bare rootfs releases."
-    required: false
-    default: "ericsciple/microvm-images"
-  images-tag:
-    description: "Release tag in images-repo to fetch the pinned kernel + rootfs from."
-    required: false
-    default: "v0.0.1"
   rootfs:
     description: >-
       Advanced: path to a custom guest rootfs ext4 to boot instead of the fetched bare

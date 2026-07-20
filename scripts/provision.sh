@@ -42,8 +42,13 @@ dl() { # dl <url> <out>  — download only if missing
 
 REL="https://github.com/${IMAGES_REPO}/releases/download/${IMAGES_TAG}"
 
-# Guest kernel (pinned) — from the images release, cached, copied into WORKDIR.
-dl "${REL}/vmlinux" "$CACHE/vmlinux"
+# Guest kernel (pinned) — compressed asset from the images release; decompress once
+# (Firecracker boots an uncompressed kernel), cached, then copy into WORKDIR.
+dl "${REL}/vmlinux.zst" "$CACHE/vmlinux.zst"
+if [ ! -s "$CACHE/vmlinux" ]; then
+  echo "decompressing kernel"
+  zstd -dq -f "$CACHE/vmlinux.zst" -o "$CACHE/vmlinux"
+fi
 cp "$CACHE/vmlinux" "$WORKDIR/vmlinux"
 
 # Bare rootfs (pinned) — fetch the compressed ext4 once, decompress once.
