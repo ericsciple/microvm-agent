@@ -1,14 +1,13 @@
-// Read and normalize action inputs.
-//
-// GitHub Actions passes inputs as INPUT_<NAME> env vars (uppercased, spaces->_).
-// Kept dependency-free (no @actions/core).
+// Read and normalize action inputs (via @actions/core).
+
+import * as core from "@actions/core";
 
 const MOUNT_MODES = ["none", "workspace", "workspace+toolcache"];
 
+// core.getInput reads INPUT_<NAME> (uppercased, spaces->_), trims, and returns "".
 function input(name, fallback = "") {
-  const key = "INPUT_" + name.replace(/ /g, "_").toUpperCase();
-  const v = process.env[key];
-  return v === undefined || v === "" ? fallback : v;
+  const v = core.getInput(name);
+  return v === "" ? fallback : v;
 }
 
 export function readInputs() {

@@ -6,7 +6,7 @@ KVM-capable Codespace.
 
 | Script | Purpose |
 |---|---|
-| `provision.sh <workdir>` | Grant `/dev/kvm` access; fetch the pinned kernel + bare rootfs from the `microvm-images` release, the Copilot CLI tarball, and the Firecracker binary; install mitmproxy. Caches artifacts (tool-cache pattern). |
+| `provision.sh <workdir>` | Host setup: grant `/dev/kvm` access, install `zstd`/`e2fsprogs` if missing, fetch the Firecracker binary, and install mitmproxy. The guest artifacts (kernel, rootfs, Copilot) are fetched separately by the action via `@actions/tool-cache` (`src/artifacts.js`). |
 | `build-mount-image.sh <src> <out.ext4> [margin_mb]` | Pack a host dir into a virtio-block ext4 via `mkfs.ext4 -d` (no loop mount). Used for the runtime config, Copilot, `/__mcp`, workspace, and tool-cache mounts. |
 | `network-up.sh` | tap0 + NAT + host-enforced deny-all firewall + `:443`→gateway redirect + host dispatch port. |
 | `network-down.sh` | Best-effort teardown of the above. |

@@ -38,8 +38,8 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
 - [x] `ericsciple/safe-outputs` app — done and expanded: `add-labels`, `add-comment`,
       `update-issue`, `create-pull-request`, plus scope-widening flags + sanitization. Run
       `npm test` there (61 tests green).
-- [x] **Scaffold → runnable action.** `action.yml` `runs.main` points directly at `src/main.js`
-      (zero-dependency ESM via `"type":"module"`), so **no `ncc`/`dist` bundle is needed**. `main.js`
+- [x] **Scaffold → runnable action.** `action.yml` `runs.main` points at `dist/index.js` (bundled from
+      `src/main.js` with `@vercel/ncc`; run `npm run build` after changing `src/`). `main.js`
       orchestrates the whole flow: inputs → MCP secret split → tool discovery → guest-asset generation
       → provision → rootfs → gateway + dispatch → boot → teardown → `status` output.
 - [x] **Provision** (bash under `scripts/`, called from `main.js`): `provision.sh` (KVM access +
@@ -161,9 +161,9 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
   the host-side server that advertises that tool. Tool names are discovered by launching each server
   and calling `tools/list` at startup (`src/dispatch.js` / `src/mcp-client.js`). Validated locally
   end-to-end (including through a real microVM).
-- [x] **Node build from a Codespace (RESOLVED).** No bundler needed — the action is zero-dependency
-  ESM (`"type":"module"`) and `runs.main` points directly at `src/main.js`, so there's no `dist/`
-  to build or commit.
+- [x] **Node build from a Codespace (RESOLVED, then UPDATED 2026-07-19).** Originally zero-dep (no bundle);
+  now the action has deps and is bundled with `@vercel/ncc` into `dist/index.js` (committed). Build in a
+  Codespace with `npm run build` (don't build on @ericsciple's local machine).
 
 ## Prebuilt images: images repo, kernel, rootfs, mounted Copilot
 
@@ -190,10 +190,11 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
       per-run runtime config drive (vdb) and execs `/__rt/init.sh`. (Correction to the original note: the
       list needed the runtime deps + `libstdc++6`, not just "shell+jq+curl+git" — the Copilot binary NEEDs
       `libstdc++.so.6` + `libgcc_s.so.1` in addition to glibc.)
-- [x] **Fetch + mount** (`provision.sh`, tool-cache PATTERN via plain curl/fs — NOT `@actions/tool-cache`,
-      to keep the action zero-dependency): pinned kernel + bare rootfs (from the images release) + the
-      Copilot tarball, cached under `RUNNER_TOOL_CACHE/microvm-agent/<tag>`. The bare rootfs is decompressed
-      once; `main.js` boots a per-run sparse copy so the cache stays pristine. **Copilot is mounted** at
+- [x] **Fetch + mount** (now via **`@actions/tool-cache`** in `src/artifacts.js` — updated 2026-07-19 when we
+      adopted deps; was previously a hand-rolled curl/fs cache in provision.sh): pinned kernel + bare rootfs
+      (from the images release) + the Copilot tarball, downloaded/decompressed/extracted and cached under
+      `RUNNER_TOOL_CACHE` (warm-after-first-use). The bare rootfs is decompressed once; `main.js` boots a
+      per-run sparse copy so the cache stays pristine. **Copilot is mounted** at
       `/opt/copilot` with a **discard overlay** (RO lower + tmpfs upper — not pure RO, per @ericsciple: tools
       may write into their install dir) and put on PATH; not baked. Install-type mounts (copilot, workspace,
       tool cache) all use the discard overlay now; `/__mcp` stays pure RO (tamper-proof shims).
@@ -211,34 +212,23 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 ## Options on the table (future)
 
-- **Reconsider the zero-dependency stance — adopt a few well-maintained deps.** The action is currently
-  zero-dependency ESM by choice, but that means we hand-roll common things and miss upstream security
-  updates / bug fixes. @ericsciple: "Having dependencies for common things means we actually get security
-  updates, etc."
-  - **Dependency trust bar (@ericsciple's rule):** only take a production dependency on something
-    **trusted, reliable, and high-use (popular)** — "I don't want to take a production dependency on
-    something that a college kid wrote that is barely functional." Prefer the **first-party GitHub Actions
-    toolkit (`@actions/*`)** by default; a non-toolkit dep must clear the same bar (reputable org, large
-    download counts, active maintenance). Vet provenance + weekly downloads before adopting.
-  - Candidates that CLEAR the bar (verified 2026-07-19):
-    - **`@actions/tool-cache`** (~481k/wk, first-party) — replace our hand-rolled fetch+cache in
-      `provision.sh` (download, extract, `cacheDir`/`find`, keyed by version). @ericsciple called it out.
-    - **`@actions/core`** (~11.7M/wk, first-party) — replace `src/inputs.js` (`getInput`/`getBooleanInput`,
-      `setOutput`, `setFailed`, `addPath`, secret masking, grouping/annotations).
-    - **`@actions/exec`** (~10.7M/wk, first-party) — replace `execFileSync`/`spawn` script calls; nice
-      built-in command tracing to the step log. @ericsciple called it out.
-    - **`@modelcontextprotocol/sdk`** (~39.6M/wk, MIT, the official `modelcontextprotocol/typescript-sdk` —
-      the MCP standard's own org, Anthropic-originated) — replace the hand-rolled stdio MCP client
-      (`src/mcp-client.js`, initialize/`tools/list`/`tools/call` handshake) with the official client. This
-      is the canonical first-party SDK for the protocol, not a hobby project — clears the bar.
-  - Deps to VET carefully (from the gateway research — do NOT adopt without checking against the bar):
-    `mockttp` (commercial-backed, HTTP Toolkit — likely OK), `selfsigned` (~17.9M/wk, community),
-    `http2-wrapper` (smaller). **Avoid `node-forge`** (unmaintained per the mockttp author).
-  - Lower value / keep as-is: the dispatch HTTP server (`node:http` is fine), `dispatch.js` arg conversion.
-  - Trade-off to weigh: a `package.json` with deps means either committing `node_modules`/a bundle (a JS
-    action must ship its deps) or a build step — currently we ship none. Adopting deps likely means adding
-    a bundler (esbuild/ncc) + `dist/`, which is the main reason we went zero-dep. Decide bundler vs. vendored
-    `node_modules` when we take this on. **safe-outputs** (also zero-dep) has the same question.
+- **Reconsider the zero-dependency stance — adopt a few well-maintained deps. [DONE 2026-07-19]**
+  The action WAS zero-dependency ESM; hand-rolling common things meant missing upstream security updates.
+  @ericsciple: "Having dependencies for common things means we actually get security updates, etc."
+  **Adopted** (bundled with `@vercel/ncc` -> `dist/index.js`, `runs.main: dist/index.js`; `npm run build`
+  regenerates it; `node_modules` gitignored, `dist/` committed):
+  - **`@actions/core`** — `src/inputs.js` (getInput), outputs (`setOutput`), failure (`setFailed`), logging.
+  - **`@actions/exec`** — `runScript` + the firecracker boot (live command tracing to the step log).
+  - **`@actions/tool-cache`** — `src/artifacts.js` fetches/decompresses/extracts + caches kernel, rootfs,
+    Copilot under `RUNNER_TOOL_CACHE` (warm-after-first-use). `provision.sh` slimmed to host setup.
+  - **`@modelcontextprotocol/sdk`** — `src/mcp-client.js` now uses the official `Client` +
+    `StdioClientTransport` for the initialize/tools handshake (dispatch API unchanged).
+  - **Dependency trust bar (@ericsciple's rule, kept for future deps):** only take a production dependency
+    on something **trusted, reliable, high-use** — prefer first-party `@actions/*`; a non-toolkit dep must
+    clear the same bar (reputable org, large downloads, active maintenance). All four cleared it (verified
+    downloads/provenance). `@actions/exec` also added per @ericsciple (nice console tracing).
+  - Follow-up: **safe-outputs** is still zero-dep — same treatment (bundler + `@actions/*`) is a candidate.
+    A CI check that `dist/` is in sync with `src/` (rebuild + `git diff --exit-code`) would prevent drift.
 
 - **Node-native TLS-intercepting gateway (drop the mitmproxy/Python dependency).** Today the
   credential gateway is `mitmproxy` (`mitmdump` + `gw_addon.py`), which the harness installs at
@@ -305,7 +295,9 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
   custom MCP would need the automation policy path resolved.
 - **Node action, bash provisioning.** Logic (input parsing, MCP merge, safe-output wiring) in Node;
   low-level host setup shelled out to `scripts/*.sh`.
-- **Zero-dependency ESM action.** `runs.main` -> `src/main.js` directly; no `dist/` bundle to build.
+- **Bundled ESM action.** `src/*.js` (ESM) is bundled with `@vercel/ncc` to `dist/index.js`, which
+  `runs.main` points at. Deps: `@actions/core`, `@actions/exec`, `@actions/tool-cache`,
+  `@modelcontextprotocol/sdk`. Rebuild `dist/` with `npm run build` after changing `src/`.
 
 ## Design decisions — guest security model, MCP delivery, discovery (finalized 2026-07-18)
 

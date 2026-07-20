@@ -17,9 +17,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import * as core from "@actions/core";
+import * as exec from "@actions/exec";
+
 import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
 import { createDispatchServer } from "./dispatch.js";
+import { fetchArtifacts } from "./artifacts.js";
 import { generateServerShim, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_COPILOT_DIR } from "./guest-assets.js";
 import { translateToolCachePathEntries } from "./paths.js";
 
@@ -76,10 +80,12 @@ const GATEWAY_ENV = { ...process.env, PATH: `${LOCAL_BIN}:${process.env.PATH || 
 const GUEST_WORKSPACE_PATH = "/__w";
 const GUEST_TOOLCACHE_PATH = "/__t";
 
-const log = (m) => process.stderr.write(`[microvm-agent] ${m}\n`);
+const log = (m) => core.info(`[microvm-agent] ${m}`);
+// Run a provisioning script via @actions/exec (echoes the command + streams output
+// live to the step log). No secrets are passed as args (only IMAGES_*/COPILOT_URL and
+// mount paths), so the command echo is safe.
 const runScript = (name, args = [], extraEnv = {}) =>
-  execFileSync("bash", [path.join(SCRIPTS, name), ...args], {
-    stdio: "inherit",
+  exec.exec("bash", [path.join(SCRIPTS, name), ...args], {
     env: { ...process.env, ...extraEnv },
   });
 
@@ -89,21 +95,7 @@ const runScript = (name, args = [], extraEnv = {}) =>
 // action when cutting a new images release.
 const IMAGES_REPO = "ericsciple/microvm-images";
 const IMAGES_TAG = "v0.0.1";
-
-// Env passed to provision.sh: which images release + Copilot build to fetch.
-function provisionEnv(inputs) {
-  const env = { IMAGES_REPO, IMAGES_TAG };
-  if (inputs.copilotUrl) env.COPILOT_URL = inputs.copilotUrl;
-  return env;
-}
-
-// provision.sh writes the resolved cache dir (kernel/rootfs/copilot live there).
-function readCacheDir() {
-  const envFile = path.join(WORK, "provision.env");
-  const m = /^MV_CACHE_DIR=(.*)$/m.exec(fs.readFileSync(envFile, "utf8"));
-  if (!m) throw new Error("provision did not report a cache dir.");
-  return m[1].trim();
-}
+const COPILOT_URL = "https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz";
 
 // A per-run writable rootfs, so the cached bare rootfs stays pristine across runs.
 // Sparse copy (the 2G ext4 is mostly empty), boot read-write, discard after.
@@ -178,16 +170,21 @@ async function main() {
   const serverNames = Object.keys(serverMap);
   log(`MCP servers exposed to the guest as shims: ${serverNames.join(", ") || "(none)"}`);
 
-  // 3. Provision the host + fetch all guest artifacts (pinned kernel + bare rootfs
-  //    from the images release, the Copilot CLI tarball), cached. Populates WORK with
-  //    firecracker + vmlinux and the shared cache with bare-rootfs.ext4 + copilot/.
-  runScript("provision.sh", [WORK], provisionEnv(inputs));
-  const cache = readCacheDir();
+  // 3. Host setup (KVM, firecracker, mitmproxy) + fetch the prebuilt guest artifacts
+  //    (pinned kernel + bare rootfs from the images release, the Copilot CLI) via
+  //    @actions/tool-cache — warm-after-first-use under RUNNER_TOOL_CACHE.
+  await runScript("provision.sh", [WORK]);
+  const { kernelPath, rootfsPath, copilotDir } = await fetchArtifacts({
+    imagesRepo: IMAGES_REPO,
+    imagesTag: IMAGES_TAG,
+    copilotUrl: inputs.copilotUrl || COPILOT_URL,
+    copilotVersion: IMAGES_TAG,
+  });
 
   // 4. Preflight the rootfs compatibility contract (x86_64 + glibc >= floor +
   //    libstdc++). For our bare rootfs this is a sanity check; it mainly guards a
   //    custom rootfs. Fail fast with an actionable error, not a late boot hang.
-  const rootfsSrc = inputs.rootfs || path.join(cache, "bare-rootfs.ext4");
+  const rootfsSrc = inputs.rootfs || rootfsPath;
   if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
 
   // 5a. Assemble the read-only /__mcp harness mount: one shim per server + event.json.
@@ -213,7 +210,7 @@ async function main() {
   else fs.writeFileSync(path.join(rtSrc, "mitmproxy-ca.pem"), ""); // dry-run has no gateway
 
   // 5c. The Copilot CLI mount (vdc): the fetched binary dir, mounted with a discard overlay.
-  const copilotSrc = path.join(cache, "copilot");
+  const copilotSrc = copilotDir;
 
   // 6. Plan drives + guest mount points. Order is fixed: vda rootfs, vdb runtime,
   //    vdc copilot, then harness/workspace/toolcache.
@@ -268,17 +265,11 @@ async function main() {
   fs.writeFileSync(path.join(rtSrc, "mcp-config.json"), JSON.stringify(guestConfig, null, 2));
 
   // 7. Build images: a per-run writable sparse copy of the bare rootfs (so the cached
-  //    original stays pristine) + one virtio-block ext4 per drive. The Copilot image is
-  //    large and static, so it is built once in the cache and reused.
+  //    original stays pristine) + one virtio-block ext4 per drive.
   const rootfs = path.join(WORK, "rootfs.ext4");
   copyRootfs(rootfsSrc, rootfs);
   for (const drive of drives) {
-    if (drive.id === "copilot") {
-      if (!fs.existsSync(drive.image)) runScript("build-mount-image.sh", [drive.src, drive.image, "64"]);
-      else log(`copilot image cached: ${drive.image}`);
-    } else {
-      runScript("build-mount-image.sh", [drive.src, drive.image]);
-    }
+    await runScript("build-mount-image.sh", [drive.src, drive.image]);
   }
 
   if (process.env.MV_DRY_RUN) {
@@ -287,7 +278,7 @@ async function main() {
   }
 
   // 6. Host network: tap + NAT + firewall + gateway redirect.
-  runScript("network-up.sh");
+  await runScript("network-up.sh");
 
   // 7. Host services: credential gateway + MCP dispatch.
   const gwLog = fs.openSync(path.join(WORK, "gateway.log"), "a");
@@ -316,7 +307,7 @@ async function main() {
   let status = "failed";
   const consoleLog = path.join(WORK, "console.log");
   try {
-    writeVmConfig(rootfs, drives);
+    writeVmConfig(rootfs, drives, kernelPath);
     const seconds = Math.max(60, inputs.timeoutMinutes * 60);
     // IMPORTANT: boot with async spawn, NOT execFileSync. The dispatch HTTP
     // server lives in this same process; a synchronous boot would block the event
@@ -332,51 +323,40 @@ async function main() {
     gateway.kill("SIGTERM");
     await new Promise((r) => dispatch.close(r));
     try {
-      runScript("network-down.sh");
+      await runScript("network-down.sh");
     } catch {
       /* best effort */
     }
   }
   setStatus(status);
-  if (status !== "completed") process.exitCode = 1;
+  if (status !== "completed") core.setFailed(`agent did not complete (status=${status}).`);
 }
 
 /**
  * Boot the guest and resolve when it exits. The host `timeout` reaps the VM at
  * the deadline, and a guest reboot makes firecracker exit cleanly, so a non-zero
  * exit is expected and not treated as an error (the console is graded instead).
+ *
+ * Uses @actions/exec (awaited, so the event loop stays free to serve the in-process
+ * dispatch + gateway while the VM runs) — it streams the serial console live to the
+ * step log, and a listener also captures it to console.log for grading.
  */
-function bootVm(seconds, consoleLog) {
-  return new Promise((resolve) => {
-    const sock = path.join(WORK, "mv-fc.sock");
-    // Remove any stale API socket so a retry in the same workdir doesn't fail to bind.
-    try {
-      execFileSync("sudo", ["rm", "-f", sock], { stdio: "ignore" });
-    } catch {
-      /* best effort */
-    }
-    const fileStream = fs.createWriteStream(consoleLog);
-    const child = spawn(
-      "sudo",
-      ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", sock, "--config-file", path.join(WORK, "vm_config.json")],
-      { stdio: ["ignore", "pipe", "pipe"] }
-    );
-    // Stream the guest's serial console live to BOTH this action's stdout (so the
-    // user sees it in the workflow step log in real time) and the console.log file
-    // (kept as an artifact / for grading).
-    const fanout = (chunk) => {
-      process.stdout.write(chunk);
-      fileStream.write(chunk);
-    };
-    child.stdout.on("data", fanout);
-    child.stderr.on("data", fanout);
-    const finish = () => {
-      fileStream.end();
-      resolve();
-    };
-    child.on("close", finish);
-    child.on("error", finish);
-  });
+async function bootVm(seconds, consoleLog) {
+  const sock = path.join(WORK, "mv-fc.sock");
+  // Remove any stale API socket so a retry in the same workdir doesn't fail to bind.
+  try {
+    execFileSync("sudo", ["rm", "-f", sock], { stdio: "ignore" });
+  } catch {
+    /* best effort */
+  }
+  const fileStream = fs.createWriteStream(consoleLog);
+  const capture = (chunk) => fileStream.write(chunk);
+  await exec.exec(
+    "sudo",
+    ["timeout", "-k", "5", String(seconds), path.join(WORK, "firecracker"), "--api-sock", sock, "--config-file", path.join(WORK, "vm_config.json")],
+    { ignoreReturnCode: true, listeners: { stdout: capture, stderr: capture } }
+  );
+  await new Promise((r) => fileStream.end(r));
 }
 
 function gradeConsole(consoleLog) {
@@ -403,10 +383,10 @@ function generateGatewayCa(rtDir) {
   fs.copyFileSync(ca, path.join(rtDir, "mitmproxy-ca.pem"));
 }
 
-function writeVmConfig(rootfs, extraDrives = []) {
+function writeVmConfig(rootfs, extraDrives = [], kernelPath = path.join(WORK, "vmlinux")) {
   const config = {
     "boot-source": {
-      kernel_image_path: path.join(WORK, "vmlinux"),
+      kernel_image_path: kernelPath,
       boot_args: "console=ttyS0 reboot=k panic=1 init=/init",
     },
     drives: [
@@ -449,7 +429,7 @@ function planMounts(inputs, { rtSrc, copilotSrc, harnessSrc = null }) {
 
   // copilot: ALWAYS present; mounted with a discard overlay, added to PATH by init.sh.
   const cpDev = nextDev();
-  drives.push({ id: "copilot", src: copilotSrc, image: path.join(readCacheDirSafe(), "copilot.ext4") });
+  drives.push({ id: "copilot", src: copilotSrc, image: path.join(WORK, "copilot.ext4") });
   initMounts.copilot = { dev: cpDev, path: DEFAULT_COPILOT_DIR };
   log(`mount: copilot ${copilotSrc} (ro+overlay) -> ${cpDev} at ${DEFAULT_COPILOT_DIR}`);
 
@@ -488,21 +468,11 @@ function planMounts(inputs, { rtSrc, copilotSrc, harnessSrc = null }) {
   return { drives, initMounts };
 }
 
-// The copilot image is cached alongside the fetched binary (large + static).
-function readCacheDirSafe() {
-  try {
-    return readCacheDir();
-  } catch {
-    return WORK;
-  }
-}
-
 function setStatus(status) {
   log(`status=${status}`);
-  if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `status=${status}\n`);
+  core.setOutput("status", status);
 }
 
 main().catch((err) => {
-  process.stderr.write(`microvm-agent failed: ${err.message}\n`);
-  process.exit(1);
+  core.setFailed(`microvm-agent failed: ${err.message}`);
 });
