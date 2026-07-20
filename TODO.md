@@ -165,6 +165,49 @@ In `docs/proven-prototype/` (verbatim, no drift) — indexed with gotchas in
   ESM (`"type":"module"`) and `runs.main` points directly at `src/main.js`, so there's no `dist/`
   to build or commit.
 
+## Prebuilt images: images repo, kernel, rootfs, mounted Copilot
+
+Move off per-run rootfs build. Ship curated Firecracker guest artifacts and fetch/mount them (kernel +
+bare rootfs + Copilot) via the tool-cache pattern. This resolves the "prebuilt-image decision" the gateway
+options above defer to. Firecracker only for now. (Design refs, in the planning repo:
+`adr-base-image-distribution.md`, `adr-microvm-action.md`.)
+
+- [ ] **New images repo** (working name `microvm-images`; final name TBD, tie it to this action). Builds
+      and publishes the curated guest artifacts as **GitHub Releases** (CDN-backed, plain `curl` in CI):
+      the guest kernel (`vmlinux`, uncompressed, x86_64) and the bare rootfs as compressed ext4
+      (e.g. `bare-rootfs-<ver>.ext4.zst`). Include the build scripts + a release workflow so assets are
+      reproducible. This action pins to a specific release tag (kernel + rootfs move together as a known
+      set).
+- [ ] **Kernel (hard-coded for now).** One pinned x86_64 guest kernel; no customer choice, no enum yet.
+      Record exact version/source (reuse whatever the prototype booted). Future: an enum of GitHub-provided
+      kernels; customers never bring their own kernel.
+- [ ] **Bare rootfs (bare tier only).** Minimal ext4: shell + `jq` + `curl` + `git`. Do **NOT** bake in
+      Copilot (mounted, below), the shims, `event.json`, or the gateway CA (all per-run, on `/__mcp`).
+      **Record the rootfs glibc version** — it is the compatibility floor (below). Distribute as the
+      compressed ext4 asset; no per-run build/convert on this default path.
+- [ ] **Fetch + mount via tool-cache** (`@actions/tool-cache`, no separate setup action — this action does
+      it): kernel + bare rootfs (from the images repo release) and the Copilot CLI tarball
+      (`copilot-linux-x64.tar.gz` from `github/copilot-cli` releases). **Mount Copilot read-only** into the
+      guest at a known path (writable HOME/config -> the throwaway overlay); do not bake it into the rootfs.
+      Warm-after-first-use on any runner; pre-populate the tool cache on hosted runners later.
+- [ ] **Rootfs compatibility contract (decision: constraint + detection, NOT a "rootfs info" input).**
+      There is effectively one Copilot `linux-x64` glibc build, so nothing to select per rootfs — only
+      "is this rootfs new enough to run it?" So:
+  - One optional input `rootfs` (or `image`), default = our bare rootfs, for a custom rootfs later.
+    (Container-image ingest/conversion is a separate fast-follow, not this task.)
+  - Documented contract for any rootfs: **x86_64 + glibc >= X**, where X is the glibc floor the pinned
+    Copilot build needs (determine empirically from the binary; pin it). **musl/Alpine unsupported.**
+  - Always mount the **same pinned Copilot build**; no per-rootfs flavor selection.
+  - **Preflight (detect, don't ask):** before boot, inspect the rootfs `libc.so.6` / `ld-linux` version;
+    **fail fast** with an actionable error if below X or musl (e.g. "rootfs glibc 2.31, need >= 2.35").
+    Detection beats a declared input (a declared value can be wrong).
+  - Future only if multiple libc-variant agent builds appear: auto-detect the rootfs libc to pick a
+    flavor — still detection, never a declared input.
+- [ ] **Open items:** final repo name; the exact glibc floor X (read off the pinned Copilot build); kernel
+      provenance (build-from-config vs. vendor a pinned upstream/Firecracker CI kernel); ext4 compression
+      (`.zst`) + decompress cost; cache keys/versioning so a harness `@ref` maps to a known-compatible
+      {kernel, rootfs, Copilot} set.
+
 ## Options on the table (future)
 
 - **Node-native TLS-intercepting gateway (drop the mitmproxy/Python dependency).** Today the
