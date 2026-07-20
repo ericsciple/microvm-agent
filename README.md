@@ -72,6 +72,11 @@ releases), the Copilot CLI (mounted, not baked), and **mitmproxy** for the crede
   discarded. Persisting changes happens only via safe outputs.
 - **MCP is the one surface.** Read tools and safe outputs are all MCP servers added via `mcp-config`.
   The default read-only `github` server is on unless `github-mcp: false` or overridden by name.
+- **Inline diagnostics + safe result model.** The agent surfaces problems the Actions-native way via
+  guest-side helpers (`report-error`/`report-warning`/`report-notice`, and `report-incomplete` to fail
+  the run) exposed at `$MV_HELPERS_DIR`. The untrusted guest console is passed through a host-side
+  allowlist filter so it can show `::error::`/`::warning::` inline but can't inject capability workflow
+  commands; the step passes/fails on the guest agent's exit code. See `docs/architecture.md` §6.
 
 ## Related
 

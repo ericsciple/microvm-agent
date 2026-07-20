@@ -30,7 +30,7 @@ flowchart TB
     CLI["Copilot CLI<br/>(glibc binary)"]
     SHIM["/__mcp/&lt;server&gt; shims<br/>(read-only mount)"]
     FAKE[("FAKE sentinel token<br/>ghs_FAKE_…")]:::fake
-    MNT["/__w workspace (ro+overlay)<br/>/__t tool cache (ro)<br/>/__mcp shims+event.json (ro)"]
+    MNT["/__rt runtime cfg + event.json + report-* helpers (ro)<br/>/__mcp shims (ro)<br/>/__w workspace (ro+overlay)<br/>/__t tool cache (ro)"]
   end
 
   MAIN --> GW & DISP & SRV & FW
@@ -180,23 +180,68 @@ sequenceDiagram
 - **Lazy discovery**: no startup `tools/list`; the dispatch fetches + caches a server's
   tools on first use. The prompt preamble lists the servers + "run `<server> --help`".
 - The real token for each server stays host-side in the server's process env.
+- The prompt preamble references servers and helpers through the well-known env vars
+  `$MV_MCP_DIR` (the shims dir) and `$MV_HELPERS_DIR` (see §6) — never a hardcoded path,
+  so the actual dir names can change freely.
 
 ---
 
-## 6. Guest filesystem & mounts
+## 6. Agent diagnostics, error surfacing & result model
+
+The agent needs to (a) surface problems **inline** in the Actions log and (b) declare
+whether it actually finished — the Actions-native way, without ever hand-formatting a
+fragile `::workflow command::` or holding any host capability.
+
+```mermaid
+flowchart LR
+  AG["guest agent"] -->|"run $MV_HELPERS_DIR/report-error"| HLP["/__rt/helpers/report-*<br/>escapes msg, prints ::error::"]
+  HLP --> CON["guest serial console"]
+  CON --> FILT["HOST: filterConsoleLine<br/>allow error/warning/notice/debug/group;<br/>neutralize capability commands"]
+  FILT -->|inline annotation| LOG["Actions step log"]
+  CON --> RAW["console.log (raw, ground truth)"]
+  RAW --> GRADE["gradeConsoleText<br/>AGENT_EXIT + report-incomplete sentinel"]
+  GRADE --> RES["step result:<br/>completed / incomplete / failed"]
+```
+
+- **Guest-side helper scripts.** `report-error`, `report-warning`, `report-notice`, and
+  `report-incomplete` live off-PATH in `/__rt/helpers` (surfaced as `$MV_HELPERS_DIR`).
+  Each takes the raw message as an arg and does the workflow-command escaping itself
+  (`%`→`%25`, CR→`%0D`, LF→`%0A`), then prints e.g. `::error::<escaped>`. The agent runs
+  `"$MV_HELPERS_DIR/report-error" "…"` — it never formats the command (the fragile part
+  `core.error()` does host-side) and holds no host capability. Delivered per-run on the
+  read-only `/__rt` mount, granted via `--add-dir`; not baked into the rootfs, not on PATH.
+- **Untrusted console → stdout allowlist filter.** The guest serial console is streamed to
+  the step log, but the runner interprets *any* `::command::` on stdout — so a compromised
+  guest could inject `::set-output::`, `::add-path::`, `::stop-commands::`, etc. `bootVm`
+  runs firecracker `silent` and re-emits the console line-by-line through `filterConsoleLine`
+  (`src/console-filter.js`): only informational annotations
+  (`error`/`warning`/`notice`/`debug`/`group`/`endgroup`) pass **verbatim** (so agent errors
+  show inline), and every other `::…::` is neutralized. The raw console is captured
+  separately for grading.
+- **Result model (three layers).** Actions grades a step from the **exit code of the host
+  process** (`node dist/index.js`), not the guest agent — there is no `::set-result::`. The
+  guest agent's exit code surfaces via the console (`=== GUEST: AGENT_EXIT=$? ===`), and
+  `gradeConsoleText` grades: (1) never reached the agent → **failed**; (2) `report-incomplete`
+  sentinel present → **incomplete** (ran fine but couldn't achieve the task); (3) `AGENT_EXIT`
+  non-zero or missing → **failed**, exactly `0` → **completed**. Anything non-completed →
+  `core.setFailed()`.
+
+---
+
+## 7. Guest filesystem & mounts
 
 ```mermaid
 flowchart TB
   subgraph VM["Guest microVM filesystem"]
     ROOT["/ rootfs (ext4)<br/>BARE, prebuilt (microvm-images)<br/>per-run writable copy — discarded"]
-    RT["/__rt runtime config (vdb, ro)<br/>init.sh + prompt + agent.env + CA + mcp-config"]
+    RT["/__rt runtime config (vdb, ro)<br/>init.sh + prompt + agent.env + CA + mcp-config<br/>+ event.json + helpers/ (report-*)"]
     CP["/opt/copilot  Copilot CLI<br/>ro image + discard overlay (on PATH)"]
     W["/__w  workspace<br/>ro image + discard overlay"]
     T["/__t  tool cache<br/>ro image + discard overlay"]
-    MCP["/__mcp  shims + event.json<br/>pure read-only (tamper-proof)"]
+    MCP["/__mcp  shims only<br/>pure read-only (tamper-proof)"]
   end
   IMAGES[("microvm-images release:<br/>vmlinux + bare-rootfs.ext4.zst")] -->|fetched + cached, boots as-is| ROOT
-  HOSTFS[("Host: runtime cfg, Copilot CLI,<br/>workspace, tool cache, event.json")] -->|"virtio-block ext4 images<br/>(mkfs.ext4 -d)"| RT & CP & W & T & MCP
+  HOSTFS[("Host: runtime cfg + event.json + helpers,<br/>Copilot CLI, workspace, tool cache")] -->|"virtio-block ext4 images<br/>(mkfs.ext4 -d)"| RT & CP & W & T & MCP
 ```
 
 - The rootfs is a **prebuilt bare image** fetched from `microvm-images` (pinned kernel + rootfs) and
@@ -206,22 +251,25 @@ flowchart TB
   `/__t` (with `GITHUB_WORKSPACE` / `RUNNER_TOOL_CACHE` set to match). **No host-path mirroring.**
 - **Install-type mounts (Copilot, workspace, tool cache) use a read-only image + throwaway tmpfs
   overlay** — writable so tools can scribble into their own dir, but nothing persists and the underlying
-  image stays pristine. The `/__mcp` shims + `event.json` are a **pure read-only** mount (tamper-proof).
-  **Persisting anything happens only via safe outputs** (lane 2).
+  image stays pristine. The `/__mcp` shims and the `/__rt` runtime config (incl. `event.json` and the
+  `report-*` helpers) are **pure read-only** mounts (tamper-proof). **Persisting anything happens only
+  via safe outputs** (lane 2).
 - The Copilot CLI is **mounted** at `/opt/copilot` (on PATH), not baked into the rootfs — so the base
   image is generic and cacheable. Contract for a custom `rootfs`: **x86_64 + glibc ≥ 2.28 +
   libstdc++.so.6** (preflighted; musl/Alpine unsupported).
-- Only the single `event.json` is injected (via `/__mcp`, surfaced as `GITHUB_EVENT_PATH`) — never
-  `RUNNER_TEMP` (which holds the checkout push token).
+- Only the single `event.json` is injected (via `/__rt`, surfaced as `GITHUB_EVENT_PATH`) — never
+  `RUNNER_TEMP` (which holds the checkout push token). `/__rt` is granted to the CLI via `--add-dir`
+  (all non-secrets: fake token, public CA, prompt, no-secret mcp-config) so it can read `event.json` and
+  run the `report-*` helpers.
 
 ---
 
-## 7. End-to-end lifecycle (what `main.js` orchestrates)
+## 8. End-to-end lifecycle (what `main.js` orchestrates)
 
 ```mermaid
 flowchart LR
   I["read inputs"] --> P["split MCP config:<br/>guest config (no secrets)<br/>+ host server plan (real env)"]
-  P --> B["build /__mcp harness<br/>(shims + event.json)"]
+  P --> B["build mounts:<br/>/__mcp shims + /__rt cfg<br/>(event.json + report-* helpers)"]
   B --> R["provision + build rootfs<br/>+ mount images"]
   R --> N["network up:<br/>tap0 + firewall + redirect"]
   N --> S["start gateway :8080<br/>+ dispatch :9000"]
@@ -236,7 +284,7 @@ VM is running**.
 
 ---
 
-## 8. Security invariants (the short list)
+## 9. Security invariants (the short list)
 
 1. **No real credential in the guest** — only fake sentinels; the gateway swaps host-side.
 2. **Lane-bound swap** — the real token is injected only on its allowlisted host/path; every
@@ -245,10 +293,13 @@ VM is running**.
    guest.
 4. **Unbypassable egress** — host firewall forces all `:443` through the gateway; default
    DROP; DNS pinned to one resolver.
-5. **Tamper-proof injected assets** — shims/event.json ride a hypervisor read-only mount.
+5. **Tamper-proof injected assets** — shims (`/__mcp`) + runtime config incl. `event.json` and
+   the `report-*` helpers (`/__rt`) ride hypervisor read-only mounts.
 6. **No persistence except via safe outputs** — workspace writes hit a throwaway overlay.
 7. **Guest controls nothing about a trusted lane** — not the URL, not the credential, not
    its scope (the "ceiling principle", decision A).
+8. **Untrusted console is filtered** — the guest cannot inject capability workflow commands;
+   the host stdout allowlist passes only informational annotations to the step log (§6).
 
 ---
 
