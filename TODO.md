@@ -236,8 +236,8 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
   allowlist filter (below) passes it → the runner renders it **inline**. All **guest-side, no dispatch
   round-trip.**
   - **Well-known env vars for the tool dirs (no hardcoded paths).** Surface both the MCP shims dir and the
-    helpers dir via well-known env vars — `$MV_MCP_DIR`, `$MV_TOOLS_DIR` (names open) — exported into the
-    guest (agent.env). Authors/prompts then use `"$MV_MCP_DIR/<server>"` and `"$MV_TOOLS_DIR/report-error"`
+    helpers dir via well-known env vars — `$MV_MCP_DIR`, `$MV_HELPERS_DIR` (names open) — exported into the
+    guest (agent.env). Authors/prompts then use `"$MV_MCP_DIR/<server>"` and `"$MV_HELPERS_DIR/report-error"`
     instead of hardcoding `/__mcp` / the helper path, so we can change the actual dir names freely. **Also
     fix the existing preamble**, which hardcodes `/__mcp` (`generateMcpPreamble`) → use `$MV_MCP_DIR`.
     (Could colocate both in one dir + one var; two keeps forwarders vs. local helpers distinct.)
@@ -257,7 +257,7 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     below); (3) **agent exited 0 but couldn't do the job** → the agent declares via `report-incomplete`
     (neither exit code nor a workflow command can express "ran fine but unachievable").
   - **Preamble edit required.** `generateMcpPreamble` (`src/guest-assets.js`) must add a short
-    **behavioral** instruction — "if you cannot complete the task, run `\"$MV_TOOLS_DIR/report-incomplete\"
+    **behavioral** instruction — "if you cannot complete the task, run `\"$MV_HELPERS_DIR/report-incomplete\"
     \"<reason>\"`" (+ report-error/report-warning to surface problems). The agent needs to be told *when*
     to use them. Deliberate exception to the tiny-preamble rule (1–2 lines).
   - Why these are **not** safe outputs: `safe-outputs/docs/parity-gh-aw.md` §2/§2.1 — safe-outputs =
