@@ -1,4 +1,6 @@
-# Copilot instructions — microvm-agent
+# AGENTS.md — microvm-agent
+
+Instructions for AI coding agents working in this repository.
 
 Before changing this repository, read **`docs/design-principles.md`**. It lists the core
 invariants (security, MCP delivery, result model) that keep an untrusted agent credential-free
