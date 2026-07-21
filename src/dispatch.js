@@ -117,12 +117,12 @@ export function createDispatchServer(serverMap, { log = () => {}, path = "/dispa
           return send(res, 404, { status: "error", server: name, text: `no tool '${toolName}' on server '${name}'` });
         }
 
-        // `<server> <tool> --help`: show the tool's schema.
+        // `<server> <tool> --help`: show a CLI usage synopsis derived from the schema
+        // (mirrors how the shim/convertArgs actually accept args — positional for a
+        // single string-array/string prop, flags otherwise, with --add/--delete for the
+        // additions/deletions file-change convention), so the tool is self-describing.
         if (payload.help) {
-          const text =
-            `${tool.name}${tool.description ? "\n" + tool.description : ""}\n` +
-            `input schema:\n${JSON.stringify(tool.inputSchema || {}, null, 2)}`;
-          return send(res, 200, { status: "ok", server: name, tool: toolName, text });
+          return send(res, 200, { status: "ok", server: name, tool: toolName, text: renderToolUsage(tool) });
         }
 
         // `<server> <tool> <args>`: convert positional args via the schema, then call.
@@ -167,11 +167,94 @@ export function convertArgs(schema, args) {
     }
   }
   if (args.length === 0) return {};
+  let obj;
   try {
-    return JSON.parse(args[0]);
+    obj = JSON.parse(args[0]);
   } catch {
     throw new Error(`could not parse arguments as JSON: ${args[0]}`);
   }
+  // Flag-mode payloads carry scalars as strings; coerce a scalar to a 1-element array
+  // when the schema declares the property an array (e.g. a single `--labels bug`), and
+  // coerce string booleans for boolean properties. Mirrors the shim's flag handling.
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    for (const [key, sub] of Object.entries(props)) {
+      const v = obj[key];
+      if (v === undefined) continue;
+      const types = Array.isArray(sub.type) ? sub.type : [sub.type];
+      if (types.includes("array") && !Array.isArray(v)) obj[key] = [v];
+    }
+  }
+  return obj;
+}
+
+/**
+ * Render a CLI usage synopsis for a tool from its JSON Schema, mirroring how the shim
+ * + convertArgs accept arguments — so `--help` teaches the ACTUAL invocation instead of
+ * dumping a raw schema. This is what makes every tool (including create_pull_request)
+ * self-describing via discovery.
+ *   - a single string-array property  -> positional: `<tool> <prop>...`
+ *   - a single string property        -> positional: `<tool> <prop>`
+ *   - otherwise                       -> flags:      `<tool> --k <v> ...`
+ * The `additions`/`deletions` file-change convention renders as `--add <path>` /
+ * `--delete <path>` (repeatable; the shim reads the file contents from the workspace),
+ * hiding the base64 wire format.
+ * @param {{name:string, description?:string, inputSchema?:object}} tool
+ * @returns {string}
+ */
+export function renderToolUsage(tool) {
+  const schema = tool.inputSchema || {};
+  const props = schema.properties || {};
+  const keys = Object.keys(props);
+  const required = new Set(schema.required || []);
+  const head = `${tool.name}${tool.description ? "\n" + tool.description : ""}`;
+
+  // Positional-mode tools (mirror convertArgs' single-property heuristics).
+  if (keys.length === 1) {
+    const key = keys[0];
+    const prop = props[key] || {};
+    if (prop.type === "array" && prop.items && prop.items.type === "string") {
+      const d = prop.items.description || prop.description || "";
+      return `${head}\nUsage: ${tool.name} <${key}>...   (one or more, space-separated)${d ? `\n  <${key}>  ${firstLine(d)}` : ""}`;
+    }
+    if (prop.type === "string") {
+      return `${head}\nUsage: ${tool.name} <${key}>${prop.description ? `\n  <${key}>  ${firstLine(prop.description)}` : ""}`;
+    }
+  }
+
+  // Flag-mode tools.
+  const synopsis = [];
+  const docs = [];
+  for (const key of keys) {
+    const prop = props[key] || {};
+    if (key === "additions" && isFileChangeArray(prop, true)) {
+      synopsis.push("--add <path>...");
+      docs.push("  --add <path>       a file to add or overwrite (repeatable; contents read from your workspace)");
+      continue;
+    }
+    if (key === "deletions" && isFileChangeArray(prop, false)) {
+      synopsis.push("--delete <path>...");
+      docs.push("  --delete <path>    a file to delete (repeatable)");
+      continue;
+    }
+    const isStrArray = prop.type === "array" && prop.items && prop.items.type === "string";
+    const type = isStrArray ? "value" : Array.isArray(prop.type) ? prop.type[0] : prop.type || "value";
+    const flag = `--${key} <${type}>`;
+    if (isStrArray) {
+      synopsis.push(required.has(key) ? `${flag}...` : `[${flag}...]`);
+      docs.push(`  ${flag}${required.has(key) ? "  (required)" : ""}  ${firstLine(prop.description || "")} (repeatable)`.replace(/\s+$/, ""));
+      continue;
+    }
+    synopsis.push(required.has(key) ? flag : `[${flag}]`);
+    docs.push(`  ${flag}${required.has(key) ? "  (required)" : ""}  ${firstLine(prop.description || "")}`.replace(/\s+$/, ""));
+  }
+  return `${head}\nUsage: ${tool.name} ${synopsis.join(" ")}\nArguments:\n${docs.join("\n")}`;
+}
+
+// A file-change array property: {type:array, items:{properties:{path[,contents]}}}.
+function isFileChangeArray(prop, wantContents) {
+  if (!prop || prop.type !== "array" || !prop.items || prop.items.type !== "object") return false;
+  const p = prop.items.properties || {};
+  return !!p.path && (wantContents ? !!p.contents : true);
 }
 
 function firstLine(s) {

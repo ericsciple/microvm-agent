@@ -108,7 +108,11 @@ case "$1" in
           ;;
         --*)
           key=\${k#--}; v=$2; shift 2
-          jq -c --arg key "$key" --arg v "$v" '. + {($key):$v}' "$OBJ" > "$OBJ.n" && mv "$OBJ.n" "$OBJ"
+          # A repeated --key accumulates into an array; a single --key stays scalar.
+          # (The host coerces a scalar to a 1-element array when the schema wants one.)
+          jq -c --arg key "$key" --arg v "$v" \\
+            'if has($key) then .[$key] = ((.[$key] | if type=="array" then . else [.] end) + [$v]) else . + {($key):$v} end' \\
+            "$OBJ" > "$OBJ.n" && mv "$OBJ.n" "$OBJ"
           ;;
         *) echo "unexpected argument: $k" >&2; exit 2 ;;
       esac
@@ -188,8 +192,10 @@ export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = 
     lines.push("Tools are provided by MCP servers, exposed as commands under $MV_MCP_DIR:");
     for (const s of serverNames) lines.push(`  $MV_MCP_DIR/${s}`);
     lines.push(
-      'List a server\'s tools: `"$MV_MCP_DIR/<server>"`. Show a tool\'s inputs: `"$MV_MCP_DIR/<server>" <tool> --help`.',
-      'Run a tool: `"$MV_MCP_DIR/<server>" <tool> <args>`.'
+      'List a server\'s tools: `"$MV_MCP_DIR/<server>"`. Show a tool\'s usage: `"$MV_MCP_DIR/<server>" <tool> --help`.',
+      'Run a tool as shown by its --help — either positional args or `--flag <value>` pairs. To include ' +
+        'file changes (e.g. for a pull request), pass `--add <path>` (repeatable) and `--delete <path>`; ' +
+        'the file contents are read from your workspace for you.'
     );
   }
   lines.push(

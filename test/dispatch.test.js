@@ -102,11 +102,11 @@ test("dispatch --help lists a server's tools", async () => {
   });
 });
 
-test("dispatch tool --help shows the schema", async () => {
+test("dispatch tool --help shows a CLI usage synopsis", async () => {
   await withDispatch({ fixture: server() }, async (port) => {
     const res = await post(port, { server: "fixture", tool: "echo_tool", help: true });
     assert.equal(res.status, 200);
-    assert.match(res.body.text, /input schema/);
+    assert.match(res.body.text, /Usage: echo_tool/);
   });
 });
 
@@ -169,4 +169,55 @@ test("dispatch rejects invalid JSON", async () => {
     });
     assert.equal(res.status, 400);
   });
+});
+
+// --- renderToolUsage (self-describing discovery) ---
+
+test("renderToolUsage: single string-array prop -> positional usage", async () => {
+  const { renderToolUsage } = await import("../src/dispatch.js");
+  const tool = { name: "add_labels", description: "Add labels.", inputSchema: { type: "object", properties: { labels: { type: "array", items: { type: "string" } } } } };
+  const u = renderToolUsage(tool);
+  assert.match(u, /Usage: add_labels <labels>\.\.\./);
+  assert.ok(!u.includes("--labels"));
+});
+
+test("renderToolUsage: file-change tool renders --add/--delete, not base64 schema", async () => {
+  const { renderToolUsage } = await import("../src/dispatch.js");
+  const tool = {
+    name: "create_pull_request",
+    description: "Open a PR.",
+    inputSchema: {
+      type: "object",
+      required: ["title", "body"],
+      properties: {
+        title: { type: "string", description: "Title." },
+        body: { type: "string", description: "Body." },
+        draft: { type: ["boolean", "string"], description: "Draft." },
+        additions: { type: "array", items: { type: "object", properties: { path: { type: "string" }, contents: { type: "string" } } } },
+        deletions: { type: "array", items: { type: "object", properties: { path: { type: "string" } } } },
+      },
+    },
+  };
+  const u = renderToolUsage(tool);
+  assert.match(u, /--title <string>/);
+  assert.match(u, /--add <path>/);
+  assert.match(u, /--delete <path>/);
+  assert.match(u, /contents read from your workspace/);
+  // The base64 wire detail is hidden from the agent-facing usage.
+  assert.ok(!/base64/.test(u));
+});
+
+test("renderToolUsage: multi-field string-array prop is a repeatable flag", async () => {
+  const { renderToolUsage } = await import("../src/dispatch.js");
+  const tool = { name: "create_issue", description: "", inputSchema: { type: "object", required: ["title"], properties: { title: { type: "string" }, labels: { type: "array", items: { type: "string" }, description: "Labels." } } } };
+  const u = renderToolUsage(tool);
+  assert.match(u, /\[--labels <value>\.\.\.\]/);
+  assert.match(u, /\(repeatable\)/);
+});
+
+test("convertArgs coerces a scalar to a 1-element array when the schema wants an array", async () => {
+  const { convertArgs } = await import("../src/dispatch.js");
+  const schema = { type: "object", properties: { title: { type: "string" }, labels: { type: "array", items: { type: "string" } } } };
+  assert.deepEqual(convertArgs(schema, ['{"title":"t","labels":"bug"}']), { title: "t", labels: ["bug"] });
+  assert.deepEqual(convertArgs(schema, ['{"title":"t","labels":["a","b"]}']), { title: "t", labels: ["a", "b"] });
 });
