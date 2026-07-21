@@ -28,9 +28,9 @@ flowchart TB
   subgraph GUEST["📦  GUEST — untrusted (Firecracker microVM)"]
     direction TB
     CLI["Copilot CLI<br/>(glibc binary)"]
-    SHIM["/__mcp/&lt;server&gt; shims<br/>(read-only mount)"]
+    SHIM["/__mcp/&lt;server&gt; shims + __tools_list<br/>(discard overlay)"]
     FAKE[("FAKE sentinel token<br/>ghs_FAKE_…")]:::fake
-    MNT["/__rt runtime cfg + event.json + report-* helpers (ro)<br/>/__mcp shims (ro)<br/>/__w workspace (ro+overlay)<br/>/__t tool cache (ro)"]
+    MNT["all mounts = ro image + discard overlay:<br/>/__rt runtime cfg + event.json + report-* helpers<br/>/__mcp shims<br/>/__w workspace, /__t tool cache"]
   end
 
   MAIN --> GW & DISP & SRV & FW
@@ -158,7 +158,7 @@ workaround and security-aligned: servers + their secrets never enter the sandbox
 ```mermaid
 sequenceDiagram
   participant A as Guest: agent (bash)
-  participant S as Guest: /__mcp/labeler shim<br/>(read-only)
+  participant S as Guest: /__mcp/labeler shim<br/>(passthrough)
   participant D as Host: dispatch :9000
   participant M as Host: safe-outputs server<br/>(holds REAL token)
   participant GH as api.github.com
@@ -174,10 +174,14 @@ sequenceDiagram
   S-->>A: ok
 ```
 
-- **One shim per server** at `/__mcp/<server>`, invoked `<server> <tool> <args>`.
-- Shims are delivered via a **read-only mount** (`/__mcp`) — tamper-proof
-  (hypervisor-enforced), off `$PATH`, not baked into the rootfs.
-- **Lazy discovery**: no startup `tools/list`; the dispatch fetches + caches a server's
+- **One shim per server** at `/__mcp/<server>`, a pure passthrough invoked
+  `<server> <tool> --input '<JSON>' | --stdin`.
+- Shims ride a **discard overlay** (RO host image + throwaway tmpfs) — the host image
+  stays pristine while the guest may write; off `$PATH`, not baked into the rootfs. (Shim
+  read-only-ness isn't a security control — the guest can bypass a shim; the boundary is
+  host-side dispatch/gateway.)
+- **Discovery** relays `tools/list` via the reserved `/__mcp/__tools_list` command; the
+  dispatch fetches + caches a server's
   tools on first use. The prompt preamble lists the servers + "run `<server> --help`".
 - The real token for each server stays host-side in the server's process env.
 - The prompt preamble references servers and helpers through the well-known env vars
@@ -209,7 +213,7 @@ flowchart LR
   (`%`→`%25`, CR→`%0D`, LF→`%0A`), then prints e.g. `::error::<escaped>`. The agent runs
   `"$MV_HELPERS_DIR/report-error" "…"` — it never formats the command (the fragile part
   `core.error()` does host-side) and holds no host capability. Delivered per-run on the
-  read-only `/__rt` mount, granted via `--add-dir`; not baked into the rootfs, not on PATH.
+  `/__rt` mount (a discard overlay), granted via `--add-dir`; not baked into the rootfs, not on PATH.
 - **Untrusted console → stdout allowlist filter.** The guest serial console is streamed to
   the step log, but the runner interprets *any* `::command::` on stdout — so a compromised
   guest could inject `::set-output::`, `::add-path::`, `::stop-commands::`, etc. `bootVm`
@@ -234,11 +238,11 @@ flowchart LR
 flowchart TB
   subgraph VM["Guest microVM filesystem"]
     ROOT["/ rootfs (ext4)<br/>BARE, prebuilt (microvm-images)<br/>per-run writable copy — discarded"]
-    RT["/__rt runtime config (vdb, ro)<br/>init.sh + prompt + agent.env + CA + mcp-config<br/>+ event.json + helpers/ (report-*)"]
+    RT["/__rt runtime config (vdb)<br/>ro image + discard overlay<br/>init.sh + prompt + agent.env + CA + mcp-config<br/>+ event.json + helpers/ (report-*)"]
     CP["/opt/copilot  Copilot CLI<br/>ro image + discard overlay (on PATH)"]
     W["/__w  workspace<br/>ro image + discard overlay"]
     T["/__t  tool cache<br/>ro image + discard overlay"]
-    MCP["/__mcp  shims only<br/>pure read-only (tamper-proof)"]
+    MCP["/__mcp  call shims + __tools_list<br/>ro image + discard overlay"]
   end
   IMAGES[("microvm-images release:<br/>vmlinux + bare-rootfs.ext4.zst")] -->|fetched + cached, boots as-is| ROOT
   HOSTFS[("Host: runtime cfg + event.json + helpers,<br/>Copilot CLI, workspace, tool cache")] -->|"virtio-block ext4 images<br/>(mkfs.ext4 -d)"| RT & CP & W & T & MCP
@@ -249,11 +253,13 @@ flowchart TB
   is baked in — it rides the mounts.
 - Well-known guest paths mirror the Actions container-job convention: workspace → `/__w`, tool cache →
   `/__t` (with `GITHUB_WORKSPACE` / `RUNNER_TOOL_CACHE` set to match). **No host-path mirroring.**
-- **Install-type mounts (Copilot, workspace, tool cache) use a read-only image + throwaway tmpfs
-  overlay** — writable so tools can scribble into their own dir, but nothing persists and the underlying
-  image stays pristine. The `/__mcp` shims and the `/__rt` runtime config (incl. `event.json` and the
-  `report-*` helpers) are **pure read-only** mounts (tamper-proof). **Persisting anything happens only
-  via safe outputs** (lane 2).
+- **Every mount uses a read-only host image + throwaway tmpfs discard overlay** (and the
+  rootfs is writable) — so a tool can write into any directory and never fail, but nothing
+  persists and the underlying host images stay pristine. This includes the `/__mcp` shims
+  and the `/__rt` runtime config (incl. `event.json` and the `report-*` helpers): they are
+  writable-but-discarded, not purely read-only. Shim/asset read-only-ness is **not** a
+  security control (the guest can bypass a shim; the boundary is host-side). **Persisting
+  anything happens only via safe outputs** (lane 2).
 - The Copilot CLI is **mounted** at `/opt/copilot` (on PATH), not baked into the rootfs — so the base
   image is generic and cacheable. Contract for a custom `rootfs`: **x86_64 + glibc ≥ 2.28 +
   libstdc++.so.6** (preflighted; musl/Alpine unsupported).
@@ -293,9 +299,11 @@ VM is running**.
    guest.
 4. **Unbypassable egress** — host firewall forces all `:443` through the gateway; default
    DROP; DNS pinned to one resolver.
-5. **Tamper-proof injected assets** — shims (`/__mcp`) + runtime config incl. `event.json` and
-   the `report-*` helpers (`/__rt`) ride hypervisor read-only mounts.
-6. **No persistence except via safe outputs** — workspace writes hit a throwaway overlay.
+5. **Host images stay pristine; nothing persists** — every mount (shims, runtime config,
+   workspace, tool cache, Copilot) is a read-only host image + throwaway tmpfs discard
+   overlay, so the guest may write anywhere but writes are discarded. (Asset read-only-ness
+   is not itself a security control — the boundary is host-side.)
+6. **No persistence except via safe outputs** — all guest writes hit throwaway overlays.
 7. **Guest controls nothing about a trusted lane** — not the URL, not the credential, not
    its scope (the "ceiling principle", decision A).
 8. **Untrusted console is filtered** — the guest cannot inject capability workflow commands;

@@ -42,8 +42,14 @@ sight.
    (`::error::`/`::warning::`/`::notice::`/`::debug::`/`::group::`) pass through;
    every other `::…::` (capability/state commands) is neutralized. (`src/console-filter.js`.)
 
-5. **Injected assets are tamper-proof.** Shims and runtime config ride hypervisor
-   read-only mounts. Nothing the guest can write persists except via safe outputs.
+5. **Nothing inside the guest is purely read-only; the host images stay pristine.**
+   Every mount (shims, runtime config, workspace, tool cache, Copilot) is writable via a
+   **throwaway tmpfs discard overlay**, and the rootfs is writable — so a tool that writes
+   into any directory never fails. Guest writes hit tmpfs and are discarded; the
+   underlying host images are never modified and nothing persists across runs (except via
+   safe outputs). Shim/asset *read-only-ness is not a security control* — the guest can
+   bypass a shim anyway; the real boundary is host-side (gateway, dispatch, firewall,
+   console filter). (`generateMountSetup`, `generateInitScript`.)
 
 ---
 
@@ -79,9 +85,11 @@ sight.
     `/__mcp` (e.g. `__tools_list`). Customer MCP server names starting with `__` are
     rejected at config time. (`src/mcp-config.js`.)
 
-12. **Well-known paths are referenced via env vars, never hardcoded.** `$MV_MCP_DIR`,
-    `$MV_HELPERS_DIR` are always exported; prompts, helpers, and authors use the vars so
-    the actual directories can be relocated freely.
+12. **Well-known paths are referenced via env vars, never hardcoded.** `$MV_MCP_DIR`
+    (MCP call + discovery commands) and `$MV_HELPERS_DIR` (report-* diagnostics) are
+    always exported; the event payload is at `$GITHUB_EVENT_PATH` (the standard Actions
+    variable, repointed to the copy on `/__rt`). Prompts, helpers, and authors use the
+    vars so the actual directories can be relocated freely.
 
 13. **No feature is special-cased in the harness.** Safe outputs, github, and any custom
     server flow through the *identical* host-launch → `tools/list` → shim path. If a

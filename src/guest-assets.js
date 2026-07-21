@@ -203,7 +203,10 @@ export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = 
  */
 export function generateMountSetup({ copilot = null, harness = null, workspace = null, toolcache = null } = {}) {
   // A read-only image + throwaway tmpfs overlay at `path`. `tag` namespaces the temp
-  // dirs so multiple overlays don't collide.
+  // dirs so multiple overlays don't collide. Nothing inside the guest is purely
+  // read-only: every mount is writable via a discard overlay, so a tool that writes
+  // into a mounted dir never fails — yet nothing persists and the host image stays
+  // pristine (the security boundary is host-side, not guest asset integrity).
   const overlay = (tag, dev, mountPath) =>
     `\n# --- ${tag}: hypervisor read-only lower + throwaway tmpfs overlay ---\n` +
     `mkdir -p /mnt/mv-${tag}-lower /mnt/mv-${tag}-rw ${shq(mountPath)}\n` +
@@ -214,12 +217,7 @@ export function generateMountSetup({ copilot = null, harness = null, workspace =
 
   let out = "";
   if (copilot) out += overlay("cp", copilot.dev, copilot.path);
-  if (harness) {
-    out +=
-      `\n# --- harness config (shims + event.json): hypervisor read-only ---\n` +
-      `mkdir -p ${shq(harness.path)}\n` +
-      `mount -o ro ${shq(harness.dev)} ${shq(harness.path)}\n`;
-  }
+  if (harness) out += overlay("mcp", harness.dev, harness.path);
   if (workspace) out += overlay("ws", workspace.dev, workspace.path);
   if (toolcache) out += overlay("tc", toolcache.dev, toolcache.path);
   return out;
@@ -267,6 +265,16 @@ export function generateInitScript({
   return `#!/bin/sh
 set -x
 RT=${shq(runtimeDir)}
+# Make the runtime dir writable via a throwaway overlay so nothing the guest touches is
+# blocked by a read-only mount (the baked stub mounts vdb here read-only). The host image
+# stays pristine — writes hit tmpfs and are discarded. Bind (not move) the lower first, so
+# if the overlay can't be set up the original mount at $RT still works.
+mkdir -p /mnt/mv-rt-lower /mnt/mv-rt-rw
+if mount --bind "$RT" /mnt/mv-rt-lower 2>/dev/null; then
+  mount -t tmpfs tmpfs /mnt/mv-rt-rw 2>/dev/null && \\
+  mkdir -p /mnt/mv-rt-rw/upper /mnt/mv-rt-rw/work && \\
+  mount -t overlay overlay -o lowerdir=/mnt/mv-rt-lower,upperdir=/mnt/mv-rt-rw/upper,workdir=/mnt/mv-rt-rw/work "$RT" 2>/dev/null || true
+fi
 ip link set lo up
 ip addr add ${guestIp}/30 dev eth0
 ip link set eth0 up

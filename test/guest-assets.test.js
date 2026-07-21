@@ -75,10 +75,11 @@ test("generateMcpPreamble with no servers still gives isolation + event + helper
   assert.ok(p.includes('"$MV_HELPERS_DIR/report-error"'));
 });
 
-test("harness mount is a read-only mount at /__mcp", () => {
+test("harness (/__mcp) mount is an RO lower + tmpfs discard overlay (writable, host image pristine)", () => {
   const s = generateMountSetup({ harness: { dev: "/dev/vdb", path: "/__mcp" } });
-  assert.ok(s.includes("mount -o ro '/dev/vdb' '/__mcp'"));
-  assert.ok(!s.includes("overlay"));
+  assert.ok(s.includes("mount -o ro '/dev/vdb' /mnt/mv-mcp-lower"));
+  assert.ok(s.includes("mount -t overlay overlay"));
+  assert.ok(s.includes("'/__mcp'"));
 });
 
 test("workspace mount is an RO lower + tmpfs overlay at /__w", () => {
@@ -104,7 +105,10 @@ test("copilot mount is an RO lower + tmpfs discard overlay", () => {
 
 test("init mounts harness + wires auth env and prompt from /__rt", () => {
   const init = generateInitScript({ mounts: { harness: { dev: "/dev/vdd", path: "/__mcp" } } });
-  assert.ok(init.includes("mount -o ro '/dev/vdd' '/__mcp'"));
+  assert.ok(init.includes("mount -t overlay overlay"));
+  assert.ok(init.includes("/mnt/mv-mcp-lower"));
+  // /__rt is made writable via a throwaway overlay too (nothing purely read-only).
+  assert.ok(init.includes("/mnt/mv-rt-lower"));
   assert.ok(init.includes("S2STOKENS=true"));
   assert.ok(init.includes('-p "$(cat "$RT/prompt.txt")"'));
   assert.ok(init.includes('. "$RT/agent.env"'));
