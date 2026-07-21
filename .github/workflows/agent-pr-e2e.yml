@@ -38,14 +38,15 @@ jobs:
             1. Create a new file at "agent-notes/e2e-${{ github.run_id }}.md" containing a
                short markdown note (a title and one sentence saying this PR was opened by
                the microVM agent end-to-end test).
-            2. Discover how to open a pull request: list the available tools by running
-               "$MV_MCP_DIR/create_pull_request", then read its usage with
-               "$MV_MCP_DIR/create_pull_request create_pull_request --help".
-            3. Using ONLY what the --help usage tells you, ACTUALLY RUN the command to open
-               a pull request whose title is "e2e: agent-opened PR ${{ github.run_id }}",
-               whose body explains this is the automated Class C end-to-end test, and which
-               includes the file you created. Do not hand-encode file contents — use the
-               file flag the usage documents.
+            2. Discover the available tools by running "$MV_MCP_DIR/__tools_list" and read
+               the create_pull_request tool's JSON input schema.
+            3. Open a pull request by calling that tool with JSON arguments that match the
+               schema. Build the JSON so it includes the title
+               "e2e: agent-opened PR ${{ github.run_id }}", a body explaining this is the
+               automated Class C end-to-end test, and an "additions" array whose one entry
+               has the file's path and its base64-encoded contents (base64-encode the file
+               you created yourself). Pass the JSON on stdin, e.g.:
+                 printf '%s' "$JSON" | "$MV_MCP_DIR/create_pull_request" create_pull_request --stdin
             After the command prints a pull request URL, reply with exactly: DONE
           github-token: ${{ github.token }}
           timeout-minutes: "12"

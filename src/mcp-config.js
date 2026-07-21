@@ -20,6 +20,8 @@
 //     GITHUB_READ_ONLY=1 — the same "local mode" gh-aw uses. It is NOT special-
 //     cased: it flows through the identical host-launch + tools/list shim path.
 
+import { RESERVED_MCP_PREFIX } from "./guest-assets.js";
+
 const DEFAULT_GITHUB_SERVER_NAME = "github";
 
 // Pinned github-mcp-server image (matches gh-aw's DefaultGitHubMCPServerVersion).
@@ -53,11 +55,9 @@ export function buildGuestMcpConfig(inputs) {
   // (1) Default read-only github server.
   //   - "shim" (default): run the official github-mcp-server host-side over docker
   //     stdio with the real token host-side (GITHUB_READ_ONLY=1), discovered like any
-  //     server and delivered as `github_*` CLI shims. No guest MCP entry.
-  //   - "native" (experimental): rely on the CLI's BUILT-IN github server in the guest
-  //     (on by default unless --disable-builtin-mcps). No host server, no shim — the
-  //     built-in is a default server, unaffected by the custom-MCP 403 policy block.
-  if (inputs.githubMcp && !userDefinedGithub && inputs.githubMode !== "native") {
+  //     server and delivered as `github` CLI shims. No guest MCP entry. github is NOT
+  //     special-cased: it flows through the identical host-launch + tools/list shim path.
+  if (inputs.githubMcp && !userDefinedGithub) {
     hostServers.push({
       name: DEFAULT_GITHUB_SERVER_NAME,
       kind: "github",
@@ -120,6 +120,13 @@ function normalizeCustomServer(name, rawDef) {
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
     throw new Error(
       `mcp-config server name '${name}' is invalid: use only letters, digits, '.', '_', or '-' (1–64 chars).`
+    );
+  }
+  // The '__' prefix is reserved for harness-provided built-in commands under /__mcp
+  // (e.g. '__tools_list'), so a customer server can never shadow or collide with one.
+  if (name.startsWith(RESERVED_MCP_PREFIX)) {
+    throw new Error(
+      `mcp-config server name '${name}' is reserved: names starting with '${RESERVED_MCP_PREFIX}' are for harness built-ins.`
     );
   }
   const def = rawDef && typeof rawDef === "object" ? rawDef : {};

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   generateServerShim,
+  generateToolsListShim,
   generateHelperScripts,
   generateMcpPreamble,
   generateMountSetup,
@@ -10,17 +11,36 @@ import {
   DEFAULT_MCP_DIR,
   DEFAULT_HELPERS_DIR,
   REPORT_INCOMPLETE_SENTINEL,
+  TOOLS_LIST_COMMAND,
 } from "../src/guest-assets.js";
 
-test("generateServerShim forwards {server,tool,args} to the dispatch endpoint", () => {
+test("generateServerShim is a pure passthrough: forwards {server,tool,input}", () => {
   const shim = generateServerShim("labeler");
   assert.match(shim, /^#!\/bin\/sh/);
   assert.ok(shim.includes("S='labeler'"));
   assert.ok(shim.includes(DEFAULT_DISPATCH_ENDPOINT));
-  // help (no args) lists tools; tool --help shows schema; else invoke with positional args.
-  assert.match(shim, /\{server:\$s,help:true\}/);
-  assert.match(shim, /\{server:\$s,tool:\$t,help:true\}/);
-  assert.match(shim, /\{server:\$s,tool:\$t,args:\$ARGS\.positional\}/);
+  // Two forms only: --input '<JSON>' and --stdin. Envelope is {server,tool,input}.
+  assert.match(shim, /--input/);
+  assert.match(shim, /--stdin/);
+  assert.match(shim, /\{server:\$s,tool:\$t,input:\$input\}/);
+  // No discovery, no positional/flag translation, no file handling in the call shim.
+  assert.ok(!shim.includes("--add"));
+  assert.ok(!shim.includes("--help"));
+  assert.ok(!shim.includes("ARGS.positional"));
+  assert.ok(!shim.includes("base64"));
+});
+
+test("generateToolsListShim relays discovery to the gateway", () => {
+  const shim = generateToolsListShim();
+  assert.match(shim, /^#!\/bin\/sh/);
+  assert.match(shim, /\{discover:true\}/);
+  assert.match(shim, /\{discover:true,server:\$s\}/);
+  assert.ok(shim.includes(DEFAULT_DISPATCH_ENDPOINT));
+});
+
+test("TOOLS_LIST_COMMAND is a reserved __-prefixed built-in", () => {
+  assert.equal(TOOLS_LIST_COMMAND, "__tools_list");
+  assert.match(TOOLS_LIST_COMMAND, /^__/);
 });
 
 test("generateServerShim endpoint is configurable", () => {
@@ -29,7 +49,7 @@ test("generateServerShim endpoint is configurable", () => {
   assert.ok(!shim.includes(DEFAULT_DISPATCH_ENDPOINT));
 });
 
-test("generateMcpPreamble lists servers via $MV_MCP_DIR + event path + helper guidance", () => {
+test("generateMcpPreamble lists servers via $MV_MCP_DIR + discovery + call guidance", () => {
   const p = generateMcpPreamble(["labeler", "github"]);
   assert.match(p, /isolated, ephemeral Firecracker microVM/);
   assert.match(p, /\$GITHUB_EVENT_PATH/);
@@ -37,6 +57,10 @@ test("generateMcpPreamble lists servers via $MV_MCP_DIR + event path + helper gu
   assert.ok(p.includes("$MV_MCP_DIR/labeler"));
   assert.ok(p.includes("$MV_MCP_DIR/github"));
   assert.ok(!p.includes(`${DEFAULT_MCP_DIR}/labeler`));
+  // Discovery via the reserved __tools_list command; calls via --input/--stdin.
+  assert.ok(p.includes(`$MV_MCP_DIR/${TOOLS_LIST_COMMAND}`));
+  assert.match(p, /--input/);
+  assert.match(p, /--stdin/);
   // The diagnostics helpers are advertised via $MV_HELPERS_DIR.
   assert.ok(p.includes('"$MV_HELPERS_DIR/report-error"'));
   assert.ok(p.includes('"$MV_HELPERS_DIR/report-incomplete"'));
@@ -129,18 +153,4 @@ test("init runs the agent from the workspace when mounted, else /root", () => {
   assert.ok(bare.includes("cd '/root'"));
 });
 
-test("generateServerShim flag mode: --add/--delete are advertised + inline file contents", () => {
-  const shim = generateServerShim("create_pull_request");
-  // Flag mode is present and generic (any tool can use --add/--delete).
-  assert.match(shim, /--add\|--delete/);
-  assert.ok(shim.includes("base64"), "reads file contents as base64");
-  assert.ok(shim.includes("additions"), "builds additions[]");
-  assert.ok(shim.includes("deletions"), "builds deletions[]");
-  // Paths are sandboxed to the workspace (reject absolute/.. escapes).
-  assert.match(shim, /invalid path/);
-  assert.ok(shim.includes("GITHUB_WORKSPACE"), "reads from the workspace");
-  // Positional mode is retained for existing tools.
-  assert.ok(shim.includes("$ARGS.positional"));
-  // Single-tool servers may omit the tool name (leading flag -> no tool).
-  assert.match(shim, /tool=""/);
-});
+

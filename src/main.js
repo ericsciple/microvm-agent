@@ -24,7 +24,7 @@ import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
 import { createDispatchServer } from "./dispatch.js";
 import { fetchArtifacts } from "./artifacts.js";
-import { generateServerShim, generateHelperScripts, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_HELPERS_DIR, DEFAULT_COPILOT_DIR } from "./guest-assets.js";
+import { generateServerShim, generateToolsListShim, generateHelperScripts, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_HELPERS_DIR, DEFAULT_COPILOT_DIR, TOOLS_LIST_COMMAND } from "./guest-assets.js";
 import { filterConsoleLine, gradeConsoleText } from "./console-filter.js";
 import { translateToolCachePathEntries } from "./paths.js";
 
@@ -188,9 +188,10 @@ async function main() {
   const rootfsSrc = inputs.rootfs || rootfsPath;
   if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
 
-  // 5a. Assemble the read-only /__mcp harness mount: one shim per server. (event.json
-  //     moved to /__rt below — it's per-run context/data, not a tool, so /__mcp is
-  //     shims-only and is created only when there are actually MCP servers.)
+  // 5a. Assemble the read-only /__mcp harness mount: one call shim per server, plus the
+  //     built-in `__tools_list` discovery command (reserved `__` prefix). event.json
+  //     lives on /__rt (per-run context/data, not a tool). /__mcp exists whenever there
+  //     is at least one server (the discovery command needs something to list).
   const harnessSrc = freshDir(path.join(WORK, "harness"));
   for (const name of serverNames) {
     const shimPath = path.join(harnessSrc, name);
@@ -198,6 +199,11 @@ async function main() {
     fs.chmodSync(shimPath, 0o755);
   }
   const harnessHasContent = serverNames.length > 0;
+  if (harnessHasContent) {
+    const toolsListPath = path.join(harnessSrc, TOOLS_LIST_COMMAND);
+    fs.writeFileSync(toolsListPath, generateToolsListShim());
+    fs.chmodSync(toolsListPath, 0o755);
+  }
 
   // 5b. The per-run runtime config mount (/__rt, always vdb): init.sh + prompt.txt +
   //     agent.env + mitmproxy-ca.pem + mcp-config.json + event.json + the report-*
@@ -252,14 +258,6 @@ async function main() {
 
   // Runtime agent env (no secrets — all fake sentinels).
   let agentEnv = `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`;
-  // In native github mode, the CLI's built-in github server may read the token from a
-  // different env var; export the SAME fake sentinel under the common names so the
-  // gateway's fake->real swap covers whichever one it uses (all fake — safe).
-  if (inputs.githubMode === "native") {
-    agentEnv += `export GITHUB_PERSONAL_ACCESS_TOKEN=${FAKE_TOKEN}\n`;
-    agentEnv += `export GITHUB_TOKEN=${FAKE_TOKEN}\n`;
-    agentEnv += `export GH_TOKEN=${FAKE_TOKEN}\n`;
-  }
   // Point the guest's GITHUB_WORKSPACE / RUNNER_TOOL_CACHE at the well-known mount
   // points, so the agent and tooling resolve them correctly inside the guest.
   if (initMounts.workspace) agentEnv += `export GITHUB_WORKSPACE=${initMounts.workspace.path}\n`;
@@ -278,11 +276,11 @@ async function main() {
     }
   }
   if (guestEventPath) agentEnv += `export GITHUB_EVENT_PATH=${guestEventPath}\n`;
-  // Well-known dirs for the guest-side tools, so prompts/authors never hardcode paths:
-  // $MV_HELPERS_DIR (report-* diagnostics helpers, always present) and $MV_MCP_DIR (the
-  // MCP shims, only when there are servers).
+  // Well-known dirs for the guest-side tools, always exported so prompts/authors never
+  // hardcode paths: $MV_MCP_DIR (MCP call + discovery commands) and $MV_HELPERS_DIR
+  // (report-* diagnostics helpers). Both are stable indirection points we can relocate.
+  agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
   agentEnv += `export MV_HELPERS_DIR=${DEFAULT_HELPERS_DIR}\n`;
-  if (harnessHasContent) agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
   fs.writeFileSync(path.join(rtSrc, "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above). Empty by default — every
   // server reaches the guest as a /__mcp shim, not a native guest MCP entry.

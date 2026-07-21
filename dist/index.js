@@ -41968,10 +41968,6 @@ function readInputs() {
     rootfs: input("rootfs", ""),
     // Optional override for the Copilot CLI tarball URL (else provision.sh's default).
     copilotUrl: process.env.MV_COPILOT_URL || "",
-    // EXPERIMENTAL (test-only) knobs for resolving the github-MCP shape:
-    //   MV_GITHUB_MODE=native  -> rely on the CLI's built-in github server (no host docker shim)
-    //   MV_GITHUB_MODE=shim    -> host-side github-mcp-server via docker + CLI shim (default)
-    githubMode: process.env.MV_GITHUB_MODE || "shim",
     //   MV_EXTRA_GUEST_MCP=<json> -> extra mcpServers merged into the GUEST config (negative control)
     extraGuestMcp: process.env.MV_EXTRA_GUEST_MCP || "",
     // Host-side only. Never written into the guest MCP config.
@@ -41979,6 +41975,312 @@ function readInputs() {
   };
 }
 
+
+;// CONCATENATED MODULE: ./src/guest-assets.js
+// Generate the guest-side assets: the per-server CLI shims, the MCP preamble, the
+// mount setup, and the init script.
+//
+// The guest rootfs is a prebuilt BARE image (from ericsciple/microvm-images) that
+// carries no per-run content. Everything run-specific is delivered via mounts:
+//   - the runtime config drive (vdb, /__rt): init.sh + prompt + agent.env + gateway CA
+//   - the Copilot CLI (its own drive, mounted with a discard overlay)
+//   - the /__mcp shims + event.json (read-only)
+//   - the workspace / tool cache (read-only lower + discard overlay)
+//
+// Shims are the guest's only view of an MCP server. There is ONE shim per server
+// (not per tool), delivered off-PATH in a read-only /__mcp mount. A shim is a thin
+// forwarder that POSTs to the host dispatch endpoint (see dispatch.js):
+//   /__mcp/<server>                 -> list the server's tools        (lazy tools/list)
+//   /__mcp/<server> <tool> --help   -> show a tool's input schema
+//   /__mcp/<server> <tool> <args>   -> run a tool
+// The shim carries NO schema — discovery is lazy and host-side (dispatch caches
+// tools/list per server), so the guest rootfs/base image needs no per-run baking.
+
+const DEFAULT_DISPATCH_ENDPOINT = "http://172.16.0.1:9000/dispatch";
+const DEFAULT_MCP_DIR = "/__mcp";
+// The per-run runtime config drive is ALWAYS the first extra drive (vdb); the bare
+// rootfs's baked /init stub mounts it here and execs /__rt/init.sh (see microvm-images).
+const DEFAULT_RUNTIME_DIR = "/__rt";
+// Guest-side helper scripts (report-error/warning/notice/incomplete) live here,
+// colocated on the runtime drive and OFF-PATH (like the /__mcp shims). Surfaced to
+// the agent via $MV_HELPERS_DIR so nothing hardcodes the path.
+const DEFAULT_HELPERS_DIR = `${DEFAULT_RUNTIME_DIR}/helpers`;
+// Where the Copilot CLI binary is mounted (its own drive, with a discard overlay so
+// anything it writes next to itself is captured in tmpfs and discarded).
+const DEFAULT_COPILOT_DIR = "/opt/copilot";
+
+// A plain-text (NOT a ::workflow-command::) sentinel that report-incomplete prints so
+// the host console grader can detect an agent-declared failure. It must NOT be a
+// `::...::` line, or the stdout allowlist filter would neutralize it before grading.
+const REPORT_INCOMPLETE_SENTINEL = "__MICROVM_AGENT_REPORT_INCOMPLETE__";
+
+// Reserved namespace for harness-provided built-in commands under /__mcp. Customer
+// MCP server names may not start with this prefix (see mcp-config.js validation), so
+// built-ins like `__tools_list` never collide with a registered server.
+const RESERVED_MCP_PREFIX = "__";
+// The MCP discovery command (relays `tools/list` to the gateway). Lives in /__mcp
+// alongside the call shims — discovery is tools-stuff, so one dir + one env var
+// ($MV_MCP_DIR) covers both discovery and calls.
+const TOOLS_LIST_COMMAND = "__tools_list";
+
+/**
+ * One call shim per registered MCP server — a PURE passthrough (POSIX sh; needs jq +
+ * curl). It carries NO schema and NO application logic: it forwards a JSON arguments
+ * object to the host gateway, which routes it to the server's `tools/call`.
+ *
+ *   <server> <tool> --input '<JSON>'   invoke <tool> with the given JSON arguments
+ *   <server> <tool> --stdin            invoke <tool> with JSON arguments read from stdin
+ *
+ * Discovery is NOT here — run `$MV_MCP_DIR/__tools_list` (see generateToolsListShim).
+ * Arguments always match the tool's advertised inputSchema; the shim never translates,
+ * inspects, or synthesizes them (no positional/flag modes, no file handling).
+ * @param {string} serverName
+ * @param {{endpoint?: string}} [opts]
+ * @returns {string} shell script contents for the shim
+ */
+function generateServerShim(serverName, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
+  return `#!/bin/sh
+# MCP call shim for server '${serverName}'. Pure passthrough to the host gateway.
+#   ${serverName} <tool> --input '<JSON>'   invoke a tool with JSON arguments
+#   ${serverName} <tool> --stdin            invoke a tool with JSON arguments from stdin
+# Discover tools with: "$MV_MCP_DIR/${TOOLS_LIST_COMMAND}"
+S=${shq(serverName)}
+EP=${shq(endpoint)}
+usage() { echo "usage: ${serverName} <tool> --input '<JSON>' | --stdin" >&2; exit 2; }
+
+[ $# -ge 1 ] || usage
+tool=$1; shift
+[ $# -ge 1 ] || usage
+
+case "$1" in
+  --input) [ $# -ge 2 ] || usage; INPUT=$2 ;;
+  --stdin) INPUT=$(cat) ;;
+  *) usage ;;
+esac
+
+# --argjson validates that INPUT is well-formed JSON before we send it.
+echo "$INPUT" | jq empty 2>/dev/null || { echo "arguments are not valid JSON" >&2; exit 2; }
+jq -nc --arg s "$S" --arg t "$tool" --argjson input "$INPUT" '{server:$s,tool:$t,input:$input}' \\
+  | curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-
+echo
+`;
+}
+
+/**
+ * The MCP discovery command (`$MV_MCP_DIR/__tools_list`). A thin relay that defers to
+ * the host gateway exactly like the call shims — it asks the gateway to run `tools/list`
+ * across the registered servers and prints the aggregated result (native `tools/list`
+ * shape: each tool's name, description, inputSchema), minified JSON.
+ *
+ *   __tools_list            list every registered server's tools
+ *   __tools_list <server>   list one server's tools
+ * @param {{endpoint?: string}} [opts]
+ * @returns {string} shell script contents for the discovery shim
+ */
+function generateToolsListShim({ endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
+  return `#!/bin/sh
+# MCP tool discovery — relays 'tools/list' to the host gateway (like a native MCP
+# client). Prints all registered servers' tools (name, description, inputSchema).
+#   ${TOOLS_LIST_COMMAND}            list every server's tools
+#   ${TOOLS_LIST_COMMAND} <server>   list one server's tools
+EP=${shq(endpoint)}
+if [ $# -ge 1 ]; then
+  jq -nc --arg s "$1" '{discover:true,server:$s}'
+else
+  jq -nc '{discover:true}'
+fi | curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-
+echo
+`;
+}
+
+/**
+ * Guest-side helper scripts the agent runs to surface diagnostics the Actions-native
+ * way — inline `::error::`/`::warning::`/`::notice::` annotations — and to declare
+ * failure. Each takes the raw message as its first arg and does the workflow-command
+ * escaping (`%`->`%25`, CR->`%0D`, LF->`%0A`) itself, so the agent NEVER hand-formats
+ * `::error::` (the fragile part). They print to the guest console; the host stdout
+ * allowlist filter passes these informational commands through so the runner renders
+ * them inline. `report-incomplete` additionally prints a plain-text sentinel that the
+ * host console grader detects to fail the step (an agent that ran fine but could not
+ * achieve the task — neither an exit code nor a workflow command can express that).
+ *
+ * POSIX sh + awk (mawk/gawk); the escape is line-by-line (joined with %0A) so it works
+ * in mawk, which lacks gawk's whole-file RS slurp.
+ * @returns {Record<string,string>} filename -> script contents
+ */
+function generateHelperScripts() {
+  // Line-by-line escape: mawk-safe (default RS splits on \n); rejoin multi-line
+  // messages with the literal %0A escape. Escapes % first so we don't double-escape
+  // the %0D/%0A we introduce.
+  const escape = `awk '
+  { gsub(/%/, "%25"); gsub(/\\r/, "%0D"); out = out (NR > 1 ? "%0A" : "") $0 }
+  END { printf "%s", out }
+'`;
+  const emit = (command, description) =>
+    `#!/bin/sh
+# ${command} — ${description}
+# Usage: ${command} "message"
+# Escapes the message and prints an Actions workflow command; the agent never
+# hand-formats '::...::' itself.
+msg=$(printf '%s' "\${1:-}" | ${escape})
+printf '::${command === "report-incomplete" ? "error" : command.replace(/^report-/, "")}::%s\\n' "$msg"
+`;
+  return {
+    "report-error": emit("report-error", "surface an inline error annotation"),
+    "report-warning": emit("report-warning", "surface an inline warning annotation"),
+    "report-notice": emit("report-notice", "surface an inline notice annotation"),
+    "report-incomplete":
+      emit("report-incomplete", "declare the task could not be completed (fails the run)") +
+      `printf '%s\\n' ${shq(REPORT_INCOMPLETE_SENTINEL)}\n`,
+  };
+}
+
+/**
+ * The preamble prepended to the user prompt: tells the agent it's in an isolated
+ * microVM, where the event payload is, how to discover + run MCP tools (via the
+ * $MV_MCP_DIR env var, never a hardcoded path), and how to surface diagnostics /
+ * declare failure via the $MV_HELPERS_DIR helper scripts.
+ * @param {string[]} serverNames
+ * @param {{mcpDir?: string}} [opts]
+ * @returns {string}
+ */
+function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = {}) {
+  void mcpDir; // paths are referenced via $MV_MCP_DIR, not baked in.
+  const lines = [
+    "You are an autonomous agent inside an isolated, ephemeral Firecracker microVM.",
+    "The triggering event payload (issue/PR JSON) is at the path in $GITHUB_EVENT_PATH.",
+  ];
+  if (serverNames.length) {
+    lines.push(
+      "Tools are provided by MCP servers, reachable as commands under $MV_MCP_DIR:",
+      ...serverNames.map((s) => `  $MV_MCP_DIR/${s}`),
+      `Discover tools (name, description, JSON input schema) by running \`"$MV_MCP_DIR/${TOOLS_LIST_COMMAND}"\` ` +
+        "(add a server name to list just that server).",
+      'Call a tool with its JSON arguments (matching the schema): ' +
+        '`"$MV_MCP_DIR/<server>" <tool> --input \'{"...":"..."}\'`, ' +
+        'or `--stdin` to pass the JSON on standard input (use this for large arguments).'
+    );
+  }
+  lines.push(
+    'To surface a problem in the run log, run `"$MV_HELPERS_DIR/report-error" "<message>"` ' +
+      "(also report-warning and report-notice for less-severe notes).",
+    'If you cannot complete the task, run `"$MV_HELPERS_DIR/report-incomplete" "<reason>"` ' +
+      "to fail the run with an explanation.",
+    "---"
+  );
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Generate the bash that mounts the requested host images inside the guest.
+ * Install-type mounts (copilot, workspace, tool cache) use a read-only lower + a
+ * throwaway tmpfs overlay, so tools that write into their own directory don't fail,
+ * yet nothing persists and the underlying image stays pristine (hypervisor RO). The
+ * /__mcp harness is a pure read-only mount (tamper-proof shims + event.json).
+ * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
+ * @returns {string}
+ */
+function generateMountSetup({ copilot = null, harness = null, workspace = null, toolcache = null } = {}) {
+  // A read-only image + throwaway tmpfs overlay at `path`. `tag` namespaces the temp
+  // dirs so multiple overlays don't collide.
+  const overlay = (tag, dev, mountPath) =>
+    `\n# --- ${tag}: hypervisor read-only lower + throwaway tmpfs overlay ---\n` +
+    `mkdir -p /mnt/mv-${tag}-lower /mnt/mv-${tag}-rw ${shq(mountPath)}\n` +
+    `mount -o ro ${shq(dev)} /mnt/mv-${tag}-lower\n` +
+    `mount -t tmpfs tmpfs /mnt/mv-${tag}-rw\n` +
+    `mkdir -p /mnt/mv-${tag}-rw/upper /mnt/mv-${tag}-rw/work\n` +
+    `mount -t overlay overlay -o lowerdir=/mnt/mv-${tag}-lower,upperdir=/mnt/mv-${tag}-rw/upper,workdir=/mnt/mv-${tag}-rw/work ${shq(mountPath)}\n`;
+
+  let out = "";
+  if (copilot) out += overlay("cp", copilot.dev, copilot.path);
+  if (harness) {
+    out +=
+      `\n# --- harness config (shims + event.json): hypervisor read-only ---\n` +
+      `mkdir -p ${shq(harness.path)}\n` +
+      `mount -o ro ${shq(harness.dev)} ${shq(harness.path)}\n`;
+  }
+  if (workspace) out += overlay("ws", workspace.dev, workspace.path);
+  if (toolcache) out += overlay("tc", toolcache.dev, toolcache.path);
+  return out;
+}
+
+function shq(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The per-run init script, delivered on the runtime config drive and run as
+ * /__rt/init.sh by the bare rootfs's baked /init stub (which has already mounted
+ * proc/sys/dev and /__rt). It brings up networking, trusts the gateway CA, sets up
+ * the mounts (Copilot + /__mcp + workspace + tool cache), exports the Copilot auth
+ * env, and runs the agent. All run-specific files are read from /__rt.
+ * @param {Object} [opts]
+ * @param {string} [opts.guestIp]
+ * @param {string} [opts.hostIp]
+ * @param {string} [opts.dns]
+ * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @param {string} [opts.runtimeDir]
+ * @returns {string}
+ */
+function generateInitScript({
+  guestIp = "172.16.0.2",
+  hostIp = "172.16.0.1",
+  dns = "8.8.8.8",
+  mounts = {},
+  runtimeDir = DEFAULT_RUNTIME_DIR,
+} = {}) {
+  const mountSetup = generateMountSetup(mounts);
+  const copilotDir = mounts.copilot ? mounts.copilot.path : DEFAULT_COPILOT_DIR;
+  const addDirs = ["/root"];
+  // The MCP shims live in the harness mount (/__mcp) and the report-* helpers +
+  // event.json live on the runtime drive (/__rt); the CLI can only execute/read files
+  // under directories it's been granted, so add both (and the workspace when mounted).
+  addDirs.push(runtimeDir);
+  if (mounts.harness) addDirs.push(mounts.harness.path);
+  if (mounts.workspace) addDirs.push(mounts.workspace.path);
+  const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
+  // Run the agent from the workspace when it's mounted (like Actions container jobs,
+  // whose working directory is the workspace); otherwise fall back to /root.
+  const workDir = mounts.workspace ? mounts.workspace.path : "/root";
+
+  return `#!/bin/sh
+set -x
+RT=${shq(runtimeDir)}
+ip link set lo up
+ip addr add ${guestIp}/30 dev eth0
+ip link set eth0 up
+ip route add default via ${hostIp}
+echo 'nameserver ${dns}' > /etc/resolv.conf
+# Trust the per-run gateway CA (delivered on the runtime drive; rootfs is writable).
+cp "$RT/mitmproxy-ca.pem" /usr/local/share/ca-certificates/mitmproxy.crt 2>/dev/null || true
+update-ca-certificates 2>/dev/null || true
+# Guest MCP config (no secrets) — the CLI reads it from HOME/.copilot.
+mkdir -p /root/.copilot
+cp "$RT/mcp-config.json" /root/.copilot/mcp-config.json 2>/dev/null || true
+${mountSetup}
+export HOME=/root
+export XDG_CONFIG_HOME=/root
+export PATH=${shq(copilotDir)}:$PATH
+export COPILOT_AGENT_RUNNER_TYPE=STANDALONE
+export S2STOKENS=true
+export GITHUB_COPILOT_INTEGRATION_ID=agentic-workflows
+export NODE_EXTRA_CA_CERTS="$RT/mitmproxy-ca.pem"
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+[ -f "$RT/agent.env" ] && . "$RT/agent.env"
+cd ${shq(workDir)} 2>/dev/null || cd /root
+
+echo "=== GUEST: starting copilot ==="
+copilot --no-ask-user --allow-all-tools \\
+  ${addDirFlags} --log-level all --log-dir /tmp/cplogs \\
+  -p "$(cat "$RT/prompt.txt")" 2>&1
+echo "=== GUEST: AGENT_EXIT=$? ==="
+
+sync
+echo 1 > /proc/sys/kernel/sysrq
+echo b > /proc/sysrq-trigger
+sleep infinity
+`;
+}
 
 ;// CONCATENATED MODULE: ./src/mcp-config.js
 // Build the MCP configuration the guest sees, and the plan for the host-side
@@ -42002,6 +42304,8 @@ function readInputs() {
 //     image host-side over stdio (docker), with the real token host-side and
 //     GITHUB_READ_ONLY=1 — the same "local mode" gh-aw uses. It is NOT special-
 //     cased: it flows through the identical host-launch + tools/list shim path.
+
+
 
 const DEFAULT_GITHUB_SERVER_NAME = "github";
 
@@ -42036,11 +42340,9 @@ function buildGuestMcpConfig(inputs) {
   // (1) Default read-only github server.
   //   - "shim" (default): run the official github-mcp-server host-side over docker
   //     stdio with the real token host-side (GITHUB_READ_ONLY=1), discovered like any
-  //     server and delivered as `github_*` CLI shims. No guest MCP entry.
-  //   - "native" (experimental): rely on the CLI's BUILT-IN github server in the guest
-  //     (on by default unless --disable-builtin-mcps). No host server, no shim — the
-  //     built-in is a default server, unaffected by the custom-MCP 403 policy block.
-  if (inputs.githubMcp && !userDefinedGithub && inputs.githubMode !== "native") {
+  //     server and delivered as `github` CLI shims. No guest MCP entry. github is NOT
+  //     special-cased: it flows through the identical host-launch + tools/list shim path.
+  if (inputs.githubMcp && !userDefinedGithub) {
     hostServers.push({
       name: DEFAULT_GITHUB_SERVER_NAME,
       kind: "github",
@@ -42103,6 +42405,13 @@ function normalizeCustomServer(name, rawDef) {
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
     throw new Error(
       `mcp-config server name '${name}' is invalid: use only letters, digits, '.', '_', or '-' (1–64 chars).`
+    );
+  }
+  // The '__' prefix is reserved for harness-provided built-in commands under /__mcp
+  // (e.g. '__tools_list'), so a customer server can never shadow or collide with one.
+  if (name.startsWith(RESERVED_MCP_PREFIX)) {
+    throw new Error(
+      `mcp-config server name '${name}' is reserved: names starting with '${RESERVED_MCP_PREFIX}' are for harness built-ins.`
     );
   }
   const def = rawDef && typeof rawDef === "object" ? rawDef : {};
@@ -55910,43 +56219,40 @@ function createDispatchServer(serverMap, { log = () => {}, path = "/dispatch" } 
       } catch {
         return send(res, 400, { error: "request body is not valid JSON" });
       }
+
+      // Discovery: relay `tools/list` (native MCP shape) for one server or all.
+      // `{ discover: true [, server] }` -> { servers: { <name>: { tools: [...] } } }.
+      if (payload.discover) {
+        try {
+          const names = payload.server ? [payload.server] : Object.keys(serverMap);
+          const servers = {};
+          for (const n of names) {
+            const s = serverMap[n];
+            if (!s) return send(res, 404, { status: "error", error: `no such MCP server '${n}'` });
+            servers[n] = { tools: await getTools(n, s) };
+          }
+          return send(res, 200, { status: "ok", servers });
+        } catch (e) {
+          log(`discovery failed: ${e.message}`);
+          return send(res, 502, { status: "error", error: e.message });
+        }
+      }
+
+      // Tool call: `{ server, tool, input }` where input is the JSON arguments object
+      // (already matching the tool's inputSchema — the shim is a pure passthrough).
       const name = payload && payload.server;
       const server = name && serverMap[name];
       if (!server) return send(res, 404, { error: `no such MCP server '${name}'` });
+      const toolName = payload.tool;
+      if (!toolName) return send(res, 400, { status: "error", server: name, text: "no tool specified" });
 
       try {
         const tools = await getTools(name, server);
-
-        // `<server>` (help, no tool): list the server's tools.
-        if (payload.help && !payload.tool) {
-          const listing = tools
-            .map((t) => `  ${t.name}${t.description ? " — " + firstLine(t.description) : ""}`)
-            .join("\n");
-          return send(res, 200, { status: "ok", server: name, text: `Tools for ${name}:\n${listing}` });
-        }
-
-        // Resolve the tool. When the shim omits the tool name (empty/undefined) and
-        // the server exposes exactly one tool, infer it — so a single-tool safe-output
-        // server can be invoked as `/__mcp/<server> --flags` with no redundant tool name.
-        let toolName = payload.tool;
-        if ((toolName === undefined || toolName === null || toolName === "") && tools.length === 1) {
-          toolName = tools[0].name;
-        }
         const tool = tools.find((t) => t.name === toolName);
         if (!tool) {
           return send(res, 404, { status: "error", server: name, text: `no tool '${toolName}' on server '${name}'` });
         }
-
-        // `<server> <tool> --help`: show a CLI usage synopsis derived from the schema
-        // (mirrors how the shim/convertArgs actually accept args — positional for a
-        // single string-array/string prop, flags otherwise, with --add/--delete for the
-        // additions/deletions file-change convention), so the tool is self-describing.
-        if (payload.help) {
-          return send(res, 200, { status: "ok", server: name, tool: toolName, text: renderToolUsage(tool) });
-        }
-
-        // `<server> <tool> <args>`: convert positional args via the schema, then call.
-        const args = convertArgs(tool.inputSchema, payload.args || []);
+        const args = payload.input && typeof payload.input === "object" ? payload.input : {};
         const result = await callTool(server, toolName, args);
         const text = result?.content?.[0]?.text ?? "";
         if (result?.isError) {
@@ -55961,124 +56267,6 @@ function createDispatchServer(serverMap, { log = () => {}, path = "/dispatch" } 
       }
     });
   });
-}
-
-/**
- * Convert positional string args (from a shim) into the tool's argument object,
- * using its JSON Schema. Mirrors the old per-tool shim heuristic, host-side:
- *   - single array-of-strings property -> {prop: [args]}
- *   - single string property           -> {prop: args.join(' ')}
- *   - otherwise                        -> JSON.parse(args[0] || '{}')
- * @param {object} schema
- * @param {string[]} args
- * @returns {object}
- */
-function convertArgs(schema, args) {
-  const props = (schema && schema.properties) || {};
-  const keys = Object.keys(props);
-  if (keys.length === 1) {
-    const key = keys[0];
-    const prop = props[key] || {};
-    if (prop.type === "array" && prop.items && prop.items.type === "string") {
-      return { [key]: args };
-    }
-    if (prop.type === "string") {
-      return { [key]: args.join(" ") };
-    }
-  }
-  if (args.length === 0) return {};
-  let obj;
-  try {
-    obj = JSON.parse(args[0]);
-  } catch {
-    throw new Error(`could not parse arguments as JSON: ${args[0]}`);
-  }
-  // Flag-mode payloads carry scalars as strings; coerce a scalar to a 1-element array
-  // when the schema declares the property an array (e.g. a single `--labels bug`), and
-  // coerce string booleans for boolean properties. Mirrors the shim's flag handling.
-  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
-    for (const [key, sub] of Object.entries(props)) {
-      const v = obj[key];
-      if (v === undefined) continue;
-      const types = Array.isArray(sub.type) ? sub.type : [sub.type];
-      if (types.includes("array") && !Array.isArray(v)) obj[key] = [v];
-    }
-  }
-  return obj;
-}
-
-/**
- * Render a CLI usage synopsis for a tool from its JSON Schema, mirroring how the shim
- * + convertArgs accept arguments — so `--help` teaches the ACTUAL invocation instead of
- * dumping a raw schema. This is what makes every tool (including create_pull_request)
- * self-describing via discovery.
- *   - a single string-array property  -> positional: `<tool> <prop>...`
- *   - a single string property        -> positional: `<tool> <prop>`
- *   - otherwise                       -> flags:      `<tool> --k <v> ...`
- * The `additions`/`deletions` file-change convention renders as `--add <path>` /
- * `--delete <path>` (repeatable; the shim reads the file contents from the workspace),
- * hiding the base64 wire format.
- * @param {{name:string, description?:string, inputSchema?:object}} tool
- * @returns {string}
- */
-function renderToolUsage(tool) {
-  const schema = tool.inputSchema || {};
-  const props = schema.properties || {};
-  const keys = Object.keys(props);
-  const required = new Set(schema.required || []);
-  const head = `${tool.name}${tool.description ? "\n" + tool.description : ""}`;
-
-  // Positional-mode tools (mirror convertArgs' single-property heuristics).
-  if (keys.length === 1) {
-    const key = keys[0];
-    const prop = props[key] || {};
-    if (prop.type === "array" && prop.items && prop.items.type === "string") {
-      const d = prop.items.description || prop.description || "";
-      return `${head}\nUsage: ${tool.name} <${key}>...   (one or more, space-separated)${d ? `\n  <${key}>  ${firstLine(d)}` : ""}`;
-    }
-    if (prop.type === "string") {
-      return `${head}\nUsage: ${tool.name} <${key}>${prop.description ? `\n  <${key}>  ${firstLine(prop.description)}` : ""}`;
-    }
-  }
-
-  // Flag-mode tools.
-  const synopsis = [];
-  const docs = [];
-  for (const key of keys) {
-    const prop = props[key] || {};
-    if (key === "additions" && isFileChangeArray(prop, true)) {
-      synopsis.push("--add <path>...");
-      docs.push("  --add <path>       a file to add or overwrite (repeatable; contents read from your workspace)");
-      continue;
-    }
-    if (key === "deletions" && isFileChangeArray(prop, false)) {
-      synopsis.push("--delete <path>...");
-      docs.push("  --delete <path>    a file to delete (repeatable)");
-      continue;
-    }
-    const isStrArray = prop.type === "array" && prop.items && prop.items.type === "string";
-    const type = isStrArray ? "value" : Array.isArray(prop.type) ? prop.type[0] : prop.type || "value";
-    const flag = `--${key} <${type}>`;
-    if (isStrArray) {
-      synopsis.push(required.has(key) ? `${flag}...` : `[${flag}...]`);
-      docs.push(`  ${flag}${required.has(key) ? "  (required)" : ""}  ${firstLine(prop.description || "")} (repeatable)`.replace(/\s+$/, ""));
-      continue;
-    }
-    synopsis.push(required.has(key) ? flag : `[${flag}]`);
-    docs.push(`  ${flag}${required.has(key) ? "  (required)" : ""}  ${firstLine(prop.description || "")}`.replace(/\s+$/, ""));
-  }
-  return `${head}\nUsage: ${tool.name} ${synopsis.join(" ")}\nArguments:\n${docs.join("\n")}`;
-}
-
-// A file-change array property: {type:array, items:{properties:{path[,contents]}}}.
-function isFileChangeArray(prop, wantContents) {
-  if (!prop || prop.type !== "array" || !prop.items || prop.items.type !== "object") return false;
-  const p = prop.items.properties || {};
-  return !!p.path && (wantContents ? !!p.contents : true);
-}
-
-function firstLine(s) {
-  return String(s).split("\n")[0];
 }
 
 function send(res, code, obj) {
@@ -56935,328 +57123,6 @@ async function fetchArtifacts({ imagesRepo, imagesTag, copilotUrl, copilotVersio
   return { kernelPath, rootfsPath, copilotDir };
 }
 
-;// CONCATENATED MODULE: ./src/guest-assets.js
-// Generate the guest-side assets: the per-server CLI shims, the MCP preamble, the
-// mount setup, and the init script.
-//
-// The guest rootfs is a prebuilt BARE image (from ericsciple/microvm-images) that
-// carries no per-run content. Everything run-specific is delivered via mounts:
-//   - the runtime config drive (vdb, /__rt): init.sh + prompt + agent.env + gateway CA
-//   - the Copilot CLI (its own drive, mounted with a discard overlay)
-//   - the /__mcp shims + event.json (read-only)
-//   - the workspace / tool cache (read-only lower + discard overlay)
-//
-// Shims are the guest's only view of an MCP server. There is ONE shim per server
-// (not per tool), delivered off-PATH in a read-only /__mcp mount. A shim is a thin
-// forwarder that POSTs to the host dispatch endpoint (see dispatch.js):
-//   /__mcp/<server>                 -> list the server's tools        (lazy tools/list)
-//   /__mcp/<server> <tool> --help   -> show a tool's input schema
-//   /__mcp/<server> <tool> <args>   -> run a tool
-// The shim carries NO schema — discovery is lazy and host-side (dispatch caches
-// tools/list per server), so the guest rootfs/base image needs no per-run baking.
-
-const DEFAULT_DISPATCH_ENDPOINT = "http://172.16.0.1:9000/dispatch";
-const DEFAULT_MCP_DIR = "/__mcp";
-// The per-run runtime config drive is ALWAYS the first extra drive (vdb); the bare
-// rootfs's baked /init stub mounts it here and execs /__rt/init.sh (see microvm-images).
-const DEFAULT_RUNTIME_DIR = "/__rt";
-// Guest-side helper scripts (report-error/warning/notice/incomplete) live here,
-// colocated on the runtime drive and OFF-PATH (like the /__mcp shims). Surfaced to
-// the agent via $MV_HELPERS_DIR so nothing hardcodes the path.
-const DEFAULT_HELPERS_DIR = `${DEFAULT_RUNTIME_DIR}/helpers`;
-// Where the Copilot CLI binary is mounted (its own drive, with a discard overlay so
-// anything it writes next to itself is captured in tmpfs and discarded).
-const DEFAULT_COPILOT_DIR = "/opt/copilot";
-
-// A plain-text (NOT a ::workflow-command::) sentinel that report-incomplete prints so
-// the host console grader can detect an agent-declared failure. It must NOT be a
-// `::...::` line, or the stdout allowlist filter would neutralize it before grading.
-const REPORT_INCOMPLETE_SENTINEL = "__MICROVM_AGENT_REPORT_INCOMPLETE__";
-
-/**
- * One shim per server. POSIX sh; needs jq + curl + base64 in the guest.
- *
- * Invocation:
- *   <server>                          list this server's tools
- *   <server> <tool> --help            show a tool's input schema
- *   <server> <tool> [positional...]   run a tool with positional args
- *   <server> [<tool>] --key value ... run a tool in FLAG mode (below)
- *
- * FLAG mode (any `--flag` present) builds a JSON argument object instead of
- * positional args, and supports two GENERIC file flags so a tool can receive file
- * CONTENTS without the agent putting bytes on the command line (ARG_MAX):
- *   --add <path>     read <path> from $GITHUB_WORKSPACE, base64 it, append to additions[]
- *   --delete <path>  append {path} to deletions[]
- *   --key <value>    set a scalar arg
- * Paths are sandboxed to the workspace (no absolute/.. escapes); contents ride the
- * POST body (stdin), never argv. When the tool name is omitted (first token is a
- * flag), a single-tool server infers its one tool host-side.
- * @param {string} serverName
- * @param {{endpoint?: string}} [opts]
- * @returns {string} shell script contents for the shim
- */
-function generateServerShim(serverName, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
-  return `#!/bin/sh
-# MCP shim for server '${serverName}'.
-S=${shq(serverName)}
-EP=${shq(endpoint)}
-post() { curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-; echo; }
-
-# No args, or only --help: list the server's tools.
-if [ $# -eq 0 ] || { [ $# -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; }; then
-  jq -nc --arg s "$S" '{server:$s,help:true}' | post
-  exit 0
-fi
-
-# Tool name is a leading bareword; a leading flag means "single-tool server" (the
-# host infers the one tool).
-tool=""
-case "$1" in
-  -*) : ;;
-  *) tool=$1; shift ;;
-esac
-
-# <tool> --help: show the tool's schema.
-if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-  jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,help:true}' | post
-  exit 0
-fi
-
-case "$1" in
-  --*)
-    # FLAG mode: build a JSON argument object; inline files for --add.
-    WS=\${GITHUB_WORKSPACE:-.}
-    ADDS=$(mktemp); DELS=$(mktemp); OBJ=$(mktemp)
-    : > "$ADDS"; : > "$DELS"; echo '{}' > "$OBJ"
-    while [ $# -gt 0 ]; do
-      k=$1
-      case "$k" in
-        --add|--delete)
-          p=$2; shift 2
-          case "$p" in
-            /*|..|../*|*/..|*/../*) echo "invalid path (must be workspace-relative): $p" >&2; exit 2 ;;
-          esac
-          if [ "$k" = "--add" ]; then
-            [ -f "$WS/$p" ] || { echo "file not found: $p" >&2; exit 1; }
-            c=$(base64 -w0 "$WS/$p" 2>/dev/null) || c=$(base64 "$WS/$p" | tr -d '\\n')
-            jq -nc --arg path "$p" --arg contents "$c" '{path:$path,contents:$contents}' >> "$ADDS"
-          else
-            jq -nc --arg path "$p" '{path:$path}' >> "$DELS"
-          fi
-          ;;
-        --*)
-          key=\${k#--}; v=$2; shift 2
-          # A repeated --key accumulates into an array; a single --key stays scalar.
-          # (The host coerces a scalar to a 1-element array when the schema wants one.)
-          jq -c --arg key "$key" --arg v "$v" \\
-            'if has($key) then .[$key] = ((.[$key] | if type=="array" then . else [.] end) + [$v]) else . + {($key):$v} end' \\
-            "$OBJ" > "$OBJ.n" && mv "$OBJ.n" "$OBJ"
-          ;;
-        *) echo "unexpected argument: $k" >&2; exit 2 ;;
-      esac
-    done
-    A=$(jq -sc '.' "$ADDS"); D=$(jq -sc '.' "$DELS"); O=$(cat "$OBJ")
-    rm -f "$ADDS" "$DELS" "$OBJ"
-    PAYLOAD=$(jq -nc --argjson o "$O" --argjson a "$A" --argjson d "$D" \\
-      '$o + (if ($a|length)>0 then {additions:$a} else {} end) + (if ($d|length)>0 then {deletions:$d} else {} end)')
-    jq -nc --arg s "$S" --arg t "$tool" --arg p "$PAYLOAD" '{server:$s,tool:$t,args:[$p]}' | post
-    ;;
-  *)
-    # Positional mode.
-    jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,args:$ARGS.positional}' --args "$@" | post
-    ;;
-esac
-`;
-}
-
-/**
- * Guest-side helper scripts the agent runs to surface diagnostics the Actions-native
- * way — inline `::error::`/`::warning::`/`::notice::` annotations — and to declare
- * failure. Each takes the raw message as its first arg and does the workflow-command
- * escaping (`%`->`%25`, CR->`%0D`, LF->`%0A`) itself, so the agent NEVER hand-formats
- * `::error::` (the fragile part). They print to the guest console; the host stdout
- * allowlist filter passes these informational commands through so the runner renders
- * them inline. `report-incomplete` additionally prints a plain-text sentinel that the
- * host console grader detects to fail the step (an agent that ran fine but could not
- * achieve the task — neither an exit code nor a workflow command can express that).
- *
- * POSIX sh + awk (mawk/gawk); the escape is line-by-line (joined with %0A) so it works
- * in mawk, which lacks gawk's whole-file RS slurp.
- * @returns {Record<string,string>} filename -> script contents
- */
-function generateHelperScripts() {
-  // Line-by-line escape: mawk-safe (default RS splits on \n); rejoin multi-line
-  // messages with the literal %0A escape. Escapes % first so we don't double-escape
-  // the %0D/%0A we introduce.
-  const escape = `awk '
-  { gsub(/%/, "%25"); gsub(/\\r/, "%0D"); out = out (NR > 1 ? "%0A" : "") $0 }
-  END { printf "%s", out }
-'`;
-  const emit = (command, description) =>
-    `#!/bin/sh
-# ${command} — ${description}
-# Usage: ${command} "message"
-# Escapes the message and prints an Actions workflow command; the agent never
-# hand-formats '::...::' itself.
-msg=$(printf '%s' "\${1:-}" | ${escape})
-printf '::${command === "report-incomplete" ? "error" : command.replace(/^report-/, "")}::%s\\n' "$msg"
-`;
-  return {
-    "report-error": emit("report-error", "surface an inline error annotation"),
-    "report-warning": emit("report-warning", "surface an inline warning annotation"),
-    "report-notice": emit("report-notice", "surface an inline notice annotation"),
-    "report-incomplete":
-      emit("report-incomplete", "declare the task could not be completed (fails the run)") +
-      `printf '%s\\n' ${shq(REPORT_INCOMPLETE_SENTINEL)}\n`,
-  };
-}
-
-/**
- * The preamble prepended to the user prompt: tells the agent it's in an isolated
- * microVM, where the event payload is, how to discover + run MCP tools (via the
- * $MV_MCP_DIR env var, never a hardcoded path), and how to surface diagnostics /
- * declare failure via the $MV_HELPERS_DIR helper scripts.
- * @param {string[]} serverNames
- * @param {{mcpDir?: string}} [opts]
- * @returns {string}
- */
-function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = {}) {
-  void mcpDir; // paths are referenced via $MV_MCP_DIR, not baked in.
-  const lines = [
-    "You are an autonomous agent inside an isolated, ephemeral Firecracker microVM.",
-    "The triggering event payload (issue/PR JSON) is at the path in $GITHUB_EVENT_PATH.",
-  ];
-  if (serverNames.length) {
-    lines.push("Tools are provided by MCP servers, exposed as commands under $MV_MCP_DIR:");
-    for (const s of serverNames) lines.push(`  $MV_MCP_DIR/${s}`);
-    lines.push(
-      'List a server\'s tools: `"$MV_MCP_DIR/<server>"`. Show a tool\'s usage: `"$MV_MCP_DIR/<server>" <tool> --help`.',
-      'Run a tool as shown by its --help — either positional args or `--flag <value>` pairs. To include ' +
-        'file changes (e.g. for a pull request), pass `--add <path>` (repeatable) and `--delete <path>`; ' +
-        'the file contents are read from your workspace for you.'
-    );
-  }
-  lines.push(
-    'To surface a problem in the run log, run `"$MV_HELPERS_DIR/report-error" "<message>"` ' +
-      "(also report-warning and report-notice for less-severe notes).",
-    'If you cannot complete the task, run `"$MV_HELPERS_DIR/report-incomplete" "<reason>"` ' +
-      "to fail the run with an explanation.",
-    "---"
-  );
-  return lines.join("\n") + "\n";
-}
-
-/**
- * Generate the bash that mounts the requested host images inside the guest.
- * Install-type mounts (copilot, workspace, tool cache) use a read-only lower + a
- * throwaway tmpfs overlay, so tools that write into their own directory don't fail,
- * yet nothing persists and the underlying image stays pristine (hypervisor RO). The
- * /__mcp harness is a pure read-only mount (tamper-proof shims + event.json).
- * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
- * @returns {string}
- */
-function generateMountSetup({ copilot = null, harness = null, workspace = null, toolcache = null } = {}) {
-  // A read-only image + throwaway tmpfs overlay at `path`. `tag` namespaces the temp
-  // dirs so multiple overlays don't collide.
-  const overlay = (tag, dev, mountPath) =>
-    `\n# --- ${tag}: hypervisor read-only lower + throwaway tmpfs overlay ---\n` +
-    `mkdir -p /mnt/mv-${tag}-lower /mnt/mv-${tag}-rw ${shq(mountPath)}\n` +
-    `mount -o ro ${shq(dev)} /mnt/mv-${tag}-lower\n` +
-    `mount -t tmpfs tmpfs /mnt/mv-${tag}-rw\n` +
-    `mkdir -p /mnt/mv-${tag}-rw/upper /mnt/mv-${tag}-rw/work\n` +
-    `mount -t overlay overlay -o lowerdir=/mnt/mv-${tag}-lower,upperdir=/mnt/mv-${tag}-rw/upper,workdir=/mnt/mv-${tag}-rw/work ${shq(mountPath)}\n`;
-
-  let out = "";
-  if (copilot) out += overlay("cp", copilot.dev, copilot.path);
-  if (harness) {
-    out +=
-      `\n# --- harness config (shims + event.json): hypervisor read-only ---\n` +
-      `mkdir -p ${shq(harness.path)}\n` +
-      `mount -o ro ${shq(harness.dev)} ${shq(harness.path)}\n`;
-  }
-  if (workspace) out += overlay("ws", workspace.dev, workspace.path);
-  if (toolcache) out += overlay("tc", toolcache.dev, toolcache.path);
-  return out;
-}
-
-function shq(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
-}
-
-/**
- * The per-run init script, delivered on the runtime config drive and run as
- * /__rt/init.sh by the bare rootfs's baked /init stub (which has already mounted
- * proc/sys/dev and /__rt). It brings up networking, trusts the gateway CA, sets up
- * the mounts (Copilot + /__mcp + workspace + tool cache), exports the Copilot auth
- * env, and runs the agent. All run-specific files are read from /__rt.
- * @param {Object} [opts]
- * @param {string} [opts.guestIp]
- * @param {string} [opts.hostIp]
- * @param {string} [opts.dns]
- * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
- * @param {string} [opts.runtimeDir]
- * @returns {string}
- */
-function generateInitScript({
-  guestIp = "172.16.0.2",
-  hostIp = "172.16.0.1",
-  dns = "8.8.8.8",
-  mounts = {},
-  runtimeDir = DEFAULT_RUNTIME_DIR,
-} = {}) {
-  const mountSetup = generateMountSetup(mounts);
-  const copilotDir = mounts.copilot ? mounts.copilot.path : DEFAULT_COPILOT_DIR;
-  const addDirs = ["/root"];
-  // The MCP shims live in the harness mount (/__mcp) and the report-* helpers +
-  // event.json live on the runtime drive (/__rt); the CLI can only execute/read files
-  // under directories it's been granted, so add both (and the workspace when mounted).
-  addDirs.push(runtimeDir);
-  if (mounts.harness) addDirs.push(mounts.harness.path);
-  if (mounts.workspace) addDirs.push(mounts.workspace.path);
-  const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
-  // Run the agent from the workspace when it's mounted (like Actions container jobs,
-  // whose working directory is the workspace); otherwise fall back to /root.
-  const workDir = mounts.workspace ? mounts.workspace.path : "/root";
-
-  return `#!/bin/sh
-set -x
-RT=${shq(runtimeDir)}
-ip link set lo up
-ip addr add ${guestIp}/30 dev eth0
-ip link set eth0 up
-ip route add default via ${hostIp}
-echo 'nameserver ${dns}' > /etc/resolv.conf
-# Trust the per-run gateway CA (delivered on the runtime drive; rootfs is writable).
-cp "$RT/mitmproxy-ca.pem" /usr/local/share/ca-certificates/mitmproxy.crt 2>/dev/null || true
-update-ca-certificates 2>/dev/null || true
-# Guest MCP config (no secrets) — the CLI reads it from HOME/.copilot.
-mkdir -p /root/.copilot
-cp "$RT/mcp-config.json" /root/.copilot/mcp-config.json 2>/dev/null || true
-${mountSetup}
-export HOME=/root
-export XDG_CONFIG_HOME=/root
-export PATH=${shq(copilotDir)}:$PATH
-export COPILOT_AGENT_RUNNER_TYPE=STANDALONE
-export S2STOKENS=true
-export GITHUB_COPILOT_INTEGRATION_ID=agentic-workflows
-export NODE_EXTRA_CA_CERTS="$RT/mitmproxy-ca.pem"
-export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-[ -f "$RT/agent.env" ] && . "$RT/agent.env"
-cd ${shq(workDir)} 2>/dev/null || cd /root
-
-echo "=== GUEST: starting copilot ==="
-copilot --no-ask-user --allow-all-tools \\
-  ${addDirFlags} --log-level all --log-dir /tmp/cplogs \\
-  -p "$(cat "$RT/prompt.txt")" 2>&1
-echo "=== GUEST: AGENT_EXIT=$? ==="
-
-sync
-echo 1 > /proc/sys/kernel/sysrq
-echo b > /proc/sysrq-trigger
-sleep infinity
-`;
-}
-
 ;// CONCATENATED MODULE: ./src/console-filter.js
 // Host-side handling of the UNTRUSTED guest serial console.
 //
@@ -57546,9 +57412,10 @@ async function main() {
   const rootfsSrc = inputs.rootfs || rootfsPath;
   if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
 
-  // 5a. Assemble the read-only /__mcp harness mount: one shim per server. (event.json
-  //     moved to /__rt below — it's per-run context/data, not a tool, so /__mcp is
-  //     shims-only and is created only when there are actually MCP servers.)
+  // 5a. Assemble the read-only /__mcp harness mount: one call shim per server, plus the
+  //     built-in `__tools_list` discovery command (reserved `__` prefix). event.json
+  //     lives on /__rt (per-run context/data, not a tool). /__mcp exists whenever there
+  //     is at least one server (the discovery command needs something to list).
   const harnessSrc = freshDir(external_node_path_namespaceObject.join(WORK, "harness"));
   for (const name of serverNames) {
     const shimPath = external_node_path_namespaceObject.join(harnessSrc, name);
@@ -57556,6 +57423,11 @@ async function main() {
     external_node_fs_namespaceObject.chmodSync(shimPath, 0o755);
   }
   const harnessHasContent = serverNames.length > 0;
+  if (harnessHasContent) {
+    const toolsListPath = external_node_path_namespaceObject.join(harnessSrc, TOOLS_LIST_COMMAND);
+    external_node_fs_namespaceObject.writeFileSync(toolsListPath, generateToolsListShim());
+    external_node_fs_namespaceObject.chmodSync(toolsListPath, 0o755);
+  }
 
   // 5b. The per-run runtime config mount (/__rt, always vdb): init.sh + prompt.txt +
   //     agent.env + mitmproxy-ca.pem + mcp-config.json + event.json + the report-*
@@ -57610,14 +57482,6 @@ async function main() {
 
   // Runtime agent env (no secrets — all fake sentinels).
   let agentEnv = `export COPILOT_GITHUB_TOKEN=${FAKE_TOKEN}\n`;
-  // In native github mode, the CLI's built-in github server may read the token from a
-  // different env var; export the SAME fake sentinel under the common names so the
-  // gateway's fake->real swap covers whichever one it uses (all fake — safe).
-  if (inputs.githubMode === "native") {
-    agentEnv += `export GITHUB_PERSONAL_ACCESS_TOKEN=${FAKE_TOKEN}\n`;
-    agentEnv += `export GITHUB_TOKEN=${FAKE_TOKEN}\n`;
-    agentEnv += `export GH_TOKEN=${FAKE_TOKEN}\n`;
-  }
   // Point the guest's GITHUB_WORKSPACE / RUNNER_TOOL_CACHE at the well-known mount
   // points, so the agent and tooling resolve them correctly inside the guest.
   if (initMounts.workspace) agentEnv += `export GITHUB_WORKSPACE=${initMounts.workspace.path}\n`;
@@ -57636,11 +57500,11 @@ async function main() {
     }
   }
   if (guestEventPath) agentEnv += `export GITHUB_EVENT_PATH=${guestEventPath}\n`;
-  // Well-known dirs for the guest-side tools, so prompts/authors never hardcode paths:
-  // $MV_HELPERS_DIR (report-* diagnostics helpers, always present) and $MV_MCP_DIR (the
-  // MCP shims, only when there are servers).
+  // Well-known dirs for the guest-side tools, always exported so prompts/authors never
+  // hardcode paths: $MV_MCP_DIR (MCP call + discovery commands) and $MV_HELPERS_DIR
+  // (report-* diagnostics helpers). Both are stable indirection points we can relocate.
+  agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
   agentEnv += `export MV_HELPERS_DIR=${DEFAULT_HELPERS_DIR}\n`;
-  if (harnessHasContent) agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
   external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(rtSrc, "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above). Empty by default — every
   // server reaches the guest as a /__mcp shim, not a native guest MCP entry.

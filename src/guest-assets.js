@@ -35,99 +35,82 @@ export const DEFAULT_COPILOT_DIR = "/opt/copilot";
 // `::...::` line, or the stdout allowlist filter would neutralize it before grading.
 export const REPORT_INCOMPLETE_SENTINEL = "__MICROVM_AGENT_REPORT_INCOMPLETE__";
 
+// Reserved namespace for harness-provided built-in commands under /__mcp. Customer
+// MCP server names may not start with this prefix (see mcp-config.js validation), so
+// built-ins like `__tools_list` never collide with a registered server.
+export const RESERVED_MCP_PREFIX = "__";
+// The MCP discovery command (relays `tools/list` to the gateway). Lives in /__mcp
+// alongside the call shims — discovery is tools-stuff, so one dir + one env var
+// ($MV_MCP_DIR) covers both discovery and calls.
+export const TOOLS_LIST_COMMAND = "__tools_list";
+
 /**
- * One shim per server. POSIX sh; needs jq + curl + base64 in the guest.
+ * One call shim per registered MCP server — a PURE passthrough (POSIX sh; needs jq +
+ * curl). It carries NO schema and NO application logic: it forwards a JSON arguments
+ * object to the host gateway, which routes it to the server's `tools/call`.
  *
- * Invocation:
- *   <server>                          list this server's tools
- *   <server> <tool> --help            show a tool's input schema
- *   <server> <tool> [positional...]   run a tool with positional args
- *   <server> [<tool>] --key value ... run a tool in FLAG mode (below)
+ *   <server> <tool> --input '<JSON>'   invoke <tool> with the given JSON arguments
+ *   <server> <tool> --stdin            invoke <tool> with JSON arguments read from stdin
  *
- * FLAG mode (any `--flag` present) builds a JSON argument object instead of
- * positional args, and supports two GENERIC file flags so a tool can receive file
- * CONTENTS without the agent putting bytes on the command line (ARG_MAX):
- *   --add <path>     read <path> from $GITHUB_WORKSPACE, base64 it, append to additions[]
- *   --delete <path>  append {path} to deletions[]
- *   --key <value>    set a scalar arg
- * Paths are sandboxed to the workspace (no absolute/.. escapes); contents ride the
- * POST body (stdin), never argv. When the tool name is omitted (first token is a
- * flag), a single-tool server infers its one tool host-side.
+ * Discovery is NOT here — run `$MV_MCP_DIR/__tools_list` (see generateToolsListShim).
+ * Arguments always match the tool's advertised inputSchema; the shim never translates,
+ * inspects, or synthesizes them (no positional/flag modes, no file handling).
  * @param {string} serverName
  * @param {{endpoint?: string}} [opts]
  * @returns {string} shell script contents for the shim
  */
 export function generateServerShim(serverName, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
   return `#!/bin/sh
-# MCP shim for server '${serverName}'.
+# MCP call shim for server '${serverName}'. Pure passthrough to the host gateway.
+#   ${serverName} <tool> --input '<JSON>'   invoke a tool with JSON arguments
+#   ${serverName} <tool> --stdin            invoke a tool with JSON arguments from stdin
+# Discover tools with: "$MV_MCP_DIR/${TOOLS_LIST_COMMAND}"
 S=${shq(serverName)}
 EP=${shq(endpoint)}
-post() { curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-; echo; }
+usage() { echo "usage: ${serverName} <tool> --input '<JSON>' | --stdin" >&2; exit 2; }
 
-# No args, or only --help: list the server's tools.
-if [ $# -eq 0 ] || { [ $# -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; }; then
-  jq -nc --arg s "$S" '{server:$s,help:true}' | post
-  exit 0
-fi
-
-# Tool name is a leading bareword; a leading flag means "single-tool server" (the
-# host infers the one tool).
-tool=""
-case "$1" in
-  -*) : ;;
-  *) tool=$1; shift ;;
-esac
-
-# <tool> --help: show the tool's schema.
-if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-  jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,help:true}' | post
-  exit 0
-fi
+[ $# -ge 1 ] || usage
+tool=$1; shift
+[ $# -ge 1 ] || usage
 
 case "$1" in
-  --*)
-    # FLAG mode: build a JSON argument object; inline files for --add.
-    WS=\${GITHUB_WORKSPACE:-.}
-    ADDS=$(mktemp); DELS=$(mktemp); OBJ=$(mktemp)
-    : > "$ADDS"; : > "$DELS"; echo '{}' > "$OBJ"
-    while [ $# -gt 0 ]; do
-      k=$1
-      case "$k" in
-        --add|--delete)
-          p=$2; shift 2
-          case "$p" in
-            /*|..|../*|*/..|*/../*) echo "invalid path (must be workspace-relative): $p" >&2; exit 2 ;;
-          esac
-          if [ "$k" = "--add" ]; then
-            [ -f "$WS/$p" ] || { echo "file not found: $p" >&2; exit 1; }
-            c=$(base64 -w0 "$WS/$p" 2>/dev/null) || c=$(base64 "$WS/$p" | tr -d '\\n')
-            jq -nc --arg path "$p" --arg contents "$c" '{path:$path,contents:$contents}' >> "$ADDS"
-          else
-            jq -nc --arg path "$p" '{path:$path}' >> "$DELS"
-          fi
-          ;;
-        --*)
-          key=\${k#--}; v=$2; shift 2
-          # A repeated --key accumulates into an array; a single --key stays scalar.
-          # (The host coerces a scalar to a 1-element array when the schema wants one.)
-          jq -c --arg key "$key" --arg v "$v" \\
-            'if has($key) then .[$key] = ((.[$key] | if type=="array" then . else [.] end) + [$v]) else . + {($key):$v} end' \\
-            "$OBJ" > "$OBJ.n" && mv "$OBJ.n" "$OBJ"
-          ;;
-        *) echo "unexpected argument: $k" >&2; exit 2 ;;
-      esac
-    done
-    A=$(jq -sc '.' "$ADDS"); D=$(jq -sc '.' "$DELS"); O=$(cat "$OBJ")
-    rm -f "$ADDS" "$DELS" "$OBJ"
-    PAYLOAD=$(jq -nc --argjson o "$O" --argjson a "$A" --argjson d "$D" \\
-      '$o + (if ($a|length)>0 then {additions:$a} else {} end) + (if ($d|length)>0 then {deletions:$d} else {} end)')
-    jq -nc --arg s "$S" --arg t "$tool" --arg p "$PAYLOAD" '{server:$s,tool:$t,args:[$p]}' | post
-    ;;
-  *)
-    # Positional mode.
-    jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,args:$ARGS.positional}' --args "$@" | post
-    ;;
+  --input) [ $# -ge 2 ] || usage; INPUT=$2 ;;
+  --stdin) INPUT=$(cat) ;;
+  *) usage ;;
 esac
+
+# --argjson validates that INPUT is well-formed JSON before we send it.
+echo "$INPUT" | jq empty 2>/dev/null || { echo "arguments are not valid JSON" >&2; exit 2; }
+jq -nc --arg s "$S" --arg t "$tool" --argjson input "$INPUT" '{server:$s,tool:$t,input:$input}' \\
+  | curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-
+echo
+`;
+}
+
+/**
+ * The MCP discovery command (`$MV_MCP_DIR/__tools_list`). A thin relay that defers to
+ * the host gateway exactly like the call shims — it asks the gateway to run `tools/list`
+ * across the registered servers and prints the aggregated result (native `tools/list`
+ * shape: each tool's name, description, inputSchema), minified JSON.
+ *
+ *   __tools_list            list every registered server's tools
+ *   __tools_list <server>   list one server's tools
+ * @param {{endpoint?: string}} [opts]
+ * @returns {string} shell script contents for the discovery shim
+ */
+export function generateToolsListShim({ endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
+  return `#!/bin/sh
+# MCP tool discovery — relays 'tools/list' to the host gateway (like a native MCP
+# client). Prints all registered servers' tools (name, description, inputSchema).
+#   ${TOOLS_LIST_COMMAND}            list every server's tools
+#   ${TOOLS_LIST_COMMAND} <server>   list one server's tools
+EP=${shq(endpoint)}
+if [ $# -ge 1 ]; then
+  jq -nc --arg s "$1" '{discover:true,server:$s}'
+else
+  jq -nc '{discover:true}'
+fi | curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-
+echo
 `;
 }
 
@@ -189,13 +172,14 @@ export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = 
     "The triggering event payload (issue/PR JSON) is at the path in $GITHUB_EVENT_PATH.",
   ];
   if (serverNames.length) {
-    lines.push("Tools are provided by MCP servers, exposed as commands under $MV_MCP_DIR:");
-    for (const s of serverNames) lines.push(`  $MV_MCP_DIR/${s}`);
     lines.push(
-      'List a server\'s tools: `"$MV_MCP_DIR/<server>"`. Show a tool\'s usage: `"$MV_MCP_DIR/<server>" <tool> --help`.',
-      'Run a tool as shown by its --help — either positional args or `--flag <value>` pairs. To include ' +
-        'file changes (e.g. for a pull request), pass `--add <path>` (repeatable) and `--delete <path>`; ' +
-        'the file contents are read from your workspace for you.'
+      "Tools are provided by MCP servers, reachable as commands under $MV_MCP_DIR:",
+      ...serverNames.map((s) => `  $MV_MCP_DIR/${s}`),
+      `Discover tools (name, description, JSON input schema) by running \`"$MV_MCP_DIR/${TOOLS_LIST_COMMAND}"\` ` +
+        "(add a server name to list just that server).",
+      'Call a tool with its JSON arguments (matching the schema): ' +
+        '`"$MV_MCP_DIR/<server>" <tool> --input \'{"...":"..."}\'`, ' +
+        'or `--stdin` to pass the JSON on standard input (use this for large arguments).'
     );
   }
   lines.push(

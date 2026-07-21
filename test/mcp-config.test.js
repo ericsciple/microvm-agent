@@ -46,16 +46,9 @@ test("never writes the harness token into the guest config", () => {
   assert.ok(!JSON.stringify(guestConfig).includes("ghs_REAL_HARNESS_TOKEN"));
 });
 
-test("githubMode 'native' skips the host github docker server (rely on builtin)", () => {
-  const { guestConfig, hostServers } = buildGuestMcpConfig({ ...base, githubMode: "native" });
-  assert.ok(!hostServers.some((s) => s.name === "github"));
-  assert.equal(guestConfig.mcpServers.github, undefined);
-});
-
 test("extraGuestMcp merges a custom server into the guest config (negative control)", () => {
   const { guestConfig } = buildGuestMcpConfig({
     ...base,
-    githubMode: "native",
     extraGuestMcp: JSON.stringify({ mcpServers: { dummy: { command: "/bin/echo", args: ["hi"] } } }),
   });
   assert.ok(guestConfig.mcpServers.dummy);
@@ -121,6 +114,17 @@ test("rejects an unsafe server name (used verbatim as the /__mcp shim filename)"
       () => buildGuestMcpConfig({ ...base, mcpConfig }),
       /invalid/,
       `server name ${JSON.stringify(bad)} should be rejected`
+    );
+  }
+});
+
+test("rejects a reserved __-prefixed server name (harness built-in namespace)", () => {
+  for (const bad of ["__tools_list", "__anything", "__"]) {
+    const mcpConfig = JSON.stringify({ mcpServers: { [bad]: { command: "x" } } });
+    assert.throws(
+      () => buildGuestMcpConfig({ ...base, mcpConfig }),
+      /reserved/,
+      `server name ${JSON.stringify(bad)} should be rejected as reserved`
     );
   }
 });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { listTools, callTool } from "../src/mcp-client.js";
-import { buildToolRegistry, createDispatchServer, convertArgs } from "../src/dispatch.js";
+import { buildToolRegistry, createDispatchServer } from "../src/dispatch.js";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-mcp-server.mjs", import.meta.url));
 
@@ -37,22 +37,6 @@ test("callTool rejects when the command cannot be spawned", async () => {
   );
 });
 
-// --- convertArgs (host-side positional -> argument object) ---
-
-test("convertArgs maps positional args to a single array-of-strings property", () => {
-  const schema = { type: "object", properties: { labels: { type: "array", items: { type: "string" } } } };
-  assert.deepEqual(convertArgs(schema, ["bug", "triage"]), { labels: ["bug", "triage"] });
-});
-
-test("convertArgs joins positional args for a single string property", () => {
-  const schema = { type: "object", properties: { body: { type: "string" } } };
-  assert.deepEqual(convertArgs(schema, ["hello", "there"]), { body: "hello there" });
-});
-
-test("convertArgs parses a single JSON arg for multi-property tools", () => {
-  const schema = { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } };
-  assert.deepEqual(convertArgs(schema, ['{"a":"x","b":"y"}']), { a: "x", b: "y" });
-});
 
 // --- buildToolRegistry (used by probes/tests) ---
 
@@ -94,60 +78,63 @@ function post(port, obj, path = "/dispatch") {
   });
 }
 
-test("dispatch --help lists a server's tools", async () => {
+test("dispatch discovery lists a server's tools (native tools/list shape)", async () => {
   await withDispatch({ fixture: server({ FIXTURE_TOOL: "add_labels" }) }, async (port) => {
-    const res = await post(port, { server: "fixture", help: true });
+    const res = await post(port, { discover: true, server: "fixture" });
     assert.equal(res.status, 200);
-    assert.match(res.body.text, /add_labels/);
+    assert.equal(res.body.status, "ok");
+    assert.ok(res.body.servers.fixture);
+    assert.equal(res.body.servers.fixture.tools[0].name, "add_labels");
   });
 });
 
-test("dispatch tool --help shows a CLI usage synopsis", async () => {
-  await withDispatch({ fixture: server() }, async (port) => {
-    const res = await post(port, { server: "fixture", tool: "echo_tool", help: true });
-    assert.equal(res.status, 200);
-    assert.match(res.body.text, /Usage: echo_tool/);
-  });
+test("dispatch discovery with no server lists ALL registered servers", async () => {
+  await withDispatch(
+    { a: server({ FIXTURE_TOOL: "tool_a" }), b: server({ FIXTURE_TOOL: "tool_b" }) },
+    async (port) => {
+      const res = await post(port, { discover: true });
+      assert.equal(res.status, 200);
+      assert.deepEqual(Object.keys(res.body.servers).sort(), ["a", "b"]);
+      assert.equal(res.body.servers.a.tools[0].name, "tool_a");
+      assert.equal(res.body.servers.b.tools[0].name, "tool_b");
+    }
+  );
 });
 
-test("dispatch invokes a tool with converted args", async () => {
+test("dispatch invokes a tool with the JSON input object (passthrough)", async () => {
   await withDispatch({ fixture: server() }, async (port) => {
-    // fixture tool has schema {type:object} (no properties) -> generic JSON arg.
-    const res = await post(port, { server: "fixture", tool: "echo_tool", args: ['{"labels":["triage"]}'] });
+    const res = await post(port, { server: "fixture", tool: "echo_tool", input: { labels: ["triage"] } });
     assert.equal(res.status, 200);
     assert.equal(res.body.status, "ok");
     assert.equal(res.body.text, 'echo:{"labels":["triage"]}');
   });
 });
 
-test("dispatch infers the single tool when the tool name is omitted", async () => {
+test("dispatch requires a tool name (no inference)", async () => {
   await withDispatch({ fixture: server() }, async (port) => {
-    // No `tool` field: the fixture server exposes exactly one tool (echo_tool), so
-    // dispatch infers it (single-tool safe-output servers invoked as /__mcp/<server> --flags).
-    const res = await post(port, { server: "fixture", tool: "", args: ['{"a":1}'] });
-    assert.equal(res.status, 200);
-    assert.equal(res.body.status, "ok");
-    assert.equal(res.body.text, 'echo:{"a":1}');
+    const res = await post(port, { server: "fixture", input: { a: 1 } });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.status, "error");
   });
 });
 
 test("dispatch returns 404 for an unknown server", async () => {
   await withDispatch({}, async (port) => {
-    const res = await post(port, { server: "nope", help: true });
+    const res = await post(port, { server: "nope", tool: "x", input: {} });
     assert.equal(res.status, 404);
   });
 });
 
 test("dispatch returns 404 for an unknown tool on a known server", async () => {
   await withDispatch({ fixture: server() }, async (port) => {
-    const res = await post(port, { server: "fixture", tool: "missing", args: [] });
+    const res = await post(port, { server: "fixture", tool: "missing", input: {} });
     assert.equal(res.status, 404);
   });
 });
 
 test("dispatch reports a tool error without failing the request", async () => {
   await withDispatch({ fixture: server({ FIXTURE_ERROR: "1" }) }, async (port) => {
-    const res = await post(port, { server: "fixture", tool: "echo_tool", args: [] });
+    const res = await post(port, { server: "fixture", tool: "echo_tool", input: {} });
     assert.equal(res.status, 200);
     assert.equal(res.body.status, "error");
   });
@@ -169,55 +156,4 @@ test("dispatch rejects invalid JSON", async () => {
     });
     assert.equal(res.status, 400);
   });
-});
-
-// --- renderToolUsage (self-describing discovery) ---
-
-test("renderToolUsage: single string-array prop -> positional usage", async () => {
-  const { renderToolUsage } = await import("../src/dispatch.js");
-  const tool = { name: "add_labels", description: "Add labels.", inputSchema: { type: "object", properties: { labels: { type: "array", items: { type: "string" } } } } };
-  const u = renderToolUsage(tool);
-  assert.match(u, /Usage: add_labels <labels>\.\.\./);
-  assert.ok(!u.includes("--labels"));
-});
-
-test("renderToolUsage: file-change tool renders --add/--delete, not base64 schema", async () => {
-  const { renderToolUsage } = await import("../src/dispatch.js");
-  const tool = {
-    name: "create_pull_request",
-    description: "Open a PR.",
-    inputSchema: {
-      type: "object",
-      required: ["title", "body"],
-      properties: {
-        title: { type: "string", description: "Title." },
-        body: { type: "string", description: "Body." },
-        draft: { type: ["boolean", "string"], description: "Draft." },
-        additions: { type: "array", items: { type: "object", properties: { path: { type: "string" }, contents: { type: "string" } } } },
-        deletions: { type: "array", items: { type: "object", properties: { path: { type: "string" } } } },
-      },
-    },
-  };
-  const u = renderToolUsage(tool);
-  assert.match(u, /--title <string>/);
-  assert.match(u, /--add <path>/);
-  assert.match(u, /--delete <path>/);
-  assert.match(u, /contents read from your workspace/);
-  // The base64 wire detail is hidden from the agent-facing usage.
-  assert.ok(!/base64/.test(u));
-});
-
-test("renderToolUsage: multi-field string-array prop is a repeatable flag", async () => {
-  const { renderToolUsage } = await import("../src/dispatch.js");
-  const tool = { name: "create_issue", description: "", inputSchema: { type: "object", required: ["title"], properties: { title: { type: "string" }, labels: { type: "array", items: { type: "string" }, description: "Labels." } } } };
-  const u = renderToolUsage(tool);
-  assert.match(u, /\[--labels <value>\.\.\.\]/);
-  assert.match(u, /\(repeatable\)/);
-});
-
-test("convertArgs coerces a scalar to a 1-element array when the schema wants an array", async () => {
-  const { convertArgs } = await import("../src/dispatch.js");
-  const schema = { type: "object", properties: { title: { type: "string" }, labels: { type: "array", items: { type: "string" } } } };
-  assert.deepEqual(convertArgs(schema, ['{"title":"t","labels":"bug"}']), { title: "t", labels: ["bug"] });
-  assert.deepEqual(convertArgs(schema, ['{"title":"t","labels":["a","b"]}']), { title: "t", labels: ["a", "b"] });
 });
