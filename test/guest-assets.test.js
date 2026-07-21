@@ -129,19 +129,18 @@ test("init runs the agent from the workspace when mounted, else /root", () => {
   assert.ok(bare.includes("cd '/root'"));
 });
 
-test("generateFileChangeHelpers emits create-pull-request + push-to-pull-request-branch", async () => {
-  const { generateFileChangeHelpers } = await import("../src/guest-assets.js");
-  const h = generateFileChangeHelpers();
-  assert.deepEqual(Object.keys(h).sort(), ["create-pull-request", "push-to-pull-request-branch"]);
-  for (const [name, body] of Object.entries(h)) {
-    assert.match(body, /^#!\/bin\/sh/, `${name} is a sh script`);
-    assert.ok(body.includes("git add -A"), `${name} stages changes`);
-    assert.ok(body.includes("base64"), `${name} base64-encodes contents`);
-    assert.ok(body.includes("$MV_DISPATCH_ENDPOINT") || body.includes("MV_DISPATCH_ENDPOINT"), `${name} uses the dispatch endpoint`);
-    assert.ok(body.includes("--server"), `${name} takes --server`);
-  }
-  // create-pull-request ships base_sha + additions/deletions; push ships message.
-  assert.ok(h["create-pull-request"].includes("create_pull_request"));
-  assert.ok(h["create-pull-request"].includes("base_sha"));
-  assert.ok(h["push-to-pull-request-branch"].includes("push_to_pull_request_branch"));
+test("generateServerShim flag mode: --add/--delete are advertised + inline file contents", () => {
+  const shim = generateServerShim("create_pull_request");
+  // Flag mode is present and generic (any tool can use --add/--delete).
+  assert.match(shim, /--add\|--delete/);
+  assert.ok(shim.includes("base64"), "reads file contents as base64");
+  assert.ok(shim.includes("additions"), "builds additions[]");
+  assert.ok(shim.includes("deletions"), "builds deletions[]");
+  // Paths are sandboxed to the workspace (reject absolute/.. escapes).
+  assert.match(shim, /invalid path/);
+  assert.ok(shim.includes("GITHUB_WORKSPACE"), "reads from the workspace");
+  // Positional mode is retained for existing tools.
+  assert.ok(shim.includes("$ARGS.positional"));
+  // Single-tool servers may omit the tool name (leading flag -> no tool).
+  assert.match(shim, /tool=""/);
 });

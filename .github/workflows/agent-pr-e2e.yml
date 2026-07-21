@@ -39,18 +39,19 @@ jobs:
                short markdown note (a title and one sentence saying this PR was opened by
                the microVM agent end-to-end test).
             2. Open a pull request with your change by ACTUALLY RUNNING this command (do
-               not just describe it):
-                 "$MV_HELPERS_DIR/create-pull-request" --server pr \
+               not just describe it), passing the file you created with --add:
+                 "$MV_MCP_DIR/create_pull_request" \
                    --title "e2e: agent-opened PR ${{ github.run_id }}" \
                    --body "Automated Class C end-to-end test: the agent created a file and opened this PR via the create-pull-request safe output." \
-                   --draft true
+                   --draft true \
+                   --add "agent-notes/e2e-${{ github.run_id }}.md"
             After the command prints a pull request URL, reply with exactly: DONE
           github-token: ${{ github.token }}
           timeout-minutes: "12"
           mcp-config: |
             {
               "mcpServers": {
-                "pr": {
+                "create_pull_request": {
                   "command": "safe-outputs",
                   "args": ["create-pull-request", "--branch-prefix", "agent-e2e-pr-"],
                   "env": { "GITHUB_TOKEN": "${{ github.token }}" }

@@ -55925,7 +55925,13 @@ function createDispatchServer(serverMap, { log = () => {}, path = "/dispatch" } 
           return send(res, 200, { status: "ok", server: name, text: `Tools for ${name}:\n${listing}` });
         }
 
-        const toolName = payload.tool;
+        // Resolve the tool. When the shim omits the tool name (empty/undefined) and
+        // the server exposes exactly one tool, infer it — so a single-tool safe-output
+        // server can be invoked as `/__mcp/<server> --flags` with no redundant tool name.
+        let toolName = payload.tool;
+        if ((toolName === undefined || toolName === null || toolName === "") && tools.length === 1) {
+          toolName = tools[0].name;
+        }
         const tool = tools.find((t) => t.name === toolName);
         if (!tool) {
           return send(res, 404, { status: "error", server: name, text: `no tool '${toolName}' on server '${name}'` });
@@ -56885,7 +56891,23 @@ const DEFAULT_COPILOT_DIR = "/opt/copilot";
 const REPORT_INCOMPLETE_SENTINEL = "__MICROVM_AGENT_REPORT_INCOMPLETE__";
 
 /**
- * One shim per server. POSIX sh; needs jq + curl in the guest.
+ * One shim per server. POSIX sh; needs jq + curl + base64 in the guest.
+ *
+ * Invocation:
+ *   <server>                          list this server's tools
+ *   <server> <tool> --help            show a tool's input schema
+ *   <server> <tool> [positional...]   run a tool with positional args
+ *   <server> [<tool>] --key value ... run a tool in FLAG mode (below)
+ *
+ * FLAG mode (any `--flag` present) builds a JSON argument object instead of
+ * positional args, and supports two GENERIC file flags so a tool can receive file
+ * CONTENTS without the agent putting bytes on the command line (ARG_MAX):
+ *   --add <path>     read <path> from $GITHUB_WORKSPACE, base64 it, append to additions[]
+ *   --delete <path>  append {path} to deletions[]
+ *   --key <value>    set a scalar arg
+ * Paths are sandboxed to the workspace (no absolute/.. escapes); contents ride the
+ * POST body (stdin), never argv. When the tool name is omitted (first token is a
+ * flag), a single-tool server infers its one tool host-side.
  * @param {string} serverName
  * @param {{endpoint?: string}} [opts]
  * @returns {string} shell script contents for the shim
@@ -56893,22 +56915,70 @@ const REPORT_INCOMPLETE_SENTINEL = "__MICROVM_AGENT_REPORT_INCOMPLETE__";
 function generateServerShim(serverName, { endpoint = DEFAULT_DISPATCH_ENDPOINT } = {}) {
   return `#!/bin/sh
 # MCP shim for server '${serverName}'.
-#   ${serverName}                 list this server's tools
-#   ${serverName} <tool> --help   show a tool's input schema
-#   ${serverName} <tool> [args]   run a tool
 S=${shq(serverName)}
 EP=${shq(endpoint)}
 post() { curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-; echo; }
-if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+
+# No args, or only --help: list the server's tools.
+if [ $# -eq 0 ] || { [ $# -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; }; then
   jq -nc --arg s "$S" '{server:$s,help:true}' | post
   exit 0
 fi
-tool=$1; shift
+
+# Tool name is a leading bareword; a leading flag means "single-tool server" (the
+# host infers the one tool).
+tool=""
+case "$1" in
+  -*) : ;;
+  *) tool=$1; shift ;;
+esac
+
+# <tool> --help: show the tool's schema.
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
   jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,help:true}' | post
   exit 0
 fi
-jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,args:$ARGS.positional}' --args "$@" | post
+
+case "$1" in
+  --*)
+    # FLAG mode: build a JSON argument object; inline files for --add.
+    WS=\${GITHUB_WORKSPACE:-.}
+    ADDS=$(mktemp); DELS=$(mktemp); OBJ=$(mktemp)
+    : > "$ADDS"; : > "$DELS"; echo '{}' > "$OBJ"
+    while [ $# -gt 0 ]; do
+      k=$1
+      case "$k" in
+        --add|--delete)
+          p=$2; shift 2
+          case "$p" in
+            /*|..|../*|*/..|*/../*) echo "invalid path (must be workspace-relative): $p" >&2; exit 2 ;;
+          esac
+          if [ "$k" = "--add" ]; then
+            [ -f "$WS/$p" ] || { echo "file not found: $p" >&2; exit 1; }
+            c=$(base64 -w0 "$WS/$p" 2>/dev/null) || c=$(base64 "$WS/$p" | tr -d '\\n')
+            jq -nc --arg path "$p" --arg contents "$c" '{path:$path,contents:$contents}' >> "$ADDS"
+          else
+            jq -nc --arg path "$p" '{path:$path}' >> "$DELS"
+          fi
+          ;;
+        --*)
+          key=\${k#--}; v=$2; shift 2
+          jq -c --arg key "$key" --arg v "$v" '. + {($key):$v}' "$OBJ" > "$OBJ.n" && mv "$OBJ.n" "$OBJ"
+          ;;
+        *) echo "unexpected argument: $k" >&2; exit 2 ;;
+      esac
+    done
+    A=$(jq -sc '.' "$ADDS"); D=$(jq -sc '.' "$DELS"); O=$(cat "$OBJ")
+    rm -f "$ADDS" "$DELS" "$OBJ"
+    PAYLOAD=$(jq -nc --argjson o "$O" --argjson a "$A" --argjson d "$D" \\
+      '$o + (if ($a|length)>0 then {additions:$a} else {} end) + (if ($d|length)>0 then {deletions:$d} else {} end)')
+    jq -nc --arg s "$S" --arg t "$tool" --arg p "$PAYLOAD" '{server:$s,tool:$t,args:[$p]}' | post
+    ;;
+  *)
+    # Positional mode.
+    jq -nc --arg s "$S" --arg t "$tool" '{server:$s,tool:$t,args:$ARGS.positional}' --args "$@" | post
+    ;;
+esac
 `;
 }
 
@@ -56953,113 +57023,6 @@ printf '::${command === "report-incomplete" ? "error" : command.replace(/^report
       `printf '%s\\n' ${shq(REPORT_INCOMPLETE_SENTINEL)}\n`,
   };
 }
-
-/**
- * Guest-side helpers for the FILE-CHANGING safe outputs (Class C, see
- * safe-outputs/docs/parity-gh-aw.md §2.0). The safe-output MCP server that applies
- * the write runs HOST-side and cannot see the guest workspace, so these helpers do
- * the git change detection IN the guest, then ship the change set (whole-file,
- * base64) through the existing MCP dispatch channel (`$MV_DISPATCH_ENDPOINT`) — the
- * guest still holds no token; the host applies the commit via `createCommitOnBranch`.
- *
- *   create-pull-request        --server <name> --title <t> --body <b> [--draft true|false]
- *   push-to-pull-request-branch --server <name> --message <m>
- *
- * The change set is computed from `git add -A` + `git diff --cached` in
- * `$GITHUB_WORKSPACE`; additions carry full file contents (base64), deletions carry
- * paths. Requires git/jq/base64/curl (present in the guest rootfs). POSIX sh.
- * @returns {Record<string,string>} filename -> script contents
- */
-function generateFileChangeHelpers() {
-  // Shared prologue: parse --server/--title/--body/--draft/--message, then compute
-  // the change set into $ADDS / $DELS (JSON arrays) and $BASE_SHA.
-  const changeset = `
-WS="\${GITHUB_WORKSPACE:-.}"
-cd "$WS" 2>/dev/null || { echo "workspace $WS not found" >&2; exit 2; }
-if ! git rev-parse --git-dir >/dev/null 2>&1; then
-  echo "no git repository in $WS" >&2; exit 2
-fi
-BASE_SHA=$(git rev-parse HEAD)
-git add -A
-TMP=$(mktemp -d)
-: > "$TMP/adds.jsonl"
-# Additions/modifications (rename detection off -> renames are add+delete).
-git diff --cached --no-renames --name-only --diff-filter=ACM > "$TMP/adds.txt" || true
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  [ -f "$f" ] || continue
-  c=$(base64 -w0 "$f" 2>/dev/null) || c=$(base64 "$f" 2>/dev/null | tr -d '\\n')
-  jq -nc --arg path "$f" --arg contents "$c" '{path:$path,contents:$contents}' >> "$TMP/adds.jsonl"
-done < "$TMP/adds.txt"
-ADDS=$(jq -sc '.' "$TMP/adds.jsonl" 2>/dev/null || echo '[]')
-: > "$TMP/dels.jsonl"
-git diff --cached --no-renames --name-only --diff-filter=D > "$TMP/dels.txt" || true
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  jq -nc --arg path "$f" '{path:$path}' >> "$TMP/dels.jsonl"
-done < "$TMP/dels.txt"
-DELS=$(jq -sc '.' "$TMP/dels.jsonl" 2>/dev/null || echo '[]')
-rm -rf "$TMP"
-if [ "$ADDS" = "[]" ] && [ "$DELS" = "[]" ]; then
-  echo "no file changes detected in $WS; make your edits before running this helper" >&2
-  exit 1
-fi`;
-
-  // POST an MCP dispatch envelope carrying the payload JSON as a single positional
-  // arg (host convertArgs JSON.parse's it back into the tool arguments). Streams the
-  // body via stdin so large base64 payloads don't hit argv limits.
-  const dispatch = `
-EP="\${MV_DISPATCH_ENDPOINT:?MV_DISPATCH_ENDPOINT is not set}"
-ENVELOPE=$(jq -nc --arg s "$SERVER" --arg t "$TOOL" --arg p "$PAYLOAD" '{server:$s,tool:$t,args:[$p]}')
-RESP=$(printf '%s' "$ENVELOPE" | curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-)
-echo "$RESP" | jq -r '.text // .error // "(no response)"'
-echo "$RESP" | jq -e '.status == "ok"' >/dev/null 2>&1 || exit 1`;
-
-  const parseArgs = (extra) => `SERVER=""; TITLE=""; BODY=""; DRAFT="true"; MESSAGE=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --server) SERVER="$2"; shift 2 ;;
-    --title) TITLE="$2"; shift 2 ;;
-    --body) BODY="$2"; shift 2 ;;
-    --draft) DRAFT="$2"; shift 2 ;;
-    --message) MESSAGE="$2"; shift 2 ;;
-    *) echo "unknown argument: $1" >&2; exit 2 ;;
-  esac
-done
-[ -n "$SERVER" ] || { echo "--server <mcp-server-name> is required" >&2; exit 2; }
-${extra}`;
-
-  const createPr = `#!/bin/sh
-# create-pull-request — open a PR from your git workspace changes.
-# Usage: create-pull-request --server <name> --title "..." --body "..." [--draft true|false]
-${parseArgs(`[ -n "$TITLE" ] || { echo "--title is required" >&2; exit 2; }
-[ -n "$BODY" ] || { echo "--body is required" >&2; exit 2; }`)}
-${changeset}
-case "$DRAFT" in true|false) ;; *) DRAFT="true" ;; esac
-TOOL="create_pull_request"
-PAYLOAD=$(jq -nc --arg t "$TITLE" --arg b "$BODY" --argjson draft "$DRAFT" \\
-  --arg base "$BASE_SHA" --argjson adds "$ADDS" --argjson dels "$DELS" \\
-  '{title:$t,body:$b,draft:$draft,base_sha:$base,additions:$adds,deletions:$dels}')
-${dispatch}
-`;
-
-  const pushBranch = `#!/bin/sh
-# push-to-pull-request-branch — commit your git workspace changes onto the PR's branch.
-# Usage: push-to-pull-request-branch --server <name> --message "..."
-${parseArgs(`[ -n "$MESSAGE" ] || { echo "--message is required" >&2; exit 2; }`)}
-${changeset}
-TOOL="push_to_pull_request_branch"
-PAYLOAD=$(jq -nc --arg m "$MESSAGE" --argjson adds "$ADDS" --argjson dels "$DELS" \\
-  '{message:$m,additions:$adds,deletions:$dels}')
-${dispatch}
-`;
-
-  return {
-    "create-pull-request": createPr,
-    "push-to-pull-request-branch": pushBranch,
-  };
-}
-
 
 /**
  * The preamble prepended to the user prompt: tells the agent it's in an isolated
@@ -57523,16 +57486,12 @@ async function main() {
   }
 
   // Guest-side diagnostics helpers (report-error/warning/notice/incomplete), off-PATH
-  // in /__rt/helpers, surfaced to the agent via $MV_HELPERS_DIR. The file-changing
-  // helpers (create-pull-request / push-to-pull-request-branch) are added only when a
-  // workspace is mounted (they operate on the guest git workspace).
+  // in /__rt/helpers, surfaced to the agent via $MV_HELPERS_DIR. (File-changing safe
+  // outputs like create-pull-request are NOT special helpers — they are ordinary MCP
+  // tools invoked via their /__mcp shim, which inlines --add/--delete files generically.)
   const helpersDir = external_node_path_namespaceObject.join(rtSrc, "helpers");
   external_node_fs_namespaceObject.mkdirSync(helpersDir, { recursive: true });
-  const helperScripts = { ...generateHelperScripts() };
-  if (inputs.mounts !== "none" && inputs.workspace && external_node_fs_namespaceObject.existsSync(inputs.workspace)) {
-    Object.assign(helperScripts, generateFileChangeHelpers());
-  }
-  for (const [name, body] of Object.entries(helperScripts)) {
+  for (const [name, body] of Object.entries(generateHelperScripts())) {
     const p = external_node_path_namespaceObject.join(helpersDir, name);
     external_node_fs_namespaceObject.writeFileSync(p, body);
     external_node_fs_namespaceObject.chmodSync(p, 0o755);
@@ -57593,9 +57552,6 @@ async function main() {
   // MCP shims, only when there are servers).
   agentEnv += `export MV_HELPERS_DIR=${DEFAULT_HELPERS_DIR}\n`;
   if (harnessHasContent) agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
-  // The MCP dispatch endpoint, used by the file-changing helpers to ship a change set
-  // to a host-side safe-output server (the guest holds no token; the host applies it).
-  agentEnv += `export MV_DISPATCH_ENDPOINT=${DEFAULT_DISPATCH_ENDPOINT}\n`;
   external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(rtSrc, "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above). Empty by default — every
   // server reaches the guest as a /__mcp shim, not a native guest MCP entry.

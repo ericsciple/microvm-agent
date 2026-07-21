@@ -105,7 +105,13 @@ export function createDispatchServer(serverMap, { log = () => {}, path = "/dispa
           return send(res, 200, { status: "ok", server: name, text: `Tools for ${name}:\n${listing}` });
         }
 
-        const toolName = payload.tool;
+        // Resolve the tool. When the shim omits the tool name (empty/undefined) and
+        // the server exposes exactly one tool, infer it — so a single-tool safe-output
+        // server can be invoked as `/__mcp/<server> --flags` with no redundant tool name.
+        let toolName = payload.tool;
+        if ((toolName === undefined || toolName === null || toolName === "") && tools.length === 1) {
+          toolName = tools[0].name;
+        }
         const tool = tools.find((t) => t.name === toolName);
         if (!tool) {
           return send(res, 404, { status: "error", server: name, text: `no tool '${toolName}' on server '${name}'` });

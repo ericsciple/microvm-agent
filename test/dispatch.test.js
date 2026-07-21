@@ -120,6 +120,17 @@ test("dispatch invokes a tool with converted args", async () => {
   });
 });
 
+test("dispatch infers the single tool when the tool name is omitted", async () => {
+  await withDispatch({ fixture: server() }, async (port) => {
+    // No `tool` field: the fixture server exposes exactly one tool (echo_tool), so
+    // dispatch infers it (single-tool safe-output servers invoked as /__mcp/<server> --flags).
+    const res = await post(port, { server: "fixture", tool: "", args: ['{"a":1}'] });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.status, "ok");
+    assert.equal(res.body.text, 'echo:{"a":1}');
+  });
+});
+
 test("dispatch returns 404 for an unknown server", async () => {
   await withDispatch({}, async (port) => {
     const res = await post(port, { server: "nope", help: true });
