@@ -20,9 +20,6 @@ jobs:
       issues: write             # for the add-labels / add-comment safe outputs
     steps:
       - uses: actions/checkout@v4
-      # Put safe-outputs on PATH the Actions way (the harness installs its own
-      # gateway/mitmproxy internally — you don't add anything for that).
-      - uses: ericsciple/safe-outputs/setup@v1
       # setup-* steps run here, on the host; their tool caches are mounted into the guest
       - uses: ericsciple/microvm-agent@v0
         with:
@@ -39,8 +36,13 @@ jobs:
             }
 ```
 
-A safe output is just an MCP server, so you give it a token through its own `env`, like any MCP
-server. The harness keeps that secret host-side and never puts it in the guest's config.
+The first-party **safe-outputs** MCP servers ship **in-the-box** with this action, so
+`command: "safe-outputs"` works with no separate setup step. You still **declare** each safe
+output you want in `mcp-config` — that declaration is how you scope what the agent can do (which
+operation, which flags, which token). A safe output is just an MCP server, so you give it a token
+through its own `env`, like any MCP server; the harness keeps that secret host-side and never puts
+it in the guest's config. (To pin or override the bundled version, put your own `safe-outputs` on
+PATH — e.g. via `ericsciple/safe-outputs/setup@<ref>` — and it takes precedence.)
 
 ## Requirements
 
@@ -49,8 +51,7 @@ The harness installs/fetches its own dependencies during provisioning: the Firec
 **prebuilt guest kernel + bare rootfs** (from [`ericsciple/microvm-images`](https://github.com/ericsciple/microvm-images)
 releases), the Copilot CLI (mounted, not baked), and **mitmproxy** for the credential gateway. `sudo`,
 `iptables`, and `e2fsprogs`/`zstd` are expected on the runner (present on hosted runners); `docker` is
-**not** needed on the default path. The one thing you add is the safe-outputs CLI, via
-`ericsciple/safe-outputs/setup@v1`.
+**not** needed on the default path. Nothing else to add — the safe-outputs CLI is bundled with the action.
 
 ## Design (what the action does)
 

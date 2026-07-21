@@ -24,9 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Put the safe-outputs CLI on PATH (job-scoped Node.js action). mitmproxy (the
-      # harness's credential gateway) is installed by microvm-agent itself — not here.
-      - uses: ericsciple/safe-outputs/setup@main
+      # NOTE: no safe-outputs setup step — safe-outputs ships in-the-box with the
+      # microvm-agent action (vendored + on PATH). Customers still declare it in mcp-config.
 
       # Test setup ONLY: make sure the candidate labels exist so add_labels can apply
       # one (the API rejects labels that don't already exist). A real repo already has

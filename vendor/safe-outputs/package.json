@@ -1,0 +1,5 @@
+{
+  "name": "safe-outputs-vendored",
+  "private": true,
+  "type": "module"
+}

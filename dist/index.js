@@ -57262,6 +57262,10 @@ function stripTrailingSlash(p) {
 
 const HERE = external_node_path_namespaceObject.dirname((0,external_node_url_.fileURLToPath)(import.meta.url));
 const SCRIPTS = external_node_path_namespaceObject.join(HERE, "..", "scripts");
+// The first-party safe-outputs CLI, vendored into the action (see
+// scripts/vendor-safe-outputs.sh). Shipped in-the-box so the action is usable without a
+// separate setup step; customers STILL declare each safe output in their mcp-config.
+const VENDORED_SAFE_OUTPUTS_CLI = external_node_path_namespaceObject.join(HERE, "..", "vendor", "safe-outputs", "src", "cli.js");
 // Scratch dir for the kernel, rootfs, and mount images. MUST live OUTSIDE
 // GITHUB_WORKSPACE: our multi-GB artifacts (rootfs.ext4, the mount images
 // themselves) would otherwise be packaged into the workspace mount image and
@@ -57314,6 +57318,29 @@ const GUEST_WORKSPACE_PATH = "/__w";
 const GUEST_TOOLCACHE_PATH = "/__t";
 
 const log = (m) => info(`[microvm-agent] ${m}`);
+
+/**
+ * Put the vendored (in-box) safe-outputs CLI on PATH so `command: "safe-outputs"` in a
+ * customer's mcp-config resolves without a separate setup step. APPENDED to PATH — so if
+ * the customer already put their own `safe-outputs` on PATH (e.g. via the setup action),
+ * theirs is found first and wins. Writes a tiny wrapper that runs the vendored cli.js
+ * under the runner's own Node (process.execPath), so no `node` on PATH is required.
+ */
+function ensureBundledSafeOutputsOnPath() {
+  if (!external_node_fs_namespaceObject.existsSync(VENDORED_SAFE_OUTPUTS_CLI)) {
+    log("no vendored safe-outputs found; skipping in-box PATH setup.");
+    return;
+  }
+  const binDir = external_node_path_namespaceObject.join(process.env.RUNNER_TEMP || external_node_os_namespaceObject.tmpdir(), "mv-inbox-bin");
+  external_node_fs_namespaceObject.mkdirSync(binDir, { recursive: true });
+  const wrapper = external_node_path_namespaceObject.join(binDir, "safe-outputs");
+  external_node_fs_namespaceObject.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(VENDORED_SAFE_OUTPUTS_CLI)} "$@"\n`);
+  external_node_fs_namespaceObject.chmodSync(wrapper, 0o755);
+  // Append (not prepend): a customer-provided safe-outputs earlier on PATH takes priority.
+  process.env.PATH = `${process.env.PATH || ""}${external_node_path_namespaceObject.delimiter}${binDir}`;
+  log(`in-box safe-outputs available on PATH (fallback): ${binDir}`);
+}
+
 // Run a provisioning script via @actions/exec (echoes the command + streams output
 // live to the step log). No secrets are passed as args (only IMAGES_*/COPILOT_URL and
 // mount paths), so the command echo is safe.
@@ -57388,6 +57415,12 @@ async function main() {
   const inputs = readInputs();
   if (!inputs.prompt) throw new Error("input 'prompt' is required.");
   if (!inputs.githubToken) throw new Error("no github-token available for the harness (gateway/github).");
+
+  // 0. Make the in-box safe-outputs CLI available on PATH (APPENDED, so a customer's own
+  //    `safe-outputs` — e.g. from the setup action — always wins). This only affects
+  //    availability; a safe output is still only reachable if the customer declares it in
+  //    mcp-config. The harness stays agnostic: it resolves `command` via PATH like any tool.
+  ensureBundledSafeOutputsOnPath();
 
   // 1. Plan MCP servers: guest config (no secrets) + host server plan (real env).
   const { guestConfig, hostServers } = buildGuestMcpConfig(inputs);

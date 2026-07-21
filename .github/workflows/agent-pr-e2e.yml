@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ericsciple/safe-outputs/setup@main
+      # No safe-outputs setup step — it ships in-the-box with the microvm-agent action.
 
       - name: Run the microVM agent (edit a file + open a PR)
         id: agent

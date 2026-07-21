@@ -97,22 +97,35 @@ sight.
     change would make the harness "know about" a specific server or tool by name, that's
     a principle-level red flag (see #7).
 
+14. **First-party safe outputs are delivered with the action, but never auto-activated.**
+    The safe-outputs CLI is vendored into the action (`vendor/safe-outputs`,
+    `scripts/vendor-safe-outputs.sh`) and put on PATH at startup so `command: "safe-outputs"`
+    works with no separate setup step — the action is useless without a write mechanism, and
+    this is the first-party one ("batteries included"). But **availability ≠ activation**: a
+    safe output is only reachable by the agent if the customer **declares it in mcp-config**,
+    which is the scoping boundary (which ops, which flags, which token). The in-box copy is
+    APPENDED to PATH, so a customer's own `safe-outputs` (e.g. from the setup action) wins.
+    This is a *packaging* convenience, not a runtime special-case: the harness still only
+    knows "servers in mcp-config" + PATH resolution (upholds #13). Contrast the default
+    **github** server, which *is* auto-activated — that's allowed because it is **read-only**;
+    **write** servers must always be explicitly declared.
+
 ---
 
 ## Result / error-surfacing invariants
 
-14. **The step result is the harness process's exit code**, graded from the guest
+15. **The step result is the harness process's exit code**, graded from the guest
     console. The run fails if: the guest never reached the agent (infra failure), the
     guest agent exited non-zero (`AGENT_EXIT`), or the agent declared it could not finish
     the task by running `report-incomplete` (which prints a special marker line the host
     grader watches for). There is no `::set-result::` workflow command.
     (`src/console-filter.js` `gradeConsoleText`.)
 
-15. **The agent surfaces diagnostics via guest-side helpers, not by hand-formatting
+16. **The agent surfaces diagnostics via guest-side helpers, not by hand-formatting
     workflow commands.** `report-error`/`report-warning`/`report-notice`/`report-incomplete`
     under `$MV_HELPERS_DIR` do the escaping; the agent never writes `::…::` itself.
 
-16. **The prepended preamble is the agent's runtime contract — keep it in sync.** The
+17. **The prepended preamble is the agent's runtime contract — keep it in sync.** The
     harness prepends a preamble to the author's prompt (`generateMcpPreamble`) that tells
     the agent everything it needs to operate: that it's sandboxed, where the event payload
     is, how to **discover** tools (`__tools_list`), how to **call** them (`--input`/`--stdin`
@@ -127,11 +140,18 @@ sight.
 
 ## Build / correctness invariants
 
-17. **`dist/` is generated from `src/`.** After changing `src/`, rebuild with
+18. **`dist/` is generated from `src/`.** After changing `src/`, rebuild with
     `npm run build` and commit `dist/` in sync. Never hand-edit `dist/`.
 
-18. **Dependencies must clear a high trust bar.** Prefer first-party `@actions/*`; any
+19. **Dependencies must clear a high trust bar.** Prefer first-party `@actions/*`; any
     other production dependency must be reputable, widely used, and actively maintained.
+
+20. **Fetch-and-cache must be atomic — never trust a partial download.** Any content we
+    fetch is verified before it's trusted: at runtime, images ride `@actions/tool-cache`
+    (which writes a `.complete` marker and only treats an entry as a cache hit if it's
+    present); at build time, `vendor-safe-outputs.sh` downloads to a temp dir, verifies the
+    archive, and only then swaps it into `vendor/` and writes its `.complete` marker. A
+    failed or partial fetch never leaves a usable-looking cache entry or vendor dir.
 
 ---
 
