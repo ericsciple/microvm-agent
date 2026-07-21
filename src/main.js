@@ -24,7 +24,7 @@ import { readInputs } from "./inputs.js";
 import { buildGuestMcpConfig, assertNoSecretsInGuestConfig } from "./mcp-config.js";
 import { createDispatchServer } from "./dispatch.js";
 import { fetchArtifacts } from "./artifacts.js";
-import { generateServerShim, generateHelperScripts, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_HELPERS_DIR, DEFAULT_COPILOT_DIR } from "./guest-assets.js";
+import { generateServerShim, generateHelperScripts, generateFileChangeHelpers, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_HELPERS_DIR, DEFAULT_COPILOT_DIR, DEFAULT_DISPATCH_ENDPOINT } from "./guest-assets.js";
 import { filterConsoleLine, gradeConsoleText } from "./console-filter.js";
 import { translateToolCachePathEntries } from "./paths.js";
 
@@ -217,10 +217,16 @@ async function main() {
   }
 
   // Guest-side diagnostics helpers (report-error/warning/notice/incomplete), off-PATH
-  // in /__rt/helpers, surfaced to the agent via $MV_HELPERS_DIR.
+  // in /__rt/helpers, surfaced to the agent via $MV_HELPERS_DIR. The file-changing
+  // helpers (create-pull-request / push-to-pull-request-branch) are added only when a
+  // workspace is mounted (they operate on the guest git workspace).
   const helpersDir = path.join(rtSrc, "helpers");
   fs.mkdirSync(helpersDir, { recursive: true });
-  for (const [name, body] of Object.entries(generateHelperScripts())) {
+  const helperScripts = { ...generateHelperScripts() };
+  if (inputs.mounts !== "none" && inputs.workspace && fs.existsSync(inputs.workspace)) {
+    Object.assign(helperScripts, generateFileChangeHelpers());
+  }
+  for (const [name, body] of Object.entries(helperScripts)) {
     const p = path.join(helpersDir, name);
     fs.writeFileSync(p, body);
     fs.chmodSync(p, 0o755);
@@ -281,6 +287,9 @@ async function main() {
   // MCP shims, only when there are servers).
   agentEnv += `export MV_HELPERS_DIR=${DEFAULT_HELPERS_DIR}\n`;
   if (harnessHasContent) agentEnv += `export MV_MCP_DIR=${DEFAULT_MCP_DIR}\n`;
+  // The MCP dispatch endpoint, used by the file-changing helpers to ship a change set
+  // to a host-side safe-output server (the guest holds no token; the host applies it).
+  agentEnv += `export MV_DISPATCH_ENDPOINT=${DEFAULT_DISPATCH_ENDPOINT}\n`;
   fs.writeFileSync(path.join(rtSrc, "agent.env"), agentEnv);
   // Guest MCP config carries NO secret (asserted above). Empty by default — every
   // server reaches the guest as a /__mcp shim, not a native guest MCP entry.

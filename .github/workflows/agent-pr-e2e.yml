@@ -1,0 +1,96 @@
+# End-to-end (Class C): an agent running inside the Firecracker microVM edits a file
+# in its workspace and opens a PULL REQUEST via the create-pull-request safe output.
+#
+# This exercises the guest->host file-change data path: the guest-side
+# `create-pull-request` helper detects the change with git, ships the change set
+# (whole-file, base64) through the MCP dispatch channel, and the HOST-side
+# safe-outputs server commits it (GraphQL createCommitOnBranch) + opens the PR. The
+# guest never holds a token.
+#
+# Manual trigger (workflow_dispatch) so it doesn't fire on every issue.
+name: agent-pr-e2e
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the branch + signed commit
+  pull-requests: write # open the PR
+  copilot-requests: write # inference through the gateway
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ericsciple/safe-outputs/setup@main
+
+      - name: Run the microVM agent (edit a file + open a PR)
+        id: agent
+        env:
+          MV_WORKDIR: ${{ runner.temp }}/microvm-agent-work
+        uses: ./
+        with:
+          prompt: |
+            You are running inside an isolated microVM with this repository checked out
+            in your workspace ($GITHUB_WORKSPACE). Do the following with your bash tool:
+            1. Create a new file at "agent-notes/e2e-${{ github.run_id }}.md" containing a
+               short markdown note (a title and one sentence saying this PR was opened by
+               the microVM agent end-to-end test).
+            2. Open a pull request with your change by ACTUALLY RUNNING this command (do
+               not just describe it):
+                 "$MV_HELPERS_DIR/create-pull-request" --server pr \
+                   --title "e2e: agent-opened PR ${{ github.run_id }}" \
+                   --body "Automated Class C end-to-end test: the agent created a file and opened this PR via the create-pull-request safe output." \
+                   --draft true
+            After the command prints a pull request URL, reply with exactly: DONE
+          github-token: ${{ github.token }}
+          timeout-minutes: "12"
+          mcp-config: |
+            {
+              "mcpServers": {
+                "pr": {
+                  "command": "safe-outputs",
+                  "args": ["create-pull-request", "--branch-prefix", "agent-e2e-pr-"],
+                  "env": { "GITHUB_TOKEN": "${{ github.token }}" }
+                }
+              }
+            }
+
+      - name: Verify a pull request was opened and clean it up
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "agent status: ${{ steps.agent.outputs.status }}"
+          # Find the PR opened by this run (head branch carries our prefix).
+          pr=$(gh pr list --state open --json number,headRefName,title \
+            --jq '.[] | select(.headRefName | startswith("agent-e2e-pr-")) | .number' | head -n1)
+          if [ -z "$pr" ]; then
+            echo "No PR with head prefix 'agent-e2e-pr-' was found." >&2
+            exit 1
+          fi
+          echo "Found PR #$pr"
+          gh pr view "$pr" --json number,title,headRefName,files \
+            --jq '{number,title,headRefName,files:[.files[].path]}'
+          # The PR must contain the agent's file.
+          gh pr view "$pr" --json files --jq '.files[].path' | grep -q "agent-notes/e2e-" || {
+            echo "PR does not contain the expected agent-notes file." >&2; exit 1; }
+          # Cleanup: close the PR and delete its branch.
+          head=$(gh pr view "$pr" --json headRefName --jq '.headRefName')
+          gh pr close "$pr" --delete-branch || gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$head" || true
+          echo "Verified + cleaned up PR #$pr (branch $head)."
+
+      - name: Upload VM console + logs on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: microvm-agent-pr-logs
+          path: |
+            ${{ runner.temp }}/microvm-agent-work/console.log
+            ${{ runner.temp }}/microvm-agent-work/gateway.log
+            ${{ runner.temp }}/microvm-agent-work/gw-hosts.log
+            ${{ runner.temp }}/microvm-agent-work/gw-swaps.log
+            ${{ runner.temp }}/microvm-agent-work/gw-blocked.log
+            ${{ runner.temp }}/microvm-agent-work/gw-misuse.log
+          if-no-files-found: ignore

@@ -105,6 +105,112 @@ printf '::${command === "report-incomplete" ? "error" : command.replace(/^report
   };
 }
 
+/**
+ * Guest-side helpers for the FILE-CHANGING safe outputs (Class C, see
+ * safe-outputs/docs/parity-gh-aw.md §2.0). The safe-output MCP server that applies
+ * the write runs HOST-side and cannot see the guest workspace, so these helpers do
+ * the git change detection IN the guest, then ship the change set (whole-file,
+ * base64) through the existing MCP dispatch channel (`$MV_DISPATCH_ENDPOINT`) — the
+ * guest still holds no token; the host applies the commit via `createCommitOnBranch`.
+ *
+ *   create-pull-request        --server <name> --title <t> --body <b> [--draft true|false]
+ *   push-to-pull-request-branch --server <name> --message <m>
+ *
+ * The change set is computed from `git add -A` + `git diff --cached` in
+ * `$GITHUB_WORKSPACE`; additions carry full file contents (base64), deletions carry
+ * paths. Requires git/jq/base64/curl (present in the guest rootfs). POSIX sh.
+ * @returns {Record<string,string>} filename -> script contents
+ */
+export function generateFileChangeHelpers() {
+  // Shared prologue: parse --server/--title/--body/--draft/--message, then compute
+  // the change set into $ADDS / $DELS (JSON arrays) and $BASE_SHA.
+  const changeset = `
+WS="\${GITHUB_WORKSPACE:-.}"
+cd "$WS" 2>/dev/null || { echo "workspace $WS not found" >&2; exit 2; }
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "no git repository in $WS" >&2; exit 2
+fi
+BASE_SHA=$(git rev-parse HEAD)
+git add -A
+TMP=$(mktemp -d)
+: > "$TMP/adds.jsonl"
+# Additions/modifications (rename detection off -> renames are add+delete).
+git diff --cached --no-renames --name-only --diff-filter=ACM > "$TMP/adds.txt" || true
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$f" ] || continue
+  c=$(base64 -w0 "$f" 2>/dev/null) || c=$(base64 "$f" 2>/dev/null | tr -d '\\n')
+  jq -nc --arg path "$f" --arg contents "$c" '{path:$path,contents:$contents}' >> "$TMP/adds.jsonl"
+done < "$TMP/adds.txt"
+ADDS=$(jq -sc '.' "$TMP/adds.jsonl" 2>/dev/null || echo '[]')
+: > "$TMP/dels.jsonl"
+git diff --cached --no-renames --name-only --diff-filter=D > "$TMP/dels.txt" || true
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  jq -nc --arg path "$f" '{path:$path}' >> "$TMP/dels.jsonl"
+done < "$TMP/dels.txt"
+DELS=$(jq -sc '.' "$TMP/dels.jsonl" 2>/dev/null || echo '[]')
+rm -rf "$TMP"
+if [ "$ADDS" = "[]" ] && [ "$DELS" = "[]" ]; then
+  echo "no file changes detected in $WS; make your edits before running this helper" >&2
+  exit 1
+fi`;
+
+  // POST an MCP dispatch envelope carrying the payload JSON as a single positional
+  // arg (host convertArgs JSON.parse's it back into the tool arguments). Streams the
+  // body via stdin so large base64 payloads don't hit argv limits.
+  const dispatch = `
+EP="\${MV_DISPATCH_ENDPOINT:?MV_DISPATCH_ENDPOINT is not set}"
+ENVELOPE=$(jq -nc --arg s "$SERVER" --arg t "$TOOL" --arg p "$PAYLOAD" '{server:$s,tool:$t,args:[$p]}')
+RESP=$(printf '%s' "$ENVELOPE" | curl -s -X POST "$EP" -H 'Content-Type: application/json' --data-binary @-)
+echo "$RESP" | jq -r '.text // .error // "(no response)"'
+echo "$RESP" | jq -e '.status == "ok"' >/dev/null 2>&1 || exit 1`;
+
+  const parseArgs = (extra) => `SERVER=""; TITLE=""; BODY=""; DRAFT="true"; MESSAGE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --server) SERVER="$2"; shift 2 ;;
+    --title) TITLE="$2"; shift 2 ;;
+    --body) BODY="$2"; shift 2 ;;
+    --draft) DRAFT="$2"; shift 2 ;;
+    --message) MESSAGE="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$SERVER" ] || { echo "--server <mcp-server-name> is required" >&2; exit 2; }
+${extra}`;
+
+  const createPr = `#!/bin/sh
+# create-pull-request — open a PR from your git workspace changes.
+# Usage: create-pull-request --server <name> --title "..." --body "..." [--draft true|false]
+${parseArgs(`[ -n "$TITLE" ] || { echo "--title is required" >&2; exit 2; }
+[ -n "$BODY" ] || { echo "--body is required" >&2; exit 2; }`)}
+${changeset}
+case "$DRAFT" in true|false) ;; *) DRAFT="true" ;; esac
+TOOL="create_pull_request"
+PAYLOAD=$(jq -nc --arg t "$TITLE" --arg b "$BODY" --argjson draft "$DRAFT" \\
+  --arg base "$BASE_SHA" --argjson adds "$ADDS" --argjson dels "$DELS" \\
+  '{title:$t,body:$b,draft:$draft,base_sha:$base,additions:$adds,deletions:$dels}')
+${dispatch}
+`;
+
+  const pushBranch = `#!/bin/sh
+# push-to-pull-request-branch — commit your git workspace changes onto the PR's branch.
+# Usage: push-to-pull-request-branch --server <name> --message "..."
+${parseArgs(`[ -n "$MESSAGE" ] || { echo "--message is required" >&2; exit 2; }`)}
+${changeset}
+TOOL="push_to_pull_request_branch"
+PAYLOAD=$(jq -nc --arg m "$MESSAGE" --argjson adds "$ADDS" --argjson dels "$DELS" \\
+  '{message:$m,additions:$adds,deletions:$dels}')
+${dispatch}
+`;
+
+  return {
+    "create-pull-request": createPr,
+    "push-to-pull-request-branch": pushBranch,
+  };
+}
+
 
 /**
  * The preamble prepended to the user prompt: tells the agent it's in an isolated
