@@ -203,7 +203,7 @@ flowchart LR
   CON --> FILT["HOST: filterConsoleLine<br/>allow error/warning/notice/debug/group;<br/>neutralize capability commands"]
   FILT -->|inline annotation| LOG["Actions step log"]
   CON --> RAW["console.log (raw, ground truth)"]
-  RAW --> GRADE["gradeConsoleText<br/>AGENT_EXIT + report-incomplete sentinel"]
+  RAW --> GRADE["gradeConsoleText<br/>AGENT_EXIT + report-incomplete marker"]
   GRADE --> RES["step result:<br/>completed / incomplete / failed"]
 ```
 
@@ -226,7 +226,7 @@ flowchart LR
   process** (`node dist/index.js`), not the guest agent — there is no `::set-result::`. The
   guest agent's exit code surfaces via the console (`=== GUEST: AGENT_EXIT=$? ===`), and
   `gradeConsoleText` grades: (1) never reached the agent → **failed**; (2) `report-incomplete`
-  sentinel present → **incomplete** (ran fine but couldn't achieve the task); (3) `AGENT_EXIT`
+  marker present → **incomplete** (ran fine but couldn't achieve the task); (3) `AGENT_EXIT`
   non-zero or missing → **failed**, exactly `0` → **completed**. Anything non-completed →
   `core.setFailed()`.
 

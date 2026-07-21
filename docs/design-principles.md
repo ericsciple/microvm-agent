@@ -24,7 +24,7 @@ sight.
 
 ## Security invariants
 
-1. **The guest holds no real credentials.** The sandbox gets only fake sentinel tokens.
+1. **The guest holds no real credentials.** The sandbox gets only fake stand-in tokens.
    Every real token (the job token, per-server secrets, the inference credential) lives
    host-side. A fully-compromised agent must not be able to read a real credential or
    escalate to a write-scoped API. (See `docs/architecture.md` §1, §4.)
@@ -35,7 +35,8 @@ sight.
 
 3. **The credential gateway is lane-bound.** A real token is swapped in only on its
    allowlisted host + path prefix (inference). Every other `api.github.com` path is
-   deny-by-default. The guest can never turn a sentinel into the write-scoped job token.
+   deny-by-default. The guest can never turn a fake stand-in token into the write-scoped
+   job token.
 
 4. **The untrusted guest console cannot inject workflow commands.** The guest serial
    console is filtered host-side: only informational annotations
@@ -101,22 +102,35 @@ sight.
 ## Result / error-surfacing invariants
 
 14. **The step result is the harness process's exit code**, graded from the guest
-    console: infra failure, guest agent non-zero `AGENT_EXIT`, or an agent-declared
-    `report-incomplete` sentinel → fail. There is no `::set-result::`.
+    console. The run fails if: the guest never reached the agent (infra failure), the
+    guest agent exited non-zero (`AGENT_EXIT`), or the agent declared it could not finish
+    the task by running `report-incomplete` (which prints a special marker line the host
+    grader watches for). There is no `::set-result::` workflow command.
     (`src/console-filter.js` `gradeConsoleText`.)
 
 15. **The agent surfaces diagnostics via guest-side helpers, not by hand-formatting
     workflow commands.** `report-error`/`report-warning`/`report-notice`/`report-incomplete`
     under `$MV_HELPERS_DIR` do the escaping; the agent never writes `::…::` itself.
 
+16. **The prepended preamble is the agent's runtime contract — keep it in sync.** The
+    harness prepends a preamble to the author's prompt (`generateMcpPreamble`) that tells
+    the agent everything it needs to operate: that it's sandboxed, where the event payload
+    is, how to **discover** tools (`__tools_list`), how to **call** them (`--input`/`--stdin`
+    with JSON matching the schema), and how to report **errors / incompletion**
+    (`$MV_HELPERS_DIR/report-*`). If you change any tool/discovery/call convention or any
+    error/result-reporting mechanism, you **must** update the preamble in the same change —
+    the agent knows only what the preamble tells it. A behavior the agent can't discover
+    from the preamble (or via `__tools_list`) effectively doesn't exist. Keep it short:
+    state the contract, don't duplicate per-tool schemas (those come from discovery).
+
 ---
 
 ## Build / correctness invariants
 
-16. **`dist/` is generated from `src/`.** After changing `src/`, rebuild with
+17. **`dist/` is generated from `src/`.** After changing `src/`, rebuild with
     `npm run build` and commit `dist/` in sync. Never hand-edit `dist/`.
 
-17. **Dependencies must clear a high trust bar.** Prefer first-party `@actions/*`; any
+18. **Dependencies must clear a high trust bar.** Prefer first-party `@actions/*`; any
     other production dependency must be reputable, widely used, and actively maintained.
 
 ---
