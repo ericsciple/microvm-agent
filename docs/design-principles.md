@@ -78,12 +78,12 @@ sight.
    returns the native shape (name, description, `inputSchema`). No baked manifest; no
    bespoke discovery protocol.
 
-10. **`/__mcp` is commands only; `/__rt` is runtime plumbing.** `$MV_MCP_DIR` holds the
+10. **`/__mcp` is commands only; `/__runtime` is runtime plumbing.** `$MV_MCP_DIR` holds the
     call shims + the `__tools_list` built-in. Per-run context/config (init, prompt,
     agent.env, CA, event.json, `report-*` helpers) **and the Copilot CLI itself** (nested
-    at `/__rt/copilot`, on PATH) live on `/__rt`. Don't mix the two. Keeping the CLI here —
+    at `/__runtime/copilot`, on PATH) live on `/__runtime`. Don't mix the two. Keeping the CLI here —
     rather than a conventional path like `/opt/copilot` — puts **all** harness-injected
-    infrastructure under the two reserved `__` roots (`/__rt`, `/__mcp`), so nothing the
+    infrastructure under the two reserved `__` roots (`/__runtime`, `/__mcp`), so nothing the
     harness injects sits in normal FHS space where an agent/tool write could collide.
 
 11. **The `__` prefix is a reserved namespace** for harness-provided built-ins under
@@ -93,7 +93,7 @@ sight.
 12. **Well-known paths are referenced via env vars, never hardcoded.** `$MV_MCP_DIR`
     (MCP call + discovery commands) and `$MV_HELPERS_DIR` (report-* diagnostics) are
     always exported; the event payload is at `$GITHUB_EVENT_PATH` (the standard Actions
-    variable, repointed to the copy on `/__rt`). Prompts, helpers, and authors use the
+    variable, repointed to the copy on `/__runtime`). Prompts, helpers, and authors use the
     vars so the actual directories can be relocated freely.
 
 13. **No feature is special-cased in the harness.** Safe outputs, github, and any custom

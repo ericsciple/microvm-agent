@@ -172,7 +172,7 @@ bare rootfs + Copilot). This resolves the "prebuilt-image decision" the gateway 
 Firecracker only for now. (Design refs, in the planning repo: `adr-base-image-distribution.md`,
 `adr-microvm-action.md`.)
 
-**Status (DONE 2026-07-19):** implemented + validated locally (full boot: stub -> /__rt -> init.sh ->
+**Status (DONE 2026-07-19):** implemented + validated locally (full boot: stub -> /__runtime -> init.sh ->
 copilot mounted at /opt/copilot -> reached inference `api.githubcopilot.com/v1/messages` through the
 lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
@@ -187,7 +187,7 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 - [x] **Bare rootfs (bare tier only).** Debian bookworm-slim ext4 with the guest-init + Copilot runtime deps
       (`iproute2`, `util-linux`, `procps`, `ca-certificates`, `curl`, `jq`, `git`, **`libstdc++6`**). NO
       Copilot/shims/event/CA baked. glibc **2.36** recorded. Ships a generic `/init` stub that mounts the
-      per-run runtime config drive (vdb) and execs `/__rt/init.sh`. (Correction to the original note: the
+      per-run runtime config drive (vdb) and execs `/__runtime/init.sh`. (Correction to the original note: the
       list needed the runtime deps + `libstdc++6`, not just "shell+jq+curl+git" — the Copilot binary NEEDs
       `libstdc++.so.6` + `libgcc_s.so.1` in addition to glibc.)
 - [x] **Fetch + mount** (now via **`@actions/tool-cache`** in `src/artifacts.js` — updated 2026-07-19 when we
@@ -227,15 +227,15 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
 
 - **Agent → Actions error surfacing (guest-side helper scripts; no MCP needed). [DONE 2026-07-20]**
   Implemented: `src/guest-assets.js` `generateHelperScripts()` emits `report-error`/`report-warning`/
-  `report-notice`/`report-incomplete` (POSIX sh + mawk-safe escaping) into `/__rt/helpers`; `src/main.js`
+  `report-notice`/`report-incomplete` (POSIX sh + mawk-safe escaping) into `/__runtime/helpers`; `src/main.js`
   writes them per-run + exports `$MV_HELPERS_DIR`/`$MV_MCP_DIR` in agent.env; the preamble advertises them;
-  `--add-dir /__rt` grants execution; the stdout allowlist filter (`src/console-filter.js`) passes the
+  `--add-dir /__runtime` grants execution; the stdout allowlist filter (`src/console-filter.js`) passes the
   `::error::`/`::warning::`/`::notice::` they print; `report-incomplete` also prints a plain-text sentinel
   the grader detects → `setFailed`. Original design notes kept below for the decision record.
   to surface errors/warnings inline and to declare failure, the Actions-native way. **Preferred design:
   tiny guest-side helper scripts** (`report-error`, `report-warning`, `report-notice`,
   `report-incomplete`) in a **harness-owned dir, OFF-PATH** (consistent with the `/__mcp` shims — not on
-  PATH, so they don't shadow real tools), delivered per-run (on `/__rt` or `/__mcp`, granted via
+  PATH, so they don't shadow real tools), delivered per-run (on `/__runtime` or `/__mcp`, granted via
   `--add-dir`; NOT baked into the prebuilt rootfs). Each takes the raw message as an arg and does the
   workflow-command **escaping** (`%`→`%25`, `\r`→`%0D`, `\n`→`%0A`) so the **agent never hand-formats**
   `::error::` (the fragile part). The script prints `::error::<escaped>` to the guest console → the stdout
@@ -247,15 +247,15 @@ lane-bound gateway). Real-token e2e via agent-e2e.yml.
     instead of hardcoding `/__mcp` / the helper path, so we can change the actual dir names freely. **Also
     fix the existing preamble**, which hardcodes `/__mcp` (`generateMcpPreamble`) → use `$MV_MCP_DIR`.
     (Could colocate both in one dir + one var; two keeps forwarders vs. local helpers distinct.)
-    **Folder name:** `$MV_HELPERS_DIR = /__helpers` (matches `/__w`/`/__t`/`/__mcp`/`/__rt`); must be
-    `--add-dir`'d so the CLI can execute the helpers. **Decided: colocate on `/__rt` as `/__rt/helpers`**
+    **Folder name:** `$MV_HELPERS_DIR = /__helpers` (matches `/__w`/`/__t`/`/__mcp`/`/__runtime`); must be
+    `--add-dir`'d so the CLI can execute the helpers. **Decided: colocate on `/__runtime` as `/__runtime/helpers`**
     (skips a virtio drive for a few tiny scripts; env var hides the path). `MV_HELPERS_DIR` (not
     `MV_TOOLS_DIR`) avoids confusion with the tool cache.
-  - **Move `event.json` from `/__mcp` → `/__rt`.** It's per-run agent *context* (data), not a tool, so it
-    belongs with `/__rt`'s prompt/env/config; `/__mcp` becomes shims-only. Transparent (agent reads it via
+  - **Move `event.json` from `/__mcp` → `/__runtime`.** It's per-run agent *context* (data), not a tool, so it
+    belongs with `/__runtime`'s prompt/env/config; `/__mcp` becomes shims-only. Transparent (agent reads it via
     `$GITHUB_EVENT_PATH`). Also **simplifies mount logic**: `/__mcp` is then created only when there are
-    MCP servers (today `harnessHasContent` also forces it just to carry event.json), while `/__rt` always
-    exists. Requires `--add-dir /__rt` (granted anyway for `/__rt/helpers`; safe — `/__rt` is all
+    MCP servers (today `harnessHasContent` also forces it just to carry event.json), while `/__runtime` always
+    exists. Requires `--add-dir /__runtime` (granted anyway for `/__runtime/helpers`; safe — `/__runtime` is all
     non-secrets: fake token, public CA, prompt, no-secret mcp-config). (`src/main.js:199-201`.)
   - **Status signal is the one thing needing the host.** Printing `::error::` can't fail the step (that's
     microvm-agent's exit code, not a message). `report-incomplete` (name open: `report-failure`/`fail`,

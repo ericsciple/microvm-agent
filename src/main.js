@@ -124,7 +124,7 @@ const runScript = (name, args = [], extraEnv = {}) =>
 // action maps to a known-compatible {kernel, rootfs} set. Bump these together with the
 // action when cutting a new images release.
 const IMAGES_REPO = "ericsciple/microvm-images";
-const IMAGES_TAG = "v0.0.1";
+const IMAGES_TAG = "v0.0.2";
 const COPILOT_URL = "https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz";
 
 // A per-run writable rootfs, so the cached bare rootfs stays pristine across runs.
@@ -235,7 +235,7 @@ async function main() {
 
   // 5a. Assemble the read-only /__mcp mount (the "mcp" drive): one call shim per
   //     server, plus the built-in `__tools_list` discovery command (reserved `__` prefix).
-  //     event.json lives on /__rt (per-run context/data, not a tool). /__mcp exists
+  //     event.json lives on /__runtime (per-run context/data, not a tool). /__mcp exists
   //     whenever there is at least one server (the discovery command needs something to list).
   const mcpSrc = freshDir(path.join(WORK, "mcp"));
   for (const name of serverNames) {
@@ -250,25 +250,25 @@ async function main() {
     fs.chmodSync(toolsListPath, 0o755);
   }
 
-  // 5b. The per-run runtime config mount (/__rt, always vdb): init.sh + prompt.txt +
+  // 5b. The per-run runtime config mount (/__runtime, always vdb): init.sh + prompt.txt +
   //     agent.env + mitmproxy-ca.pem + mcp-config.json + event.json + the report-*
-  //     helper scripts (/__rt/helpers). The bare rootfs is prebuilt and generic, so
+  //     helper scripts (/__runtime/helpers). The bare rootfs is prebuilt and generic, so
   //     nothing is baked in — everything run-specific rides this mount.
   const rtSrc = freshDir(path.join(WORK, "runtime"));
   if (!process.env.MV_DRY_RUN) generateGatewayCa(rtSrc);
   else fs.writeFileSync(path.join(rtSrc, "mitmproxy-ca.pem"), ""); // dry-run has no gateway
 
-  // event.json rides /__rt (per-run context, not a tool). The agent reads it via
-  // $GITHUB_EVENT_PATH; /__rt is --add-dir'd below so the CLI can read it.
+  // event.json rides /__runtime (per-run context, not a tool). The agent reads it via
+  // $GITHUB_EVENT_PATH; /__runtime is --add-dir'd below so the CLI can read it.
   let guestEventPath = "";
   if (inputs.copyEvent && inputs.eventPath && fs.existsSync(inputs.eventPath)) {
     fs.copyFileSync(inputs.eventPath, path.join(rtSrc, "event.json"));
     guestEventPath = `${DEFAULT_RUNTIME_DIR}/event.json`;
-    log("copied event.json onto the /__rt runtime mount (GITHUB_EVENT_PATH repointed).");
+    log("copied event.json onto the /__runtime runtime mount (GITHUB_EVENT_PATH repointed).");
   }
 
   // Guest-side diagnostics helpers (report-error/warning/notice/incomplete), off-PATH
-  // in /__rt/helpers, surfaced to the agent via $MV_HELPERS_DIR. (File-changing safe
+  // in /__runtime/helpers, surfaced to the agent via $MV_HELPERS_DIR. (File-changing safe
   // outputs like create-pull-request are NOT special helpers — they are ordinary MCP
   // tools invoked via their /__mcp shim, which inlines --add/--delete files generically.)
   const helpersDir = path.join(rtSrc, "helpers");
@@ -290,7 +290,7 @@ async function main() {
     mcpSrc: mcpHasContent ? mcpSrc : null,
   });
 
-  // init.sh (delivered on /__rt) — references its config files from /__rt.
+  // init.sh (delivered on /__runtime) — references its config files from /__runtime.
   fs.writeFileSync(
     path.join(rtSrc, "init.sh"),
     generateInitScript({ mounts: initMounts, dns: process.env.MV_DNS_RESOLVER || "8.8.8.8" })
@@ -473,7 +473,7 @@ function generateGatewayCa(rtDir) {
   }
   const ca = path.join(process.env.HOME || "/root", ".mitmproxy", "mitmproxy-ca-cert.pem");
   if (!fs.existsSync(ca)) throw new Error("gateway CA was not generated (is mitmproxy installed?).");
-  // Delivered on the runtime drive (/__rt); init.sh copies it into the guest trust store.
+  // Delivered on the runtime drive (/__runtime); init.sh copies it into the guest trust store.
   fs.copyFileSync(ca, path.join(rtDir, "mitmproxy-ca.pem"));
 }
 
@@ -502,7 +502,7 @@ function writeVmConfig(rootfs, extraDrives = [], kernelPath = path.join(WORK, "v
 /**
  * Decide which host paths to expose as virtio-block drives, assigning guest device
  * names in a FIXED order: rootfs=vda, runtime=vdb (the bare rootfs's /init stub
- * hardcodes vdb -> /__rt), copilot=vdc, then the /__mcp shims, workspace, toolcache.
+ * hardcodes vdb -> /__runtime), copilot=vdc, then the /__mcp shims, workspace, toolcache.
  * Install-type mounts (copilot/workspace/toolcache) get a discard overlay in-guest.
  * @param {ReturnType<import("./inputs.js").readInputs>} inputs
  * @param {{rtSrc:string, copilotSrc:string, mcpSrc:string|null}} sources
@@ -515,8 +515,8 @@ function planMounts(inputs, { rtSrc, copilotSrc, mcpSrc = null }) {
   let i = 0;
   const nextDev = () => `/dev/vd${letters[i++]}`;
 
-  // runtime config (/__rt): ALWAYS vdb — the baked /init stub mounts vdb and execs
-  // /__rt/init.sh. Not exposed to the agent (plumbing), so it's not in initMounts.
+  // runtime config (/__runtime): ALWAYS vdb — the baked /init stub mounts vdb and execs
+  // /__runtime/init.sh. Not exposed to the agent (plumbing), so it's not in initMounts.
   const rtDev = nextDev();
   drives.push({ id: "runtime", src: rtSrc, image: path.join(WORK, "runtime.ext4") });
   log(`mount: runtime ${rtSrc} (ro) -> ${rtDev} at ${DEFAULT_RUNTIME_DIR}`);

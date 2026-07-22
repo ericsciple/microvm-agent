@@ -30,7 +30,7 @@ flowchart TB
     CLI["Copilot CLI<br/>(glibc binary)"]
     SHIM["/__mcp/&lt;server&gt; shims + __tools_list<br/>(discard overlay)"]
     FAKE[("FAKE sentinel token<br/>ghs_FAKE_…")]:::fake
-    MNT["all mounts = ro image + discard overlay:<br/>/__rt runtime cfg + event.json + report-* helpers<br/>/__mcp shims<br/>/__w workspace, /__t tool cache"]
+    MNT["all mounts = ro image + discard overlay:<br/>/__runtime runtime cfg + event.json + report-* helpers<br/>/__mcp shims<br/>/__w workspace, /__t tool cache"]
   end
 
   MAIN --> GW & DISP & SRV & FW
@@ -198,7 +198,7 @@ fragile `::workflow command::` or holding any host capability.
 
 ```mermaid
 flowchart LR
-  AG["guest agent"] -->|"run $MV_HELPERS_DIR/report-error"| HLP["/__rt/helpers/report-*<br/>escapes msg, prints ::error::"]
+  AG["guest agent"] -->|"run $MV_HELPERS_DIR/report-error"| HLP["/__runtime/helpers/report-*<br/>escapes msg, prints ::error::"]
   HLP --> CON["guest serial console"]
   CON --> FILT["HOST: filterConsoleLine<br/>allow error/warning/notice/debug/group;<br/>neutralize capability commands"]
   FILT -->|inline annotation| LOG["Actions step log"]
@@ -208,12 +208,12 @@ flowchart LR
 ```
 
 - **Guest-side helper scripts.** `report-error`, `report-warning`, `report-notice`, and
-  `report-incomplete` live off-PATH in `/__rt/helpers` (surfaced as `$MV_HELPERS_DIR`).
+  `report-incomplete` live off-PATH in `/__runtime/helpers` (surfaced as `$MV_HELPERS_DIR`).
   Each takes the raw message as an arg and does the workflow-command escaping itself
   (`%`→`%25`, CR→`%0D`, LF→`%0A`), then prints e.g. `::error::<escaped>`. The agent runs
   `"$MV_HELPERS_DIR/report-error" "…"` — it never formats the command (the fragile part
   `core.error()` does host-side) and holds no host capability. Delivered per-run on the
-  `/__rt` mount (a discard overlay), granted via `--add-dir`; not baked into the rootfs, not on PATH.
+  `/__runtime` mount (a discard overlay), granted via `--add-dir`; not baked into the rootfs, not on PATH.
 - **Untrusted console → stdout allowlist filter.** The guest serial console is streamed to
   the step log, but the runner interprets *any* `::command::` on stdout — so a compromised
   guest could inject `::set-output::`, `::add-path::`, `::stop-commands::`, etc. `bootVm`
@@ -238,8 +238,8 @@ flowchart LR
 flowchart TB
   subgraph VM["Guest microVM filesystem"]
     ROOT["/ rootfs (ext4)<br/>BARE, prebuilt (microvm-images)<br/>per-run writable copy — discarded"]
-    RT["/__rt runtime config (vdb)<br/>ro image + discard overlay<br/>init.sh + prompt + agent.env + CA + mcp-config<br/>+ event.json + helpers/ (report-*)"]
-    CP["/__rt/copilot  Copilot CLI (vdc)<br/>ro image + discard overlay (on PATH)<br/>nested-mounted under /__rt"]
+    RT["/__runtime runtime config (vdb)<br/>ro image + discard overlay<br/>init.sh + prompt + agent.env + CA + mcp-config<br/>+ event.json + helpers/ (report-*)"]
+    CP["/__runtime/copilot  Copilot CLI (vdc)<br/>ro image + discard overlay (on PATH)<br/>nested-mounted under /__runtime"]
     W["/__w  workspace<br/>ro image + discard overlay"]
     T["/__t  tool cache<br/>ro image + discard overlay"]
     MCP["/__mcp  call shims + __tools_list<br/>ro image + discard overlay"]
@@ -256,18 +256,18 @@ flowchart TB
 - **Every mount uses a read-only host image + throwaway tmpfs discard overlay** (and the
   rootfs is writable) — so a tool can write into any directory and never fail, but nothing
   persists and the underlying host images stay pristine. This includes the `/__mcp` shims
-  and the `/__rt` runtime config (incl. `event.json` and the `report-*` helpers): they are
+  and the `/__runtime` runtime config (incl. `event.json` and the `report-*` helpers): they are
   writable-but-discarded, not purely read-only. Shim/asset read-only-ness is **not** a
   security control (the guest can bypass a shim; the boundary is host-side). **Persisting
   anything happens only via safe outputs** (lane 2).
 - The Copilot CLI is **mounted** on its own drive (`copilot.ext4`), nested under the reserved runtime
-  root at `/__rt/copilot` (on PATH), not baked into the rootfs — so the base image is generic and
-  cacheable. Living under `/__rt` (rather than a conventional path like `/opt`) keeps every
+  root at `/__runtime/copilot` (on PATH), not baked into the rootfs — so the base image is generic and
+  cacheable. Living under `/__runtime` (rather than a conventional path like `/opt`) keeps every
   harness-injected asset under the two reserved `__` roots and avoids colliding with agent/tool writes.
   Contract for a custom `rootfs`: **x86_64 + glibc ≥ 2.28 +
   libstdc++.so.6** (preflighted; musl/Alpine unsupported).
-- Only the single `event.json` is injected (via `/__rt`, surfaced as `GITHUB_EVENT_PATH`) — never
-  `RUNNER_TEMP` (which holds the checkout push token). `/__rt` is granted to the CLI via `--add-dir`
+- Only the single `event.json` is injected (via `/__runtime`, surfaced as `GITHUB_EVENT_PATH`) — never
+  `RUNNER_TEMP` (which holds the checkout push token). `/__runtime` is granted to the CLI via `--add-dir`
   (all non-secrets: fake token, public CA, prompt, no-secret mcp-config) so it can read `event.json` and
   run the `report-*` helpers.
 
@@ -278,7 +278,7 @@ flowchart TB
 ```mermaid
 flowchart LR
   I["read inputs"] --> P["split MCP config:<br/>guest config (no secrets)<br/>+ host server plan (real env)"]
-  P --> B["build mounts:<br/>/__mcp shims + /__rt cfg<br/>(event.json + report-* helpers)"]
+  P --> B["build mounts:<br/>/__mcp shims + /__runtime cfg<br/>(event.json + report-* helpers)"]
   B --> R["provision + build rootfs<br/>+ mount images"]
   R --> N["network up:<br/>tap0 + firewall + redirect"]
   N --> S["start gateway :8080<br/>+ dispatch :9000"]

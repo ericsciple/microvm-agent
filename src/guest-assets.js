@@ -3,7 +3,7 @@
 //
 // The guest rootfs is a prebuilt BARE image (from ericsciple/microvm-images) that
 // carries no per-run content. Everything run-specific is delivered via mounts:
-//   - the runtime config drive (vdb, /__rt): init.sh + prompt + agent.env + gateway CA
+//   - the runtime config drive (vdb, /__runtime): init.sh + prompt + agent.env + gateway CA
 //   - the Copilot CLI (its own drive, mounted with a discard overlay)
 //   - the /__mcp shims + event.json (read-only)
 //   - the workspace / tool cache (read-only lower + discard overlay)
@@ -20,19 +20,19 @@
 export const DEFAULT_DISPATCH_ENDPOINT = "http://172.16.0.1:9000/dispatch";
 export const DEFAULT_MCP_DIR = "/__mcp";
 // The per-run runtime config drive is ALWAYS the first extra drive (vdb); the bare
-// rootfs's baked /init stub mounts it here and execs /__rt/init.sh (see microvm-images).
-export const DEFAULT_RUNTIME_DIR = "/__rt";
+// rootfs's baked /init stub mounts it here and execs /__runtime/init.sh (see microvm-images).
+export const DEFAULT_RUNTIME_DIR = "/__runtime";
 // Guest-side helper scripts (report-error/warning/notice/incomplete) live here,
 // colocated on the runtime drive and OFF-PATH (like the /__mcp shims). Surfaced to
 // the agent via $MV_HELPERS_DIR so nothing hardcodes the path.
 export const DEFAULT_HELPERS_DIR = `${DEFAULT_RUNTIME_DIR}/helpers`;
 // Where the Copilot CLI binary is mounted: its own drive (copilot.ext4), nested-mounted
-// as a subdirectory of the runtime namespace at /__rt/copilot with a discard overlay (so
+// as a subdirectory of the runtime namespace at /__runtime/copilot with a discard overlay (so
 // anything it writes next to itself is captured in tmpfs and discarded). Living under the
-// reserved /__rt root — rather than a conventional FHS path like /opt — keeps ALL
-// harness-injected infrastructure under the two reserved `__` roots (/__rt, /__mcp) and
+// reserved /__runtime root — rather than a conventional FHS path like /opt — keeps ALL
+// harness-injected infrastructure under the two reserved `__` roots (/__runtime, /__mcp) and
 // removes the only injected path that could collide with agent/tool writes in /opt.
-export const DEFAULT_COPILOT_DIR = "/__rt/copilot";
+export const DEFAULT_COPILOT_DIR = `${DEFAULT_RUNTIME_DIR}/copilot`;
 
 // A plain-text (NOT a ::workflow-command::) sentinel that report-incomplete prints so
 // the host console grader can detect an agent-declared failure. It must NOT be a
@@ -233,10 +233,10 @@ function shq(s) {
 
 /**
  * The per-run init script, delivered on the runtime config drive and run as
- * /__rt/init.sh by the bare rootfs's baked /init stub (which has already mounted
- * proc/sys/dev and /__rt). It brings up networking, trusts the gateway CA, sets up
+ * /__runtime/init.sh by the bare rootfs's baked /init stub (which has already mounted
+ * proc/sys/dev and /__runtime). It brings up networking, trusts the gateway CA, sets up
  * the mounts (Copilot + /__mcp + workspace + tool cache), exports the Copilot auth
- * env, and runs the agent. All run-specific files are read from /__rt.
+ * env, and runs the agent. All run-specific files are read from /__runtime.
  * @param {Object} [opts]
  * @param {string} [opts.guestIp]
  * @param {string} [opts.hostIp]
@@ -256,7 +256,7 @@ export function generateInitScript({
   const copilotDir = mounts.copilot ? mounts.copilot.path : DEFAULT_COPILOT_DIR;
   const addDirs = ["/root"];
   // The MCP shims live in the /__mcp mount and the report-* helpers + event.json live on
-  // the runtime drive (/__rt); the CLI can only execute/read files under directories it's
+  // the runtime drive (/__runtime); the CLI can only execute/read files under directories it's
   // been granted, so add both (and the workspace when mounted).
   addDirs.push(runtimeDir);
   if (mounts.mcp) addDirs.push(mounts.mcp.path);

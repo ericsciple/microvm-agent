@@ -97,25 +97,25 @@ test("toolcache mount is an RO lower + tmpfs overlay at /__t", () => {
 });
 
 test("copilot mount is an RO lower + tmpfs discard overlay", () => {
-  const s = generateMountSetup({ copilot: { dev: "/dev/vdc", path: "/__rt/copilot" } });
+  const s = generateMountSetup({ copilot: { dev: "/dev/vdc", path: "/__runtime/copilot" } });
   assert.ok(s.includes("mount -o ro '/dev/vdc' /mnt/mv-cp-lower"));
   assert.ok(s.includes("mount -t overlay overlay"));
-  assert.ok(s.includes("'/__rt/copilot'"));
+  assert.ok(s.includes("'/__runtime/copilot'"));
 });
 
-test("init mounts mcp + wires auth env and prompt from /__rt", () => {
+test("init mounts mcp + wires auth env and prompt from /__runtime", () => {
   const init = generateInitScript({ mounts: { mcp: { dev: "/dev/vdd", path: "/__mcp" } } });
   assert.ok(init.includes("mount -t overlay overlay"));
   assert.ok(init.includes("/mnt/mv-mcp-lower"));
-  // /__rt is made writable via a throwaway overlay too (nothing purely read-only).
+  // /__runtime is made writable via a throwaway overlay too (nothing purely read-only).
   assert.ok(init.includes("/mnt/mv-rt-lower"));
   assert.ok(init.includes("S2STOKENS=true"));
   assert.ok(init.includes('-p "$(cat "$RT/prompt.txt")"'));
   assert.ok(init.includes('. "$RT/agent.env"'));
-  // The CLI must be granted the /__mcp dir to execute the shims there, and /__rt for the
+  // The CLI must be granted the /__mcp dir to execute the shims there, and /__runtime for the
   // report-* helpers + event.json.
   assert.ok(init.includes("--add-dir '/__mcp'"));
-  assert.ok(init.includes("--add-dir '/__rt'"));
+  assert.ok(init.includes("--add-dir '/__runtime'"));
 });
 
 test("generateHelperScripts emits the four report-* helpers with escaping", () => {
@@ -142,23 +142,23 @@ test("generateHelperScripts emits the four report-* helpers with escaping", () =
 });
 
 test("DEFAULT_HELPERS_DIR is colocated under the runtime dir", () => {
-  assert.equal(DEFAULT_HELPERS_DIR, "/__rt/helpers");
+  assert.equal(DEFAULT_HELPERS_DIR, "/__runtime/helpers");
 });
 
 test("init puts the copilot mount on PATH", () => {
-  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/__rt/copilot" } } });
-  assert.ok(init.includes("export PATH='/__rt/copilot':$PATH"));
+  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/__runtime/copilot" } } });
+  assert.ok(init.includes("export PATH='/__runtime/copilot':$PATH"));
 });
 
-test("copilot nests under /__rt: the /__rt overlay is established before the copilot mount", () => {
-  // Copilot lives at /__rt/copilot (a nested mount), so its mount MUST come after the
-  // /__rt overlay is set up — otherwise the mkdir/mount would land on the RO lower and be
-  // shadowed when /__rt is later overlaid. Guard that ordering.
-  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/__rt/copilot" } } });
+test("copilot nests under /__runtime: the /__runtime overlay is established before the copilot mount", () => {
+  // Copilot lives at /__runtime/copilot (a nested mount), so its mount MUST come after the
+  // /__runtime overlay is set up — otherwise the mkdir/mount would land on the RO lower and be
+  // shadowed when /__runtime is later overlaid. Guard that ordering.
+  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/__runtime/copilot" } } });
   const rtOverlay = init.indexOf("/mnt/mv-rt-lower");
   const cpMount = init.indexOf("/mnt/mv-cp-lower");
-  assert.ok(rtOverlay >= 0 && cpMount >= 0, "both the /__rt overlay and copilot mount are present");
-  assert.ok(rtOverlay < cpMount, "the /__rt overlay must be established before the nested copilot mount");
+  assert.ok(rtOverlay >= 0 && cpMount >= 0, "both the /__runtime overlay and copilot mount are present");
+  assert.ok(rtOverlay < cpMount, "the /__runtime overlay must be established before the nested copilot mount");
 });
 
 test("init runs the agent from the workspace when mounted, else /root", () => {
