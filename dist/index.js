@@ -38963,6 +38963,8 @@ var __webpack_exports__ = {};
 
 ;// CONCATENATED MODULE: external "node:child_process"
 const external_node_child_process_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:child_process");
+// EXTERNAL MODULE: external "node:crypto"
+var external_node_crypto_ = __nccwpck_require__(7598);
 ;// CONCATENATED MODULE: external "node:fs"
 const external_node_fs_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
 ;// CONCATENATED MODULE: external "node:os"
@@ -57229,6 +57231,48 @@ function stripTrailingSlash(p) {
   return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
 }
 
+;// CONCATENATED MODULE: ./src/mcp-state.js
+// Per-(step, instance) MCP scratch dirs.
+//
+// Every host MCP server gets a private directory exported as MCP_STATE_DIR. This is a
+// generic primitive (any server may use it); safe-outputs uses it for run-wide op-count
+// limits (`claimCall`), keyed by op inside the dir. Other servers ignore it.
+//
+// Path layout: ${RUNNER_TEMP}/mcp-state/${stepGuid}/${serverName}
+//   - stepGuid is minted once per run -> two agent steps in one job get independent
+//     dirs even though RUNNER_TEMP is shared per job.
+//   - the serverName segment isolates instances -> the same op declared twice
+//     (add_labels1 / add_labels2) counts against separate budgets.
+// MCP_STATE_DIR is a path, never a secret, so it never lands in the guest config.
+
+
+
+
+/** Root that may hold many concurrent steps' state dirs (never bulk-deleted). */
+function mcpStateRoot(runnerTemp) {
+  return external_node_path_namespaceObject.join(runnerTemp || external_node_os_namespaceObject.tmpdir(), "mcp-state");
+}
+
+/** This run's GUID-scoped dir — the only thing safe to remove in teardown. */
+function stepStateDir(runnerTemp, stepGuid) {
+  return external_node_path_namespaceObject.join(mcpStateRoot(runnerTemp), stepGuid);
+}
+
+/**
+ * Assign each server a private MCP_STATE_DIR (mutates `server.env`) and return the
+ * run's GUID-scoped dir so the caller can remove it in teardown.
+ * @param {Record<string, {env?: Record<string,string>}>} serverMap keyed by server name
+ * @param {{runnerTemp?: string, stepGuid: string}} opts
+ * @returns {string} the GUID-scoped state dir
+ */
+function assignMcpStateDirs(serverMap, { runnerTemp, stepGuid }) {
+  const base = stepStateDir(runnerTemp, stepGuid);
+  for (const [name, server] of Object.entries(serverMap)) {
+    server.env = { ...(server.env || {}), MCP_STATE_DIR: external_node_path_namespaceObject.join(base, name) };
+  }
+  return base;
+}
+
 ;// CONCATENATED MODULE: ./src/main.js
 // microVM agent harness — host-side entrypoint.
 //
@@ -57242,6 +57286,8 @@ function stripTrailingSlash(p) {
 //
 // MV_DRY_RUN=1 stops after the rootfs is built (before booting), so the whole
 // provisioning path can be exercised without a Copilot inference token.
+
+
 
 
 
@@ -57436,6 +57482,16 @@ async function main() {
   const serverNames = Object.keys(serverMap);
   log(`MCP servers exposed to the guest as shims: ${serverNames.join(", ") || "(none)"}`);
 
+  // 2a. Give every host MCP server a private, per-(step, instance) scratch dir via the
+  //     generic MCP_STATE_DIR env var. STEP_GUID is minted once per run so two agent
+  //     steps in one job stay independent; the server-name segment isolates instances.
+  //     safe-outputs uses this for run-wide op-count limits; other servers ignore it.
+  const stepGuid = (0,external_node_crypto_.randomUUID)();
+  const stepStateDir = assignMcpStateDirs(serverMap, {
+    runnerTemp: process.env.RUNNER_TEMP,
+    stepGuid,
+  });
+
   // 3. Host setup (KVM, firecracker, mitmproxy) + fetch the prebuilt guest artifacts
   //    (pinned kernel + bare rootfs from the images release, the Copilot CLI) via
   //    @actions/tool-cache — warm-after-first-use under RUNNER_TOOL_CACHE.
@@ -57611,6 +57667,14 @@ async function main() {
     await new Promise((r) => dispatch.close(r));
     try {
       await runScript("network-down.sh");
+    } catch {
+      /* best effort */
+    }
+    // Best-effort: drop ONLY this run's GUID-scoped MCP state dir. NOT the parent
+    // ${RUNNER_TEMP}/mcp-state — a sibling agent step may be running in parallel
+    // (Actions can run steps in the background), so its own GUID dir could be live.
+    try {
+      external_node_fs_namespaceObject.rmSync(stepStateDir, { recursive: true, force: true });
     } catch {
       /* best effort */
     }

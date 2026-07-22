@@ -12,6 +12,7 @@
 // provisioning path can be exercised without a Copilot inference token.
 
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +28,7 @@ import { fetchArtifacts } from "./artifacts.js";
 import { generateServerShim, generateToolsListShim, generateHelperScripts, generateMcpPreamble, generateInitScript, DEFAULT_MCP_DIR, DEFAULT_RUNTIME_DIR, DEFAULT_HELPERS_DIR, DEFAULT_COPILOT_DIR, TOOLS_LIST_COMMAND } from "./guest-assets.js";
 import { filterConsoleLine, gradeConsoleText } from "./console-filter.js";
 import { translateToolCachePathEntries } from "./paths.js";
+import { assignMcpStateDirs } from "./mcp-state.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS = path.join(HERE, "..", "scripts");
@@ -204,6 +206,16 @@ async function main() {
   const serverNames = Object.keys(serverMap);
   log(`MCP servers exposed to the guest as shims: ${serverNames.join(", ") || "(none)"}`);
 
+  // 2a. Give every host MCP server a private, per-(step, instance) scratch dir via the
+  //     generic MCP_STATE_DIR env var. STEP_GUID is minted once per run so two agent
+  //     steps in one job stay independent; the server-name segment isolates instances.
+  //     safe-outputs uses this for run-wide op-count limits; other servers ignore it.
+  const stepGuid = randomUUID();
+  const stepStateDir = assignMcpStateDirs(serverMap, {
+    runnerTemp: process.env.RUNNER_TEMP,
+    stepGuid,
+  });
+
   // 3. Host setup (KVM, firecracker, mitmproxy) + fetch the prebuilt guest artifacts
   //    (pinned kernel + bare rootfs from the images release, the Copilot CLI) via
   //    @actions/tool-cache — warm-after-first-use under RUNNER_TOOL_CACHE.
@@ -379,6 +391,14 @@ async function main() {
     await new Promise((r) => dispatch.close(r));
     try {
       await runScript("network-down.sh");
+    } catch {
+      /* best effort */
+    }
+    // Best-effort: drop ONLY this run's GUID-scoped MCP state dir. NOT the parent
+    // ${RUNNER_TEMP}/mcp-state — a sibling agent step may be running in parallel
+    // (Actions can run steps in the background), so its own GUID dir could be live.
+    try {
+      fs.rmSync(stepStateDir, { recursive: true, force: true });
     } catch {
       /* best effort */
     }
