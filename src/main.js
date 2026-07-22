@@ -233,19 +233,19 @@ async function main() {
   const rootfsSrc = inputs.rootfs || rootfsPath;
   if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
 
-  // 5a. Assemble the read-only /__mcp harness mount: one call shim per server, plus the
-  //     built-in `__tools_list` discovery command (reserved `__` prefix). event.json
-  //     lives on /__rt (per-run context/data, not a tool). /__mcp exists whenever there
-  //     is at least one server (the discovery command needs something to list).
-  const harnessSrc = freshDir(path.join(WORK, "harness"));
+  // 5a. Assemble the read-only /__mcp mount (the "mcp-shims" drive): one call shim per
+  //     server, plus the built-in `__tools_list` discovery command (reserved `__` prefix).
+  //     event.json lives on /__rt (per-run context/data, not a tool). /__mcp exists
+  //     whenever there is at least one server (the discovery command needs something to list).
+  const mcpShimsSrc = freshDir(path.join(WORK, "mcp-shims"));
   for (const name of serverNames) {
-    const shimPath = path.join(harnessSrc, name);
+    const shimPath = path.join(mcpShimsSrc, name);
     fs.writeFileSync(shimPath, generateServerShim(name));
     fs.chmodSync(shimPath, 0o755);
   }
-  const harnessHasContent = serverNames.length > 0;
-  if (harnessHasContent) {
-    const toolsListPath = path.join(harnessSrc, TOOLS_LIST_COMMAND);
+  const mcpShimsHasContent = serverNames.length > 0;
+  if (mcpShimsHasContent) {
+    const toolsListPath = path.join(mcpShimsSrc, TOOLS_LIST_COMMAND);
     fs.writeFileSync(toolsListPath, generateToolsListShim());
     fs.chmodSync(toolsListPath, 0o755);
   }
@@ -283,11 +283,11 @@ async function main() {
   const copilotSrc = copilotDir;
 
   // 6. Plan drives + guest mount points. Order is fixed: vda rootfs, vdb runtime,
-  //    vdc copilot, then harness/workspace/toolcache.
+  //    vdc copilot, then mcp-shims/workspace/toolcache.
   const { drives, initMounts } = planMounts(inputs, {
     rtSrc,
     copilotSrc,
-    harnessSrc: harnessHasContent ? harnessSrc : null,
+    mcpShimsSrc: mcpShimsHasContent ? mcpShimsSrc : null,
   });
 
   // init.sh (delivered on /__rt) — references its config files from /__rt.
@@ -502,12 +502,12 @@ function writeVmConfig(rootfs, extraDrives = [], kernelPath = path.join(WORK, "v
 /**
  * Decide which host paths to expose as virtio-block drives, assigning guest device
  * names in a FIXED order: rootfs=vda, runtime=vdb (the bare rootfs's /init stub
- * hardcodes vdb -> /__rt), copilot=vdc, then the /__mcp harness, workspace, toolcache.
+ * hardcodes vdb -> /__rt), copilot=vdc, then the /__mcp shims, workspace, toolcache.
  * Install-type mounts (copilot/workspace/toolcache) get a discard overlay in-guest.
  * @param {ReturnType<import("./inputs.js").readInputs>} inputs
- * @param {{rtSrc:string, copilotSrc:string, harnessSrc:string|null}} sources
+ * @param {{rtSrc:string, copilotSrc:string, mcpShimsSrc:string|null}} sources
  */
-function planMounts(inputs, { rtSrc, copilotSrc, harnessSrc = null }) {
+function planMounts(inputs, { rtSrc, copilotSrc, mcpShimsSrc = null }) {
   const drives = [];
   const initMounts = {};
 
@@ -527,12 +527,13 @@ function planMounts(inputs, { rtSrc, copilotSrc, harnessSrc = null }) {
   initMounts.copilot = { dev: cpDev, path: DEFAULT_COPILOT_DIR };
   log(`mount: copilot ${copilotSrc} (ro+overlay) -> ${cpDev} at ${DEFAULT_COPILOT_DIR}`);
 
-  // harness (/__mcp): shims + event.json, read-only. First agent-facing mount when present.
-  if (harnessSrc) {
+  // mcp-shims (/__mcp): the call shims + __tools_list, read-only. First agent-facing
+  // mount when present.
+  if (mcpShimsSrc) {
     const dev = nextDev();
-    drives.push({ id: "harness", src: harnessSrc, image: path.join(WORK, "harness.ext4") });
-    initMounts.harness = { dev, path: DEFAULT_MCP_DIR };
-    log(`mount: harness ${harnessSrc} (ro) -> ${dev} at ${DEFAULT_MCP_DIR}`);
+    drives.push({ id: "mcp-shims", src: mcpShimsSrc, image: path.join(WORK, "mcp-shims.ext4") });
+    initMounts.mcpShims = { dev, path: DEFAULT_MCP_DIR };
+    log(`mount: mcp-shims ${mcpShimsSrc} (ro) -> ${dev} at ${DEFAULT_MCP_DIR}`);
   }
 
   if (inputs.mounts === "none") return { drives, initMounts };

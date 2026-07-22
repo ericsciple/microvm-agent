@@ -26,9 +26,13 @@ export const DEFAULT_RUNTIME_DIR = "/__rt";
 // colocated on the runtime drive and OFF-PATH (like the /__mcp shims). Surfaced to
 // the agent via $MV_HELPERS_DIR so nothing hardcodes the path.
 export const DEFAULT_HELPERS_DIR = `${DEFAULT_RUNTIME_DIR}/helpers`;
-// Where the Copilot CLI binary is mounted (its own drive, with a discard overlay so
-// anything it writes next to itself is captured in tmpfs and discarded).
-export const DEFAULT_COPILOT_DIR = "/opt/copilot";
+// Where the Copilot CLI binary is mounted: its own drive (copilot.ext4), nested-mounted
+// as a subdirectory of the runtime namespace at /__rt/copilot with a discard overlay (so
+// anything it writes next to itself is captured in tmpfs and discarded). Living under the
+// reserved /__rt root — rather than a conventional FHS path like /opt — keeps ALL
+// harness-injected infrastructure under the two reserved `__` roots (/__rt, /__mcp) and
+// removes the only injected path that could collide with agent/tool writes in /opt.
+export const DEFAULT_COPILOT_DIR = "/__rt/copilot";
 
 // A plain-text (NOT a ::workflow-command::) sentinel that report-incomplete prints so
 // the host console grader can detect an agent-declared failure. It must NOT be a
@@ -197,11 +201,11 @@ export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = 
  * Install-type mounts (copilot, workspace, tool cache) use a read-only lower + a
  * throwaway tmpfs overlay, so tools that write into their own directory don't fail,
  * yet nothing persists and the underlying image stays pristine (hypervisor RO). The
- * /__mcp harness is a pure read-only mount (tamper-proof shims + event.json).
- * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
+ * /__mcp mount (the mcp-shims drive) is a pure read-only mount (tamper-proof shims).
+ * @param {{copilot?: {dev:string,path:string}|null, mcpShims?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
  * @returns {string}
  */
-export function generateMountSetup({ copilot = null, harness = null, workspace = null, toolcache = null } = {}) {
+export function generateMountSetup({ copilot = null, mcpShims = null, workspace = null, toolcache = null } = {}) {
   // A read-only image + throwaway tmpfs overlay at `path`. `tag` namespaces the temp
   // dirs so multiple overlays don't collide. Nothing inside the guest is purely
   // read-only: every mount is writable via a discard overlay, so a tool that writes
@@ -217,7 +221,7 @@ export function generateMountSetup({ copilot = null, harness = null, workspace =
 
   let out = "";
   if (copilot) out += overlay("cp", copilot.dev, copilot.path);
-  if (harness) out += overlay("mcp", harness.dev, harness.path);
+  if (mcpShims) out += overlay("mcp", mcpShims.dev, mcpShims.path);
   if (workspace) out += overlay("ws", workspace.dev, workspace.path);
   if (toolcache) out += overlay("tc", toolcache.dev, toolcache.path);
   return out;
@@ -237,7 +241,7 @@ function shq(s) {
  * @param {string} [opts.guestIp]
  * @param {string} [opts.hostIp]
  * @param {string} [opts.dns]
- * @param {{copilot?: {dev:string,path:string}|null, harness?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @param {{copilot?: {dev:string,path:string}|null, mcpShims?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
  * @param {string} [opts.runtimeDir]
  * @returns {string}
  */
@@ -251,11 +255,11 @@ export function generateInitScript({
   const mountSetup = generateMountSetup(mounts);
   const copilotDir = mounts.copilot ? mounts.copilot.path : DEFAULT_COPILOT_DIR;
   const addDirs = ["/root"];
-  // The MCP shims live in the harness mount (/__mcp) and the report-* helpers +
-  // event.json live on the runtime drive (/__rt); the CLI can only execute/read files
-  // under directories it's been granted, so add both (and the workspace when mounted).
+  // The MCP shims live in the /__mcp mount and the report-* helpers + event.json live on
+  // the runtime drive (/__rt); the CLI can only execute/read files under directories it's
+  // been granted, so add both (and the workspace when mounted).
   addDirs.push(runtimeDir);
-  if (mounts.harness) addDirs.push(mounts.harness.path);
+  if (mounts.mcpShims) addDirs.push(mounts.mcpShims.path);
   if (mounts.workspace) addDirs.push(mounts.workspace.path);
   const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
   // Run the agent from the workspace when it's mounted (like Actions container jobs,

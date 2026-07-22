@@ -80,7 +80,11 @@ sight.
 
 10. **`/__mcp` is commands only; `/__rt` is runtime plumbing.** `$MV_MCP_DIR` holds the
     call shims + the `__tools_list` built-in. Per-run context/config (init, prompt,
-    agent.env, CA, event.json, `report-*` helpers) lives on `/__rt`. Don't mix the two.
+    agent.env, CA, event.json, `report-*` helpers) **and the Copilot CLI itself** (nested
+    at `/__rt/copilot`, on PATH) live on `/__rt`. Don't mix the two. Keeping the CLI here —
+    rather than a conventional path like `/opt/copilot` — puts **all** harness-injected
+    infrastructure under the two reserved `__` roots (`/__rt`, `/__mcp`), so nothing the
+    harness injects sits in normal FHS space where an agent/tool write could collide.
 
 11. **The `__` prefix is a reserved namespace** for harness-provided built-ins under
     `/__mcp` (e.g. `__tools_list`). Customer MCP server names starting with `__` are

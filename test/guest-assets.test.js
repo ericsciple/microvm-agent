@@ -75,8 +75,8 @@ test("generateMcpPreamble with no servers still gives isolation + event + helper
   assert.ok(p.includes('"$MV_HELPERS_DIR/report-error"'));
 });
 
-test("harness (/__mcp) mount is an RO lower + tmpfs discard overlay (writable, host image pristine)", () => {
-  const s = generateMountSetup({ harness: { dev: "/dev/vdb", path: "/__mcp" } });
+test("mcp-shims (/__mcp) mount is an RO lower + tmpfs discard overlay (writable, host image pristine)", () => {
+  const s = generateMountSetup({ mcpShims: { dev: "/dev/vdb", path: "/__mcp" } });
   assert.ok(s.includes("mount -o ro '/dev/vdb' /mnt/mv-mcp-lower"));
   assert.ok(s.includes("mount -t overlay overlay"));
   assert.ok(s.includes("'/__mcp'"));
@@ -97,14 +97,14 @@ test("toolcache mount is an RO lower + tmpfs overlay at /__t", () => {
 });
 
 test("copilot mount is an RO lower + tmpfs discard overlay", () => {
-  const s = generateMountSetup({ copilot: { dev: "/dev/vdc", path: "/opt/copilot" } });
+  const s = generateMountSetup({ copilot: { dev: "/dev/vdc", path: "/__rt/copilot" } });
   assert.ok(s.includes("mount -o ro '/dev/vdc' /mnt/mv-cp-lower"));
   assert.ok(s.includes("mount -t overlay overlay"));
-  assert.ok(s.includes("'/opt/copilot'"));
+  assert.ok(s.includes("'/__rt/copilot'"));
 });
 
-test("init mounts harness + wires auth env and prompt from /__rt", () => {
-  const init = generateInitScript({ mounts: { harness: { dev: "/dev/vdd", path: "/__mcp" } } });
+test("init mounts mcp-shims + wires auth env and prompt from /__rt", () => {
+  const init = generateInitScript({ mounts: { mcpShims: { dev: "/dev/vdd", path: "/__mcp" } } });
   assert.ok(init.includes("mount -t overlay overlay"));
   assert.ok(init.includes("/mnt/mv-mcp-lower"));
   // /__rt is made writable via a throwaway overlay too (nothing purely read-only).
@@ -146,8 +146,19 @@ test("DEFAULT_HELPERS_DIR is colocated under the runtime dir", () => {
 });
 
 test("init puts the copilot mount on PATH", () => {
-  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/opt/copilot" } } });
-  assert.ok(init.includes("export PATH='/opt/copilot':$PATH"));
+  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/__rt/copilot" } } });
+  assert.ok(init.includes("export PATH='/__rt/copilot':$PATH"));
+});
+
+test("copilot nests under /__rt: the /__rt overlay is established before the copilot mount", () => {
+  // Copilot lives at /__rt/copilot (a nested mount), so its mount MUST come after the
+  // /__rt overlay is set up — otherwise the mkdir/mount would land on the RO lower and be
+  // shadowed when /__rt is later overlaid. Guard that ordering.
+  const init = generateInitScript({ mounts: { copilot: { dev: "/dev/vdc", path: "/__rt/copilot" } } });
+  const rtOverlay = init.indexOf("/mnt/mv-rt-lower");
+  const cpMount = init.indexOf("/mnt/mv-cp-lower");
+  assert.ok(rtOverlay >= 0 && cpMount >= 0, "both the /__rt overlay and copilot mount are present");
+  assert.ok(rtOverlay < cpMount, "the /__rt overlay must be established before the nested copilot mount");
 });
 
 test("init runs the agent from the workspace when mounted, else /root", () => {

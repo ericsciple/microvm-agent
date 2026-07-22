@@ -239,7 +239,7 @@ flowchart TB
   subgraph VM["Guest microVM filesystem"]
     ROOT["/ rootfs (ext4)<br/>BARE, prebuilt (microvm-images)<br/>per-run writable copy — discarded"]
     RT["/__rt runtime config (vdb)<br/>ro image + discard overlay<br/>init.sh + prompt + agent.env + CA + mcp-config<br/>+ event.json + helpers/ (report-*)"]
-    CP["/opt/copilot  Copilot CLI<br/>ro image + discard overlay (on PATH)"]
+    CP["/__rt/copilot  Copilot CLI (vdc)<br/>ro image + discard overlay (on PATH)<br/>nested-mounted under /__rt"]
     W["/__w  workspace<br/>ro image + discard overlay"]
     T["/__t  tool cache<br/>ro image + discard overlay"]
     MCP["/__mcp  call shims + __tools_list<br/>ro image + discard overlay"]
@@ -260,8 +260,11 @@ flowchart TB
   writable-but-discarded, not purely read-only. Shim/asset read-only-ness is **not** a
   security control (the guest can bypass a shim; the boundary is host-side). **Persisting
   anything happens only via safe outputs** (lane 2).
-- The Copilot CLI is **mounted** at `/opt/copilot` (on PATH), not baked into the rootfs — so the base
-  image is generic and cacheable. Contract for a custom `rootfs`: **x86_64 + glibc ≥ 2.28 +
+- The Copilot CLI is **mounted** on its own drive (`copilot.ext4`), nested under the reserved runtime
+  root at `/__rt/copilot` (on PATH), not baked into the rootfs — so the base image is generic and
+  cacheable. Living under `/__rt` (rather than a conventional path like `/opt`) keeps every
+  harness-injected asset under the two reserved `__` roots and avoids colliding with agent/tool writes.
+  Contract for a custom `rootfs`: **x86_64 + glibc ≥ 2.28 +
   libstdc++.so.6** (preflighted; musl/Alpine unsupported).
 - Only the single `event.json` is injected (via `/__rt`, surfaced as `GITHUB_EVENT_PATH`) — never
   `RUNNER_TEMP` (which holds the checkout push token). `/__rt` is granted to the CLI via `--add-dir`
