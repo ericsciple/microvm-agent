@@ -42182,11 +42182,11 @@ function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = {}) {
  * Install-type mounts (copilot, workspace, tool cache) use a read-only lower + a
  * throwaway tmpfs overlay, so tools that write into their own directory don't fail,
  * yet nothing persists and the underlying image stays pristine (hypervisor RO). The
- * /__mcp mount (the mcp-shims drive) is a pure read-only mount (tamper-proof shims).
- * @param {{copilot?: {dev:string,path:string}|null, mcpShims?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
+ * /__mcp mount (the mcp drive) is a pure read-only mount (tamper-proof shims).
+ * @param {{copilot?: {dev:string,path:string}|null, mcp?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
  * @returns {string}
  */
-function generateMountSetup({ copilot = null, mcpShims = null, workspace = null, toolcache = null } = {}) {
+function generateMountSetup({ copilot = null, mcp = null, workspace = null, toolcache = null } = {}) {
   // A read-only image + throwaway tmpfs overlay at `path`. `tag` namespaces the temp
   // dirs so multiple overlays don't collide. Nothing inside the guest is purely
   // read-only: every mount is writable via a discard overlay, so a tool that writes
@@ -42202,7 +42202,7 @@ function generateMountSetup({ copilot = null, mcpShims = null, workspace = null,
 
   let out = "";
   if (copilot) out += overlay("cp", copilot.dev, copilot.path);
-  if (mcpShims) out += overlay("mcp", mcpShims.dev, mcpShims.path);
+  if (mcp) out += overlay("mcp", mcp.dev, mcp.path);
   if (workspace) out += overlay("ws", workspace.dev, workspace.path);
   if (toolcache) out += overlay("tc", toolcache.dev, toolcache.path);
   return out;
@@ -42222,7 +42222,7 @@ function shq(s) {
  * @param {string} [opts.guestIp]
  * @param {string} [opts.hostIp]
  * @param {string} [opts.dns]
- * @param {{copilot?: {dev:string,path:string}|null, mcpShims?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @param {{copilot?: {dev:string,path:string}|null, mcp?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
  * @param {string} [opts.runtimeDir]
  * @returns {string}
  */
@@ -42240,7 +42240,7 @@ function generateInitScript({
   // the runtime drive (/__rt); the CLI can only execute/read files under directories it's
   // been granted, so add both (and the workspace when mounted).
   addDirs.push(runtimeDir);
-  if (mounts.mcpShims) addDirs.push(mounts.mcpShims.path);
+  if (mounts.mcp) addDirs.push(mounts.mcp.path);
   if (mounts.workspace) addDirs.push(mounts.workspace.path);
   const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
   // Run the agent from the workspace when it's mounted (like Actions container jobs,
@@ -57513,19 +57513,19 @@ async function main() {
   const rootfsSrc = inputs.rootfs || rootfsPath;
   if (!process.env.MV_DRY_RUN) preflightRootfs(rootfsSrc);
 
-  // 5a. Assemble the read-only /__mcp mount (the "mcp-shims" drive): one call shim per
+  // 5a. Assemble the read-only /__mcp mount (the "mcp" drive): one call shim per
   //     server, plus the built-in `__tools_list` discovery command (reserved `__` prefix).
   //     event.json lives on /__rt (per-run context/data, not a tool). /__mcp exists
   //     whenever there is at least one server (the discovery command needs something to list).
-  const mcpShimsSrc = freshDir(external_node_path_namespaceObject.join(WORK, "mcp-shims"));
+  const mcpSrc = freshDir(external_node_path_namespaceObject.join(WORK, "mcp"));
   for (const name of serverNames) {
-    const shimPath = external_node_path_namespaceObject.join(mcpShimsSrc, name);
+    const shimPath = external_node_path_namespaceObject.join(mcpSrc, name);
     external_node_fs_namespaceObject.writeFileSync(shimPath, generateServerShim(name));
     external_node_fs_namespaceObject.chmodSync(shimPath, 0o755);
   }
-  const mcpShimsHasContent = serverNames.length > 0;
-  if (mcpShimsHasContent) {
-    const toolsListPath = external_node_path_namespaceObject.join(mcpShimsSrc, TOOLS_LIST_COMMAND);
+  const mcpHasContent = serverNames.length > 0;
+  if (mcpHasContent) {
+    const toolsListPath = external_node_path_namespaceObject.join(mcpSrc, TOOLS_LIST_COMMAND);
     external_node_fs_namespaceObject.writeFileSync(toolsListPath, generateToolsListShim());
     external_node_fs_namespaceObject.chmodSync(toolsListPath, 0o755);
   }
@@ -57563,11 +57563,11 @@ async function main() {
   const copilotSrc = copilotDir;
 
   // 6. Plan drives + guest mount points. Order is fixed: vda rootfs, vdb runtime,
-  //    vdc copilot, then mcp-shims/workspace/toolcache.
+  //    vdc copilot, then mcp/workspace/toolcache.
   const { drives, initMounts } = planMounts(inputs, {
     rtSrc,
     copilotSrc,
-    mcpShimsSrc: mcpShimsHasContent ? mcpShimsSrc : null,
+    mcpSrc: mcpHasContent ? mcpSrc : null,
   });
 
   // init.sh (delivered on /__rt) — references its config files from /__rt.
@@ -57785,9 +57785,9 @@ function writeVmConfig(rootfs, extraDrives = [], kernelPath = external_node_path
  * hardcodes vdb -> /__rt), copilot=vdc, then the /__mcp shims, workspace, toolcache.
  * Install-type mounts (copilot/workspace/toolcache) get a discard overlay in-guest.
  * @param {ReturnType<import("./inputs.js").readInputs>} inputs
- * @param {{rtSrc:string, copilotSrc:string, mcpShimsSrc:string|null}} sources
+ * @param {{rtSrc:string, copilotSrc:string, mcpSrc:string|null}} sources
  */
-function planMounts(inputs, { rtSrc, copilotSrc, mcpShimsSrc = null }) {
+function planMounts(inputs, { rtSrc, copilotSrc, mcpSrc = null }) {
   const drives = [];
   const initMounts = {};
 
@@ -57807,13 +57807,13 @@ function planMounts(inputs, { rtSrc, copilotSrc, mcpShimsSrc = null }) {
   initMounts.copilot = { dev: cpDev, path: DEFAULT_COPILOT_DIR };
   log(`mount: copilot ${copilotSrc} (ro+overlay) -> ${cpDev} at ${DEFAULT_COPILOT_DIR}`);
 
-  // mcp-shims (/__mcp): the call shims + __tools_list, read-only. First agent-facing
+  // mcp (/__mcp): the call shims + __tools_list, read-only. First agent-facing
   // mount when present.
-  if (mcpShimsSrc) {
+  if (mcpSrc) {
     const dev = nextDev();
-    drives.push({ id: "mcp-shims", src: mcpShimsSrc, image: external_node_path_namespaceObject.join(WORK, "mcp-shims.ext4") });
-    initMounts.mcpShims = { dev, path: DEFAULT_MCP_DIR };
-    log(`mount: mcp-shims ${mcpShimsSrc} (ro) -> ${dev} at ${DEFAULT_MCP_DIR}`);
+    drives.push({ id: "mcp", src: mcpSrc, image: external_node_path_namespaceObject.join(WORK, "mcp.ext4") });
+    initMounts.mcp = { dev, path: DEFAULT_MCP_DIR };
+    log(`mount: mcp ${mcpSrc} (ro) -> ${dev} at ${DEFAULT_MCP_DIR}`);
   }
 
   if (inputs.mounts === "none") return { drives, initMounts };

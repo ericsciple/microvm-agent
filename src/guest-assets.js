@@ -201,11 +201,11 @@ export function generateMcpPreamble(serverNames, { mcpDir = DEFAULT_MCP_DIR } = 
  * Install-type mounts (copilot, workspace, tool cache) use a read-only lower + a
  * throwaway tmpfs overlay, so tools that write into their own directory don't fail,
  * yet nothing persists and the underlying image stays pristine (hypervisor RO). The
- * /__mcp mount (the mcp-shims drive) is a pure read-only mount (tamper-proof shims).
- * @param {{copilot?: {dev:string,path:string}|null, mcpShims?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
+ * /__mcp mount (the mcp drive) is a pure read-only mount (tamper-proof shims).
+ * @param {{copilot?: {dev:string,path:string}|null, mcp?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [mounts]
  * @returns {string}
  */
-export function generateMountSetup({ copilot = null, mcpShims = null, workspace = null, toolcache = null } = {}) {
+export function generateMountSetup({ copilot = null, mcp = null, workspace = null, toolcache = null } = {}) {
   // A read-only image + throwaway tmpfs overlay at `path`. `tag` namespaces the temp
   // dirs so multiple overlays don't collide. Nothing inside the guest is purely
   // read-only: every mount is writable via a discard overlay, so a tool that writes
@@ -221,7 +221,7 @@ export function generateMountSetup({ copilot = null, mcpShims = null, workspace 
 
   let out = "";
   if (copilot) out += overlay("cp", copilot.dev, copilot.path);
-  if (mcpShims) out += overlay("mcp", mcpShims.dev, mcpShims.path);
+  if (mcp) out += overlay("mcp", mcp.dev, mcp.path);
   if (workspace) out += overlay("ws", workspace.dev, workspace.path);
   if (toolcache) out += overlay("tc", toolcache.dev, toolcache.path);
   return out;
@@ -241,7 +241,7 @@ function shq(s) {
  * @param {string} [opts.guestIp]
  * @param {string} [opts.hostIp]
  * @param {string} [opts.dns]
- * @param {{copilot?: {dev:string,path:string}|null, mcpShims?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
+ * @param {{copilot?: {dev:string,path:string}|null, mcp?: {dev:string,path:string}|null, workspace?: {dev:string,path:string}|null, toolcache?: {dev:string,path:string}|null}} [opts.mounts]
  * @param {string} [opts.runtimeDir]
  * @returns {string}
  */
@@ -259,7 +259,7 @@ export function generateInitScript({
   // the runtime drive (/__rt); the CLI can only execute/read files under directories it's
   // been granted, so add both (and the workspace when mounted).
   addDirs.push(runtimeDir);
-  if (mounts.mcpShims) addDirs.push(mounts.mcpShims.path);
+  if (mounts.mcp) addDirs.push(mounts.mcp.path);
   if (mounts.workspace) addDirs.push(mounts.workspace.path);
   const addDirFlags = addDirs.map((d) => `--add-dir ${shq(d)}`).join(" ");
   // Run the agent from the workspace when it's mounted (like Actions container jobs,
